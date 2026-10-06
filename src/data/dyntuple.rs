@@ -1,6 +1,6 @@
 use std::{any::TypeId, mem::ManuallyDrop};
 
-// Shared value representations live with the byte packer so storage does not depend on tracing.
+use crate::data::stringcache::AtomIndexed;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -37,8 +37,8 @@ impl From<&ValueData> for ValueKind {
 }
 
 impl ValueKind {
-    // The subscriber uses this size to allocate packed rows.
-    pub(crate) fn unit(&self) -> usize {
+    // Exposed so the example can derive packed field ranges.
+    pub fn unit(&self) -> usize {
         match self {
             ValueKind::F64 => size_of::<f64>(),
             ValueKind::I64 => size_of::<i64>(),
@@ -48,6 +48,8 @@ impl ValueKind {
             ValueKind::Bool => size_of::<bool>(),
             ValueKind::Str => size_of::<Atom>(),
             ValueKind::PrefixStr => size_of::<(Atom, Atom)>(),
+            ValueKind::StrIndex => size_of::<AtomIndexed>(),
+            ValueKind::PrefixStrIndex => size_of::<(AtomIndexed, AtomIndexed)>(),
         }
     }
 }
@@ -64,32 +66,8 @@ pub enum ValueData {
     Bool(bool),
     Str(Atom),
     PrefixStr(Atom, Atom),
-}
-
-/// Helper to split string into prefixes, while updating prefix
-pub fn split_update_prefix(prefix: &mut Option<Atom>, value: &str) -> Atom {
-    if let Some(p) = prefix {
-        let mut new_prefix_index = None; // in bytes
-        for (p_char, value_char) in p.char_indices().zip(value.chars()) {
-            if p_char.1 != value_char {
-                new_prefix_index = Some(p_char.0);
-                break;
-            }
-        }
-
-        if new_prefix_index == Some(0) {
-            // no overlap, reset prefix to the value
-            *p = Atom::from(value);
-            return Atom::from(value);
-        }
-
-        let n = new_prefix_index.unwrap_or(p.len());
-        let suffix = &value[n..];
-        return Atom::from(suffix);
-    } else {
-        *prefix = None;
-        return Atom::from(value);
-    }
+    StrIndex(AtomIndexed),
+    PrefixStrIndex(AtomIndexed, AtomIndexed),
 }
 
 /// Write data into a byte buffer and take it out again
@@ -197,8 +175,6 @@ impl<'a> BytePacker<'a> {
         self.offset += size;
     }
 
-    /// Packed string values acquire one owned reference per logical row. The
-    /// storage owner must release those references before destroying its bytes.
     pub fn write_any_value(&mut self, data: &ValueData, aligned: bool) {
         match data {
             ValueData::F64(v) => self.write_any(v, aligned),
@@ -207,11 +183,10 @@ impl<'a> BytePacker<'a> {
             ValueData::I128(v) => self.write_any(v, aligned),
             ValueData::U128(v) => self.write_any(v, aligned),
             ValueData::Bool(v) => self.write_any(v, aligned),
-            ValueData::Str(atom) => self.write_any_owned(atom.clone(), aligned),
+            ValueData::Str(atom) => self.write_any(atom, aligned),
             ValueData::PrefixStr(atom, atom1) => {
-                // Each logical row owns a reference, including compacted constant rows.
-                self.write_any_owned(atom.clone(), aligned);
-                self.write_any_owned(atom1.clone(), aligned);
+                self.write_any(atom, aligned);
+                self.write_any(atom1, aligned);
             }
         }
     }
@@ -234,9 +209,6 @@ impl<'a> BytePacker<'a> {
         });
     }
 
-    /// # Safety
-    /// Bytes must contain a valid T. Unaligned values borrow scratch bytes;
-    /// changing those does not write back to the row. Do not drop borrowed owners.
     pub unsafe fn read_any<T>(&mut self, aligned: bool) -> &mut T {
         if aligned {
             self.align(align_of::<T>());
@@ -246,34 +218,23 @@ impl<'a> BytePacker<'a> {
         let start = self.offset;
         self.offset += size;
 
-        let ptr = self.buffer[start..self.offset].as_mut_ptr();
-        if ptr as usize % align_of::<T>() == 0 {
-            return unsafe { &mut *ptr.cast::<T>() };
+        let mut ptr = self.buffer[start..self.offset].as_ptr() as *const ();
+        if ptr as usize % align_of::<T>() != 0 {
+            // use scratchpad
+            let scratchpad = self.scratchpad.as_mut_slice();
+            let scratchpad = &mut bytemuck::cast_slice_mut::<u128, u8>(scratchpad)[..size];
+            scratchpad[..size].copy_from_slice(&self.buffer[start..self.offset]);
+            ptr = scratchpad.as_ptr() as *const ();
         }
-        // This scratch buffer owns bytes, not the values represented by them.
-        // The caller must not drop a borrowed atom or retain the reference.
-        assert!(align_of::<T>() <= align_of::<u128>());
-        self.scratchpad.resize(size.div_ceil(size_of::<u128>()), 0);
-        let bytes = bytemuck::cast_slice_mut::<u128, u8>(&mut self.scratchpad);
-        bytes[..size].copy_from_slice(&self.buffer[start..self.offset]);
-        unsafe { &mut *bytes.as_mut_ptr().cast::<T>() }
+
+        unsafe { &mut *(ptr as *mut T) }
     }
 
-    /// Read a value by move. The caller must own the stored value and never read
-    /// it again as owned (or use Copy types). Packed rows need unaligned reads.
     pub unsafe fn read_any_owned<T: Unpin>(&mut self, aligned: bool) -> T {
-        if aligned {
-            self.align(align_of::<T>());
-        }
-        let start = self.offset;
-        self.offset += size_of::<T>();
-        let bytes = &self.buffer[start..self.offset];
-        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
+        let value: T = unsafe { std::ptr::read(self.read_any(aligned) as *const T) };
+        value
     }
 
-    /// # Safety
-    /// The next bytes must match `kind` and retain live atom owners. Returned
-    /// atoms are cloned; this does not transfer ownership away from the row.
     pub unsafe fn read_value(&mut self, kind: ValueKind, aligned: bool) -> ValueData {
         unsafe {
             match kind {

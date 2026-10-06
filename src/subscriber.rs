@@ -1,41 +1,42 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
+    default,
+    fs::metadata,
+    hash::Hash,
     ops::{Add, Deref, DerefMut},
-    sync::{Arc, atomic::AtomicU64},
-    time::{Instant, SystemTime},
+    path::Prefix,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{ArcRwLockWriteGuard, RawRwLock, RwLock};
 use tracing::{Metadata, field::Visit};
-use tracing_core::callsite::Identifier;
+use tracing_core::{Callsite, callsite::Identifier};
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
-use crate::data::{
-    blockbuffer::BlockCache,
-    dataframe::CompressionStats,
-    dyntuple::{Atom, BytePacker, ValueData, ValueKind},
-};
+use crate::data::{blockbuffer::BlockCache, dataframe::CompressionStats, dyntuple::{Atom, BytePacker, ValueData, ValueKind}};
 
-// Inspection stays read-only; presentation and cache totals belong to callers.
-mod inspection;
-pub use inspection::*;
-
-struct PerCallsiteData {
-    id: u64,
-    metadata: &'static Metadata<'static>,
+// Existing data is exposed for example-owned inspection; recording stays unchanged.
+pub struct PerCallsiteData {
+    pub id: u64,
+    pub metadata: &'static Metadata<'static>,
 
     // used for prefix
     last_message: Option<Atom>,
 
     // Stored here to avoid heap allocations
-    last_values: Vec<Option<ValueData>>,
+    pub last_values: Vec<Option<ValueData>>,
     last_archetype: Archetype,
 
     call_count: usize,
     finished_count: usize,
 
     // Hopefully will be only one field
-    cache: Vec<PerArchData>,
+    pub cache: Vec<PerArchData>,
     lookup: HashMap<Archetype, usize>,
 }
 
@@ -43,7 +44,7 @@ impl PerCallsiteData {
     fn get_arch(&mut self) -> usize {
         let archetype = &self.last_archetype; //aliased mutability issue with structs needs to be fixed. 
         let unit = archetype.unit();
-        let cap = (4096 / unit).max(1);
+        let cap = 4096 / unit;
 
         let i = match self.lookup.get(archetype) {
             Some(i) => *i,
@@ -70,58 +71,11 @@ impl PerCallsiteData {
     }
 }
 
-struct PerArchData {
-    data: BlockCache,
+pub struct PerArchData {
+    pub data: BlockCache,
     // id_counter: AtomicU64,
-    archetype: Archetype,
-    id: u32,
-}
-
-impl Drop for PerArchData {
-    fn drop(&mut self) {
-        use streaming_iterator::StreamingIterator;
-        // Release once per logical row, even when many rows share constant bytes.
-        let mut iter = self.data.iter();
-        while let Some(row) = iter.next() {
-            let mut bytes = row.to_vec();
-            let mut packer = BytePacker::new(&mut bytes);
-            skip_header(&mut packer, &self.archetype);
-            for kind in self.archetype.field_types.iter().flatten() {
-                unsafe {
-                    match kind {
-                        ValueKind::Str => drop(packer.read_any_owned::<Atom>(false)),
-                        ValueKind::PrefixStr => {
-                            drop(packer.read_any_owned::<Atom>(false));
-                            drop(packer.read_any_owned::<Atom>(false));
-                        }
-                        _ => {
-                            for _ in 0..kind.unit() {
-                                packer.skip::<u8>(false);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// The same header layout must be used by decoding and destruction.
-fn skip_header(packer: &mut BytePacker<'_>, arch: &Archetype) {
-    if arch.is_span_end {
-        packer.skip::<SpanId>(false);
-    } else {
-        packer.skip::<u64>(false);
-        if !arch.is_event {
-            packer.skip::<u64>(false);
-        }
-    }
-    if arch.follows_from {
-        packer.skip::<SpanId>(false);
-    }
-    if arch.parent {
-        packer.skip::<SpanId>(false);
-    }
+    pub archetype: Archetype,
+    pub id: u32,
 }
 
 // Needed because tracing_log adapter doesn't register it's callsites
@@ -139,7 +93,7 @@ struct Time {
 
 pub struct RecordingLayer {
     // TODO need to seperate storage thread and layer
-    callsites: RwLock<HashMap<Identifier, Arc<RwLock<PerCallsiteData>>>>,
+    pub callsites: RwLock<HashMap<Identifier, Arc<RwLock<PerCallsiteData>>>>,
     /// starts at 1
     span_id_counter: AtomicU64,
     /// starts at u32MAX + 1, to not conflict with span ids
@@ -152,7 +106,7 @@ pub struct RecordingLayer {
     /// You can adjust this to only store as much precision as is meaningfull.
     /// This is needed because the CompactFrame cannot filter out noise. For many callsites, timestamps will be the only recorded data.
     /// low variance (more signifigant) bits get automatically compressed when constant within a frame.
-    timestamp_bit_shift: u8,
+    pub timestamp_bit_shift: u8,
 
     system_time: SystemTime,
     started: Instant,
@@ -163,7 +117,7 @@ impl RecordingLayer {
         RecordingLayer {
             callsites: Default::default(),
             span_id_counter: 1.into(),
-            event_id_counter: ((1usize + u32::MAX as usize) as u64).into(),
+            event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             timestamp_bit_shift: 3,
             started: Instant::now(),
             system_time: SystemTime::now(),
@@ -245,33 +199,22 @@ impl RecordingLayer {
     }
 }
 
-impl Default for RecordingLayer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RecordingLayer {
-    /// Keep this Arc for inspection and clone the lightweight layer into Registry.
-    pub fn layer(self: &Arc<Self>) -> LocalRecordingLayer {
-        LocalRecordingLayer(self.clone())
-    }
-}
+impl RecordingLayer {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Archetype {
     callsite: u64, // implies metadata
-    parent: bool,
-    follows_from: bool,
-    is_span_end: bool,
-    is_event: bool,
-    field_types: Vec<Option<ValueKind>>,
+    pub parent: bool,
+    pub follows_from: bool,
+    pub is_span_end: bool,
+    pub is_event: bool,
+    pub field_types: Vec<Option<ValueKind>>,
     extra_hash: usize,
 }
 
 impl Archetype {
     /// bytes needed to store this archetype, argueably should be derived elsewhere
-    fn unit(&self) -> usize {
+    pub fn unit(&self) -> usize {
         let mut bytes = 0;
         if !self.is_span_end {
             bytes += std::mem::size_of::<u64>();
@@ -338,7 +281,8 @@ pub const PLACE_HOLDER: SpanId = SpanId {
 struct FollowFrom(SpanId);
 
 #[derive(Clone)]
-pub struct LocalRecordingLayer(Arc<RecordingLayer>);
+// Public tuple constructor keeps subscriber setup in the example.
+pub struct LocalRecordingLayer(pub Arc<RecordingLayer>);
 
 impl Deref for LocalRecordingLayer {
     type Target = RecordingLayer;
@@ -359,15 +303,10 @@ where
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let id: SpanId = *ctx.span(follows).unwrap().extensions().get().unwrap();
-        let span = ctx.span(span).unwrap();
-        let mut extensions = span.extensions_mut();
-        if let Some(previous) = extensions.get_mut::<FollowFrom>() {
-            // Preserve the existing single-edge representation without panicking
-            // when tracing reports more than one dependency for the same span.
-            previous.0 = id;
-        } else {
-            extensions.insert(FollowFrom(id));
-        }
+        ctx.span(span)
+            .unwrap()
+            .extensions_mut()
+            .insert(FollowFrom(id));
     }
 
     fn on_record(
@@ -440,7 +379,6 @@ where
                 .extend(fields.iter().map(|opt| opt.as_ref().map(|v| v.into())));
             callsite_data.last_archetype.extra_hash = 0;
             callsite_data.last_archetype.follows_from = false;
-            callsite_data.last_archetype.callsite = id.callsite as u64;
             callsite_data.last_archetype.is_span_end = true;
             callsite_data.last_archetype.is_event = false;
             callsite_data.last_archetype.parent = false;
@@ -456,7 +394,7 @@ where
             // most won't have end data, so this is good
             for field in fields.iter() {
                 if let Some(field) = field {
-                    data.write_any_value(field, false);
+                    data.write_any(field, false);
                 }
             }
             arch.data.compute_mask();
@@ -624,6 +562,8 @@ where
     }
 }
 
+// ----------------  CRUFT ------------------------
+
 struct ValueRecorder<'a> {
     _metadata: &'a Metadata<'a>,
 
@@ -635,25 +575,41 @@ struct ValueRecorder<'a> {
 impl<'a> Visit for ValueRecorder<'a> {
     fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
         if field.name() == "message" {
-            // Advance in UTF-8 characters so shorter messages and shared leading
-            // bytes of different Unicode characters cannot produce an invalid split.
-            let common = self.prefix.as_ref().map_or(0, |prefix| {
-                prefix
-                    .chars()
-                    .zip(value.chars())
-                    .take_while(|(a, b)| a == b)
-                    .map(|(ch, _)| ch.len_utf8())
-                    .sum()
-            });
-            let n = if self.prefix.is_none() || common == 0 {
-                value.len()
-            } else {
-                common
-            };
-            let (prefix, suffix) = value.split_at(n);
-            let prefix = Atom::from(prefix);
-            *self.prefix = Some(prefix.clone());
-            self.data[field.index()] = Some(ValueData::PrefixStr(prefix, Atom::from(suffix)));
+            match self.prefix {
+                Some(p) => {
+                    let mut new_prefix_index = None; // in bytes
+                    for (p_char, value_char) in p.char_indices().zip(value.chars()) {
+                        if p_char.1 != value_char {
+                            new_prefix_index = Some(p_char.0);
+                            break;
+                        }
+                    }
+
+                    match new_prefix_index {
+                        Some(0) => {
+                            *p = Atom::from(value);
+                            self.data[field.index()] =
+                                Some(ValueData::PrefixStr(p.clone(), Atom::from("")))
+                        }
+                        Some(n) => {
+                            let (prefix, rem) = value.split_at(n);
+                            *p = Atom::from(prefix);
+                            self.data[field.index()] =
+                                Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
+                        }
+                        None => {
+                            let (prefix, rem) = value.split_at(p.len());
+                            self.data[field.index()] =
+                                Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
+                        }
+                    }
+                }
+                None => {
+                    *self.prefix = Some(Atom::from(value));
+                    self.data[field.index()] =
+                        Some(ValueData::PrefixStr(Atom::from(value), Atom::from("")))
+                }
+            }
         } else {
             self.data[field.index()] = Some(ValueData::Str(Atom::from(value)));
         }
@@ -688,8 +644,8 @@ impl<'a> Visit for ValueRecorder<'a> {
     }
 
     fn record_bytes(&mut self, field: &tracing_core::Field, value: &[u8]) {
-        // Preserve byte fields as debug strings until a native bytes kind exists.
-        self.record_debug(field, &value);
+        // XXX unimplemented
+        //self.record_debug(field, &HexBytes(value))
     }
 
     fn record_error(
@@ -716,7 +672,8 @@ mod test {
         // Set up the tracing registry with the RecordingLayer
         let recording_layer = LocalRecordingLayer(Arc::new(RecordingLayer::new()));
         let subscriber = Registry::default().with(recording_layer.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Failed to set global subscriber");
 
         // Generate logs in a loop
         for i in 0..1000 {
@@ -731,7 +688,7 @@ mod test {
         println!("Compression stats: {:?}", compression_stats);
 
         let callsite_data = recording_layer.callsites.read();
-        for (_identifier, data) in callsite_data.iter() {
+        for (identifier, data) in callsite_data.iter() {
             for arch in data.read().cache.iter() {
                 assert_eq!(arch.data.iter().count(), 1000);
             }
