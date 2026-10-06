@@ -1,9 +1,5 @@
 #![feature(ptr_metadata)]
-pub mod blockbuffer;
-pub mod dataframe;
-pub mod dyntuple;
-// pub mod smartstring;
-pub mod stringcache;
+pub mod data;
 pub mod subscriber;
 
 pub fn add(left: u64, right: u64) -> u64 {

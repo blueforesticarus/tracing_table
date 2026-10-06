@@ -1,14 +1,11 @@
 use std::{
     cmp::{max, min},
-    collections::binary_heap,
-    default,
     ops::Range,
-    sync::atomic::AtomicU64,
 };
 
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
-use crate::dataframe::{CompactFrame, CompactFrameIter, CompressionStats, Frame, Row};
+use crate::data::dataframe::{CompactFrame, CompactFrameIter, CompressionStats, Frame, Row};
 
 /// a quasi ring buffer of dataframes.
 
@@ -46,10 +43,12 @@ pub struct Data {
     data: Box<CompactFrame>,
     index: usize,
     timestamp: Range<usize>,
+    revision: u64,
 }
 
 impl BlockCache {
     pub fn new(unit: usize, start_cap: usize, max_cap: usize) -> Self {
+        assert!(unit > 0 && start_cap > 0 && max_cap >= start_cap);
         BlockCache {
             unit,
             frame_size_max: max_cap,
@@ -67,7 +66,7 @@ impl BlockCache {
                 // starts at 1, jumps to 8, then double capacity untill max
                 let mut frame = Frame::new(
                     self.active.unit,
-                    max(min(self.active.capacity() * 2, self.frame_size_max), 8),
+                    min(max(self.active.capacity() * 2, 8), self.frame_size_max),
                 );
                 frame.buffer[..self.active.buffer.len()].copy_from_slice(&self.active.buffer);
                 frame.length = self.active.length;
@@ -88,6 +87,7 @@ impl BlockCache {
                     data: frame,
                     timestamp: self.timestamp.clone(),
                     index: self.count,
+                    revision: 0,
                 });
                 self.count += length;
                 self.timestamp = Range { start: 0, end: 0 };
@@ -109,13 +109,17 @@ impl BlockCache {
     }
 
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<Row<'a>> {
+        if index == 0 || index >= self.count + self.active.length {
+            return None;
+        }
         if index >= self.count {
             Row {
                 init: false, // we aren't copying the data, just providing the buffer
                 buffered: None,
                 owned: None,
                 index: index - self.count,
-                frame: crate::dataframe::AnyFrame::Frame(&mut self.active),
+                revision: None,
+                frame: crate::data::dataframe::AnyFrame::Frame(&mut self.active),
             }
             .into()
         } else {
@@ -128,7 +132,8 @@ impl BlockCache {
                 buffered: Some(self.edit_buffer.as_mut_slice()),
                 owned: None,
                 index: index - data.index,
-                frame: crate::dataframe::AnyFrame::Compact(&mut data.data),
+                revision: Some(&mut data.revision),
+                frame: crate::data::dataframe::AnyFrame::Compact(&mut data.data),
             }
             .into()
         }
@@ -148,7 +153,8 @@ impl BlockCache {
             &mut self
                 .ring
                 .iter_mut()
-                .find(|d| index > d.index)
+                .rev()
+                .find(|d| index >= d.index)
                 .unwrap()
                 .timestamp
         };
@@ -167,6 +173,75 @@ impl BlockCache {
             .into_streaming_iter()
             .flat_map(|frame| CompactFrameIter::new(&frame.data))
             .chain(self.active.iter().into_streaming_iter_ref())
+    }
+
+    /// Completed-frame descriptors do not inspect masks. The caller chooses
+    /// which revisions need fresh compression accounting.
+    pub(crate) fn completed_frames(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.ring.iter().map(|frame| (frame.index, frame.revision))
+    }
+
+    pub(crate) fn completed_stats(&self, id: usize) -> CompressionStats {
+        let frame = self.ring.iter().find(|frame| frame.index == id).unwrap();
+        frame.data.compression_ratio()
+            + CompressionStats {
+                overhead: size_of_val(frame),
+                ..Default::default()
+            }
+    }
+
+    /// Copy masks only for completed blocks whose revision the caller needs.
+    pub(crate) fn completed_mask(&self, id: usize) -> (usize, Vec<u8>) {
+        let frame = self.ring.iter().find(|frame| frame.index == id).unwrap();
+        (frame.data.length, frame.data.mask().to_vec())
+    }
+
+    pub(crate) fn block_count(&self) -> usize {
+        self.ring.len() + 1
+    }
+
+    pub(crate) fn active_stats(&self) -> CompressionStats {
+        self.active.compression_ratio()
+            + CompressionStats {
+                overhead: size_of::<Self>(),
+                ..Default::default()
+            }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.count - 1 + self.active.length
+    }
+
+    /// Copy a bounded page in newest-first order. No query or entity policy is
+    /// imposed here; callers can page backwards until enough matches are found.
+    pub(crate) fn rows_before(&self, before: Option<usize>, limit: usize) -> Vec<(usize, Vec<u8>)> {
+        let end = before.unwrap_or(self.len() + 1).min(self.len() + 1);
+        let start = end.saturating_sub(limit).max(1);
+        let mut rows = Vec::new();
+        for frame in &self.ring {
+            if frame.index >= end || frame.index + frame.data.length <= start {
+                continue;
+            }
+            let mut iter = CompactFrameIter::new(&frame.data);
+            let mut index = frame.index;
+            while let Some(row) = iter.next() {
+                if index >= start && index < end {
+                    rows.push((index, row.to_vec()));
+                }
+                index += 1;
+                if index >= end {
+                    break;
+                }
+            }
+        }
+        for (offset, row) in self.active.iter().enumerate() {
+            let index = self.count + offset;
+            if index >= start && index < end {
+                rows.push((index, row.to_vec()));
+            }
+        }
+        rows.reverse();
+        rows
     }
 
     pub fn compression_ratio(&self) -> CompressionStats {
@@ -193,13 +268,11 @@ impl BlockCache {
 mod test {
     use std::{
         hash::{DefaultHasher, Hash, Hasher},
-        time::{Instant, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use bytemuck::{Pod, Zeroable, bytes_of};
     use streaming_iterator::StreamingIterator;
-
-    use crate::dataframe::Frame;
 
     use super::BlockCache;
 

@@ -1,0 +1,19 @@
+[package]
+name = "tracing_table_bevy_viewer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A standalone package keeps the renderer out of root builds and benchmarks.
+[workspace]
+
+[dependencies]
+tracing_table = { path = "../.." }
+bevy = { version = "0.19", default-features = false, features = ["3d", "x11", "multi_threaded"] }
+bevy_egui = { version = "0.42", default-features = false, features = ["render", "default_fonts"] }
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+debug = 0

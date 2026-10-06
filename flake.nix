@@ -60,6 +60,15 @@
 
             sccache
             mold-wrapped
+
+            # for project graph view
+            cargo-modules
+            graphviz
+            gtk3
+            (python3.withPackages(ps: with ps; [
+              pygobject3
+            ]))
+            xdot
           ];
 
           # needed for rust-analyzer
