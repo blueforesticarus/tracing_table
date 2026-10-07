@@ -18,7 +18,10 @@ use tracing::{
     Level, Metadata,
     field::{FieldSet, Visit},
 };
-use tracing_core::{Callsite, Kind, callsite::Identifier};
+use tracing_core::{
+    Callsite, Kind,
+    callsite::{self, Identifier},
+};
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
@@ -187,18 +190,26 @@ pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static>
     })
 }
 
+/// Row-header time: nanoseconds since the recorder started, shifted right by
+/// RecordingLayer::timestamp_bit_shift. Shared by row sizing, writing, and decoding.
+pub type PackedTimestamp = u64;
+
 // NOTE: this could include a basis to indicate whether it is system time or monotonic, and to convert between them
 // it would get compacted. it might complicate lookup though.
 #[derive(Debug, Clone, Copy)]
 struct Time {
-    value: u64,
+    value: PackedTimestamp,
     shift: u8,
 }
+
+// literally a &'static Metadata
+// cannot use tracing callsite id because tracing_log uses one callsite for all logs
+type CallsiteId = usize;
 
 pub struct RecordingLayer {
     // TODO need to seperate storage thread and layer
     // Canonical metadata addresses distinguish log origins sharing tracing-log's Identifier.
-    pub callsites: RwLock<HashMap<usize, Arc<RwLock<PerCallsiteData>>>>,
+    pub callsites: RwLock<HashMap<CallsiteId, Arc<RwLock<PerCallsiteData>>>>,
 
     /// these identify callsites
     /// starts at 1
@@ -310,6 +321,16 @@ impl RecordingLayer {
                 Add::add,
             )
     }
+
+    pub fn dump_all_data(&self) {
+        let ids: Vec<usize> = self.callsites.read().keys().cloned().collect();
+        for id in ids {
+            let shared = self.callsites.read().get(&id).unwrap().clone();
+            let callsite = shared.read();
+
+            for buffer in callsite.cache {}
+        }
+    }
 }
 
 impl RecordingLayer {}
@@ -330,9 +351,10 @@ impl Archetype {
     pub fn unit(&self) -> usize {
         let mut bytes = 0;
         if !self.is_span_end {
-            bytes += std::mem::size_of::<u64>();
+            bytes += std::mem::size_of::<PackedTimestamp>();
             if !self.is_event {
-                bytes += std::mem::size_of::<u64>();
+                bytes += std::mem::size_of::<PackedTimestamp>(); //end timestamp
+                bytes += std::mem::size_of::<SpanFieldsRef>();
             }
         } else {
             bytes += std::mem::size_of::<SpanId>();
@@ -363,6 +385,15 @@ pub struct SpanId {
 
     // starts at 0
     pub archetype: u32,
+}
+
+/// Location of deferred span fields in the same callsite. Blocks are one-based;
+/// block zero means no update row. Completed block positions never move.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpanFieldsRef {
+    pub archetype: u32,
+    pub block: u32,
 }
 
 pub const PLACE_HOLDER: SpanId = SpanId {
@@ -470,22 +501,8 @@ where
         let mut callsite_data = self.register(ctx.metadata());
         let callsite_data = callsite_data.deref_mut();
         callsite_data.finished_count += 1;
-        {
-            let data = &mut callsite_data.cache[id.archetype as usize].data;
-            {
-                let mut row = data.get_mut(id.index as usize).unwrap();
-                let row = row.get_mut();
-                let mut packer = BytePacker::new(row);
-                packer.skip::<u64>(false);
-                packer.write_any(&time.value, false); // end timestamp;
-                if let Some(FollowFrom(f)) = follow_from {
-                    packer.write_any(f, false)
-                }
-            }
-            data.compute_timestamp(time.value as usize, Some(id.index as usize));
-        }
 
-        if let Some(fields) = fields {
+        let extra_fields = if let Some(fields) = fields {
             callsite_data.last_archetype.field_types.clear();
             callsite_data
                 .last_archetype
@@ -513,6 +530,29 @@ where
             }
             arch.data.compute_mask();
             arch.data.compute_timestamp(time.value as usize, None);
+            // allocate() can roll over the active block, so capture its ordinal afterward.
+            SpanFieldsRef {
+                archetype: arch.id,
+                block: u32::try_from(arch.data.ring.len() + 1)
+                    .expect("span update block exceeds u32"),
+            }
+        } else {
+            SpanFieldsRef::default()
+        };
+        {
+            let data = &mut callsite_data.cache[id.archetype as usize].data;
+            {
+                let mut row = data.get_mut(id.index as usize).unwrap();
+                let row = row.get_mut();
+                let mut packer = BytePacker::new(row);
+                packer.skip::<PackedTimestamp>(false);
+                packer.write_any(&time.value, false); // end timestamp;
+                packer.write_any(&extra_fields, false);
+                if let Some(FollowFrom(f)) = follow_from {
+                    packer.write_any(f, false)
+                }
+            }
+            data.compute_timestamp(time.value as usize, Some(id.index as usize));
         }
     }
 
@@ -586,7 +626,8 @@ where
         // NOTE: with compaction, probably could use serialization.
         let mut data = BytePacker::new(data);
         data.write_any(&time.value, false);
-        data.write_any(&0u64, false); //space for end_timestamp
+        data.write_any(&PackedTimestamp::default(), false); // space for end_timestamp
+        data.write_any(&SpanFieldsRef::default(), false); // deferred fields are unknown until close
         data.write_any(&PLACE_HOLDER, false); // space for follows_from
         if arch.archetype.parent {
             data.write_any(&span_id.unwrap(), false);

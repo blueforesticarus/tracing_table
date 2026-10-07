@@ -11,14 +11,13 @@ cargo run --manifest-path examples/bevy_viewer/Cargo.toml
 ```
 
 Bevy 0.19 and bevy_egui 0.42 belong only to that standalone package. Root builds,
-tests, and the benchmark do not compile them. The existing nightly Rust toolchain
+tests, and the root synthetic benchmark do not compile them. The existing nightly Rust toolchain
 is required. The viewer needs a display and a working GPU/software graphics driver.
 
-This example uses the existing recorder implementation unchanged. Its subscriber
+This example’s subscriber
 wrapper retains unique string atoms per callsite so old log fields remain live.
 Recording and retention share a per-callsite lock to handle concurrent emitters;
-these example-owned pools are excluded from compression accounting. Storage fixes,
-including delayed span-close behavior, remain outside the example’s scope.
+these example-owned pools are excluded from compression accounting.
 
 Stats refresh every 500 ms. Select an archetype to inspect its fields, compression,
 and newest matching records. Search the archetype table by target, source, ID,
@@ -48,6 +47,48 @@ For a finite display/GPU smoke run:
 ```sh
 TRACING_VIEWER_SMOKE_FRAMES=120 cargo run --manifest-path examples/bevy_viewer/Cargo.toml
 ```
+
+## Full-block compression comparison
+
+This binary runs the same scene systems headlessly by default, captures Bevy
+library callsites with Bevy's opt-in `detailed_trace` feature, and emits a separate
+HTTP/database/queue workload. Set `TRACING_COMPRESSION_BEVY_WINDOWED=1` when an
+X display is available to include `winit`/window-event callsites without starting
+the renderer. It records each workload once. For each archetype,
+the recorded rows are replayed into 4 KiB, 64 KiB, and 256 KiB frame capacities;
+only full frames at each capacity enter that capacity's comparison.
+
+```sh
+cargo run --release --manifest-path examples/bevy_viewer/Cargo.toml \
+  --bin compression_bench --features compression_detailed_trace
+
+# Include winit/window event logs when an X display is available:
+TRACING_COMPRESSION_BEVY_WINDOWED=1 cargo run --release \
+  --manifest-path examples/bevy_viewer/Cargo.toml \
+  --bin compression_bench --features compression_detailed_trace
+```
+
+`TRACING_COMPRESSION_BEVY_FRAMES` (default 16,000) and
+`TRACING_COMPRESSION_REQUESTS` (default 60,000) control the sample length.
+`TRACING_COMPRESSION_REPORT` selects the detailed CSV path (default
+`/tmp/tracing_compression_report.csv`). The program prints weighted totals and
+best/worst full-block archetypes for Bevy libraries, the scene, the generated
+workload, and their combinations. The CSV contains every archetype with at least
+one full block at a given size.
+
+All four byte counts include the `unit` and `length` fields (two `usize`s):
+uncompressed counts the entire `Frame::buffer`, compact counts the entire
+`CompactFrame::buffer`, LZ4 compresses `Frame::buffer`, and compact plus LZ4
+compresses `CompactFrame::buffer`. `CompactFrame` allocates one spare compact row
+without initializing it; the benchmark supplies zero bytes for that tail before
+LZ4 so the entire buffer can be compressed reproducibly. String allocations and
+per-archetype/cache structures are outside these four frame-size counts.
+
+The headless app uses Bevy's core, asset, transform, diagnostics, and input
+plugins. The windowed mode adds Bevy's `WindowPlugin` and `WinitPlugin` with a
+continuously updating event loop. Neither mode runs the renderer, so rendering
+callsite traffic is outside this comparison. The regular viewer does not enable
+`detailed_trace` unless explicitly requested.
 
 ## Synthetic tracing benchmark
 
@@ -145,7 +186,14 @@ Span end timestamps are not ordered by span start/row index: spans can close in
 any order, and closing an old span expands an old block's timestamp range after
 newer blocks exist. Span-close callbacks are not serialized by the retention pool.
 Consequently block ranges can overlap, and their latest timestamps need not be
-monotonic across blocks. The core completed-span range lookup also uses the first
-block with `index > block.index`, instead of the containing block: it can update
-the wrong block and can panic for the first row of the first completed block.
-This audit leaves the core implementation unchanged.
+monotonic across blocks. The completed-span range lookup finds the containing block by searching backward
+for a starting index less than or equal to the row index.
+
+Span-start headers reserve **extra_archetype** and **extra_block**, each a `u32`.
+On close, spans with updated fields receive the update archetype ID and a one-based
+block ordinal; block zero means no extra fields. The reference remains valid when
+an active update block becomes a completed block. Hover over **extra archetype:block**
+on a log row to see its updated fields. The viewer scans only that referenced block
+and matches the update row’s original SpanId; it does not search the full history.
+The component table accounts for both reference halves separately. Late span closes
+refresh compression masks when modifying previously constant header bytes.

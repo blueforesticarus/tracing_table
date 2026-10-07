@@ -11,7 +11,7 @@ use tracing_table::{
         dataframe::{CompactFrameIter, CompressionStats},
         dyntuple::{Atom, ValueData, ValueKind},
     },
-    subscriber::{RecordingLayer, SpanId},
+    subscriber::{PackedTimestamp, RecordingLayer, SpanFieldsRef, SpanId},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -74,6 +74,7 @@ pub struct RecordedRow {
     pub index: usize,
     pub timestamp_ns: Option<u64>,
     pub end_timestamp_ns: Option<u64>,
+    pub extra_fields: Option<SpanFieldsRef>,
     pub span: Option<SpanId>,
     pub parent: Option<SpanId>,
     pub follows_from: Option<SpanId>,
@@ -84,6 +85,11 @@ pub struct RecordedRow {
 pub trait InspectRecording {
     fn inspect(&self, known: &FrameSizes) -> Vec<ArchetypeSnapshot>;
     fn rows(&self, id: ArchetypeId, before: Option<usize>, limit: usize) -> Vec<RecordedRow>;
+    fn span_fields(
+        &self,
+        span: SpanId,
+        reference: SpanFieldsRef,
+    ) -> Option<Vec<(String, ValueData)>>;
 }
 impl InspectRecording for RecordingLayer {
     /// Snapshot under short per-callsite read locks. No caller code runs under
@@ -155,9 +161,11 @@ impl InspectRecording for RecordingLayer {
                 if arch.archetype.is_span_end {
                     header("span", "SpanId", size_of::<SpanId>());
                 } else {
-                    header("ts", "U64", size_of::<u64>());
+                    header("ts", "PackedTimestamp", size_of::<PackedTimestamp>());
                     if !arch.archetype.is_event {
-                        header("end_ts", "U64", size_of::<u64>());
+                        header("end_ts", "PackedTimestamp", size_of::<PackedTimestamp>());
+                        header("extra_archetype", "U32", size_of::<u32>());
+                        header("extra_block", "U32", size_of::<u32>());
                     }
                 }
                 if arch.archetype.follows_from {
@@ -256,6 +264,7 @@ impl InspectRecording for RecordingLayer {
                         index,
                         timestamp_ns: None,
                         end_timestamp_ns: None,
+                        extra_fields: None,
                         span: None,
                         parent: None,
                         follows_from: None,
@@ -267,12 +276,14 @@ impl InspectRecording for RecordingLayer {
                         if arch.archetype.is_span_end {
                             row.span = Some(packer.read());
                         } else {
-                            let timestamp: u64 = packer.read();
+                            let timestamp: PackedTimestamp = packer.read();
                             row.timestamp_ns = Some(timestamp << self.timestamp_bit_shift);
                             if !arch.archetype.is_event {
-                                let timestamp: u64 = packer.read();
+                                let timestamp: PackedTimestamp = packer.read();
                                 row.end_timestamp_ns = (timestamp != 0)
                                     .then_some(timestamp << self.timestamp_bit_shift);
+                                let reference: SpanFieldsRef = packer.read();
+                                row.extra_fields = (reference.block != 0).then_some(reference);
                             }
                         }
                         if arch.archetype.follows_from {
@@ -299,6 +310,55 @@ impl InspectRecording for RecordingLayer {
                 .collect();
         }
         Vec::new()
+    }
+    fn span_fields(
+        &self,
+        span: SpanId,
+        reference: SpanFieldsRef,
+    ) -> Option<Vec<(String, ValueData)>> {
+        let block = reference.block.checked_sub(1)? as usize;
+        let callsite = self
+            .callsites
+            .read()
+            .values()
+            .find(|data| data.read().id == span.callsite as u64)?
+            .clone();
+        let data = callsite.read();
+        let arch = data.cache.get(reference.archetype as usize)?;
+        if !arch.archetype.is_span_end {
+            return None;
+        }
+        let decode = |bytes: &[u8]| {
+            let mut reader = RowReader { bytes, offset: 0 };
+            // Scan only the referenced block and match the original span identity.
+            let id: SpanId = unsafe { reader.read() };
+            if (id.callsite, id.archetype, id.index) != (span.callsite, span.archetype, span.index)
+            {
+                return None;
+            }
+            let fields = data
+                .metadata
+                .fields()
+                .iter()
+                .zip(&arch.archetype.field_types)
+                .filter_map(|(field, kind)| {
+                    kind.as_ref()
+                        .map(|kind| (field.name().to_owned(), unsafe { reader.value(kind) }))
+                })
+                .collect();
+            Some(fields)
+        };
+        if let Some(frame) = arch.data.ring.get(block) {
+            let mut rows = CompactFrameIter::new(&frame.data);
+            for _ in 0..frame.data.length {
+                if let Some(fields) = rows.next().and_then(&decode) {
+                    return Some(fields);
+                }
+            }
+        } else if block == arch.data.ring.len() {
+            return arch.data.active.iter().find_map(decode);
+        }
+        None
     }
 }
 
@@ -333,8 +393,11 @@ impl InspectBlocks for BlockCache {
         let mut iter = CompactFrameIter::new(&frame.data);
         // Only read the timestamp header; copying/decoding atoms would be costly.
         let timestamps = (0..frame.data.length).filter_map(|_| {
-            iter.next()
-                .map(|row| u64::from_ne_bytes(row[..8].try_into().unwrap()))
+            iter.next().map(|row| {
+                PackedTimestamp::from_ne_bytes(
+                    row[..size_of::<PackedTimestamp>()].try_into().unwrap(),
+                )
+            })
         });
         timestamp_duration_ns(timestamps, shift)
     }
@@ -484,5 +547,139 @@ mod timing_tests {
             blocks.push(&time.to_ne_bytes(), time as usize);
         }
         assert_eq!(blocks.completed_duration_ns(1, 3), Some(160));
+    }
+}
+
+#[cfg(test)]
+mod span_fields_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn span_links_resolve_after_start_and_update_blocks_roll_over() {
+        let recorder = Arc::new(RecordingLayer::new());
+        let _guard = tracing::subscriber::set_default(subscriber(recorder.clone()));
+        // Keep starts open until several blocks have compressed, then close in
+        // creation order to exercise row zero and interior edits in old blocks.
+        let spans: Vec<_> = (0..600u64)
+            .map(|initial| {
+                tracing::info_span!(
+                    "linked_fields",
+                    initial,
+                    extra = tracing::field::Empty,
+                    optional = tracing::field::Empty
+                )
+            })
+            .collect();
+        let start = recorder
+            .inspect(&Default::default())
+            .into_iter()
+            .find(|snapshot| snapshot.kind == RecordKind::Span)
+            .unwrap();
+        assert!(start.blocks > 2);
+        assert!(
+            recorder
+                .rows(start.id, None, 600)
+                .iter()
+                .all(|row| row.extra_fields.is_none())
+        );
+        for (initial, span) in spans.into_iter().enumerate() {
+            if initial % 3 != 0 {
+                span.record("extra", initial as u64 + 1000);
+                if initial % 3 == 2 {
+                    span.record("optional", initial as u64 + 2000);
+                }
+            }
+            drop(span);
+        }
+        let rows = recorder.rows(start.id, None, 600);
+        assert_eq!(rows.len(), 600);
+        let mut references = Vec::new();
+        for row in rows {
+            let initial = row
+                .fields
+                .iter()
+                .find_map(|(name, value)| match value {
+                    ValueData::U64(value) if name == "initial" => Some(*value),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(row.index as u64, initial + 1);
+            assert!(row.end_timestamp_ns.unwrap() >= row.timestamp_ns.unwrap());
+            if initial % 3 == 0 {
+                assert!(row.extra_fields.is_none());
+                continue;
+            }
+            let reference = row.extra_fields.unwrap();
+            let span = SpanId {
+                callsite: start.id.callsite as u32,
+                archetype: start.id.archetype,
+                index: row.index as u64,
+            };
+            let fields = recorder.span_fields(span, reference).unwrap();
+            assert!(fields.iter().any(|(name, value)| name == "extra"
+                && matches!(value, ValueData::U64(value) if *value == initial + 1000)));
+            assert_eq!(fields.len(), if initial % 3 == 2 { 2 } else { 1 });
+            if initial % 3 == 2 {
+                assert!(fields.iter().any(|(name, value)| name == "optional"
+                    && matches!(value, ValueData::U64(value) if *value == initial + 2000)));
+            }
+            references.push(reference);
+        }
+        assert!(references.iter().any(|reference| reference.block > 1));
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.archetype != references[0].archetype)
+        );
+        assert_eq!(size_of::<SpanFieldsRef>(), 8);
+    }
+
+    #[test]
+    fn active_span_reference_and_follows_from_keep_their_header_offsets() {
+        let recorder = Arc::new(RecordingLayer::new());
+        let _guard = tracing::subscriber::set_default(subscriber(recorder.clone()));
+        let other = tracing::info_span!("other");
+        let span = tracing::info_span!("active_link", extra = tracing::field::Empty);
+        span.follows_from(&other);
+        span.record("extra", 42u64);
+        drop(span);
+        let start = recorder
+            .inspect(&Default::default())
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.metadata.name() == "active_link" && snapshot.kind == RecordKind::Span
+            })
+            .unwrap();
+        let row = recorder.rows(start.id, None, 1).remove(0);
+        assert!(row.follows_from.is_some());
+        let reference = row.extra_fields.unwrap();
+        assert_eq!(reference.block, 1);
+        let span = SpanId {
+            callsite: start.id.callsite as u32,
+            archetype: start.id.archetype,
+            index: row.index as u64,
+        };
+        assert!(matches!(
+            &recorder.span_fields(span, reference).unwrap()[0].1,
+            ValueData::U64(42)
+        ));
+        assert!(
+            recorder
+                .span_fields(span, SpanFieldsRef::default())
+                .is_none()
+        );
+        assert!(
+            recorder
+                .span_fields(
+                    span,
+                    SpanFieldsRef {
+                        block: u32::MAX,
+                        ..reference
+                    }
+                )
+                .is_none()
+        );
+        drop(other);
     }
 }

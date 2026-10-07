@@ -104,6 +104,8 @@ impl<'a> Drop for Row<'a> {
                     let mut unpacked = Frame::new(unit, compact_frame.length);
                     compact_frame.uncompact(&mut unpacked);
                     unpacked.buffer[unit..][unit * self.index..][..unit].copy_from_slice(&buffer);
+                    // A formerly constant header byte can change when a span closes.
+                    unpacked.compute_mask(self.index);
                     let new = CompactFrame::new_from(&unpacked);
                     **compact_frame = new;
                 }
@@ -202,22 +204,19 @@ impl Frame {
         Some((&mut buffer[index..index + self.unit], self.length - 1))
     }
 
-    // updates mask with overlap of index and index-1
+    // Appends inspect the previous row; edits inspect both neighboring pairs.
+    // This also catches edits to row zero, whose new constants affect every row.
     pub fn compute_mask(&mut self, index: usize) {
         let (mask, buffer) = self.buffer.split_at_mut(self.unit);
-        let index = self.unit * (self.length - 1);
-        if index == 0 {
-            return;
-        }
-
-        // NOTE https://github.com/rust-lang/rust/issues/43702
-        // TODO vectorize
-        for ((m, a), b) in mask
-            .iter_mut()
-            .zip(buffer[index - self.unit..index].iter())
-            .zip(buffer[index..self.unit + index].iter())
-        {
-            *m |= *a ^ *b;
+        for next in index.max(1)..=(index + 1).min(self.length.saturating_sub(1)) {
+            let offset = self.unit * next;
+            for ((m, a), b) in mask
+                .iter_mut()
+                .zip(&buffer[offset - self.unit..offset])
+                .zip(&buffer[offset..offset + self.unit])
+            {
+                *m |= *a ^ *b;
+            }
         }
     }
 

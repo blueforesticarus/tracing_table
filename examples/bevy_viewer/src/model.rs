@@ -516,6 +516,7 @@ mod tests {
             index: 0,
             timestamp_ns: None,
             end_timestamp_ns: None,
+            extra_fields: None,
             span: None,
             parent: None,
             follows_from: None,

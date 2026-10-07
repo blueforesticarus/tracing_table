@@ -214,7 +214,29 @@ python3 -m unittest discover -s util
    must support deletion
 2. support deletion of blocks, which must also cleanup strings
 3. order of logs (in a thread, at a minimum, though possibly nominally) must be recoverable. timestamps are not enough
-4. should allow per thread dumping to a collector thread
-5. probably should have bounded lookups for spans active at a given time, which effects block design, might be able to get away without it due to events pointing to span id's. we already have bounded lookup for events/span start/end
-6. we need indexing over fields, for efficient entity lookup
-7. all sources of memory use must be tracked. 
+   what we should do, is use timestamp + disambiguator
+   disambiguator SHOULD be cross thread so that cross thread timing can be reconstructed, since that timing may be nonarbitrary in the case of locks.
+   we can reduce bits in order to 
+4. we might want to allow blocks to grow past default length, untill adding the row would require invalidate a currently compactible bytecolumn
+5. support bitpacked version of frame
+6. support compressing frames.
+7. should allow per thread dumping to a collector thread
+8. probably should have bounded lookups for spans active at a given time, which effects block design, might be able to get away without it due to events pointing to span id's. we already have bounded lookup for events/span start/end
+9.  we need indexing over fields, for efficient entity lookup
+10. all sources of memory use must be tracked. 
+11. we should probably compute the prefix per block, when compacting.
+   though this may result in "finished frame 1000|1" "finished frame 1000|2"
+   when what we want is "finished frame |10001"
+   however whole archetype prefixing means one weird message disables prefixing entirely. 
+   **compromise might be reseting when prefix is 0 (or a small number of bytes, 8 feels right due to overhead reasons)**
+   but we still should resplit the block on compression
+12. traitify dyntuple values. support multiple rep formats for a given output type. try to avoid depending on subscriber for soundness of dyntuple actions. may consider nestable / composable dyntuples.
+13. need a test which compares just recording every log directly to a file with logs reconstructed from the tracing_table, for accuracy.
+14. we may want to store the blocks columnar, either by field or by byte. This might assist with compression. supporting this is tricky, ideally should be a compiletime abstraction for perf
+15. messages are generally similar per callsite, so it is likely they should be stored together per callsite, possibly in a compressed block. fields are more likely to be shared, so perhaps handle those seperately. compression could use lz4 with a dictionary shared by all the blocks of a given archetype.
+16. however string fields are stored it needs to be easy to equality check, so we can scan for a value like entity="201v1", *this is different than message which has different tradeoffs*
+
+## TODO benchmark
+64K is a good default lz4 size. my guess is that's as large as we want to go considering random access (following span heirarchy, indexing by entity, etc.)
+
+however, this increases the likelihood of needing more columns in the compacted frame

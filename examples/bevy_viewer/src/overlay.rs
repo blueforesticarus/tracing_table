@@ -1,5 +1,5 @@
 //! Basic UI. All recording locks are released before their owned results render.
-use crate::inspection::{ArchetypeId, RecordKind, RecordedRow, RecordingControl};
+use crate::inspection::{ArchetypeId, InspectRecording, RecordKind, RecordedRow, RecordingControl};
 use crate::{
     model::{self, SortColumn, SortOrder, StatsCache},
     scene::SceneSettings,
@@ -16,7 +16,7 @@ use tracing_table::{
         dataframe::CompressionStats,
         stringcache::{STRING_INDEX, STRING_STATS},
     },
-    subscriber::{RecordingLayer, USE_INDEXED_ATOM},
+    subscriber::{RecordingLayer, SpanId, USE_INDEXED_ATOM},
 };
 
 #[derive(Resource)]
@@ -493,6 +493,15 @@ pub fn draw(
                     if let Some((_, entity)) = row.fields.iter().find(|(name, _)| name == "entity") {
                         let entity = model::field_text(entity);
                         if ui.small_button(format!("entity={entity}")).on_hover_text("View logs for this entity").clicked() { picked_entity = Some(entity); }
+                    }
+                    if let (Some(reference), Some(selected)) = (row.extra_fields, viewer.selected) {
+                        ui.small_button(format!("extra {}:{}", reference.archetype, reference.block))
+                            .on_hover_ui(|ui| {
+                                let span = SpanId { callsite: selected.callsite as u32, archetype: selected.archetype, index: row.index as u64 };
+                                if let Some(fields) = viewer.recorder.span_fields(span, reference) {
+                                    for (name, value) in fields { ui.monospace(format!("{name}={}", model::field_text(&value))); }
+                                } else { ui.label("Extra fields unavailable"); }
+                            });
                     }
                     ui.monospace(format!("#{} {timestamp} {} {fields}", row.index, model::message(row)))
                         .on_hover_text(format!("end={:?} span={:?} parent={:?} follows={:?}", row.end_timestamp_ns, row.span, row.parent, row.follows_from));

@@ -3,9 +3,14 @@ name = "tracing_table_bevy_viewer"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "tracing_table_bevy_viewer"
 
 # A standalone package keeps the renderer out of root builds and benchmarks.
 [workspace]
+
+[features]
+# Enable Bevy's high-volume library callsites only for the compression run.
+compression_detailed_trace = ["bevy/detailed_trace"]
 
 [dependencies]
 tracing_table = { path = "../.." }
@@ -15,6 +20,7 @@ streaming-iterator = "0.1.9"
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = "0.3"
+lz4_flex = "0.11"
 
 [profile.dev]
 debug = 0

@@ -116,7 +116,13 @@ fn viewer_reset_and_components() {
                     .iter()
                     .map(|part| part.name.as_str())
                     .collect::<Vec<_>>(),
-                ["ts", "end_ts", "follows_from"]
+                [
+                    "ts",
+                    "end_ts",
+                    "extra_archetype",
+                    "extra_block",
+                    "follows_from"
+                ]
             );
             let rows = recorder.rows(arch.snapshot.id, None, 1000);
             assert_eq!(rows.len(), 1000);

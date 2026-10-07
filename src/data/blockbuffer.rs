@@ -141,6 +141,7 @@ impl BlockCache {
     }
 
     // track earliest and latest ts for block
+    // called when a span closes
     pub fn compute_timestamp(&mut self, ts: usize, index: Option<usize>) {
         let index = index.unwrap_or(self.count + self.active.length);
 
@@ -150,7 +151,8 @@ impl BlockCache {
             &mut self
                 .ring
                 .iter_mut()
-                .find(|d| index > d.index)
+                .rev()
+                .find(|d| d.index <= index)
                 .unwrap()
                 .timestamp
         };
