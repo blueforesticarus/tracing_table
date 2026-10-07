@@ -1,13 +1,15 @@
 //! A standalone experiment: engine TRACE capture, scene instrumentation, and a
 //! basic egui overlay. The root crate does not depend on this renderer package.
+mod inspection;
 mod model;
 mod overlay;
 mod scene;
+mod strings;
 use bevy::{log::LogPlugin, prelude::*};
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
-use std::sync::Arc;
-use tracing_subscriber::{Registry, layer::SubscriberExt};
-use tracing_table::subscriber::RecordingLayer;
+use inspection::InspectRecording;
+use std::sync::{Arc, atomic::Ordering};
+use tracing_table::subscriber::{RecordingLayer, USE_INDEXED_ATOM};
 
 // Optional finite run for display/GPU smoke validation without a manual close.
 #[derive(Resource)]
@@ -20,14 +22,19 @@ fn smoke_exit(mut frames: ResMut<SmokeFrames>, mut commands: Commands) {
 }
 
 fn main() {
+    // Configure string storage before installing tracing or starting Bevy workers.
+    let indexed = std::env::var("USE_INDEXED_ATOM")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    USE_INDEXED_ATOM.store(indexed, Ordering::Relaxed);
     let recorder = Arc::new(RecordingLayer::new());
     // A global dispatch captures Bevy workers; no fmt layer or level filter is
     // added, so all tracing targets are recorded at TRACE without stderr spam.
-    tracing::subscriber::set_global_default(Registry::default().with(recorder.layer()))
+    let control = inspection::RecordingControl::new(recorder.clone());
+    tracing::subscriber::set_global_default(inspection::subscriber_with_control(control.clone()))
         .expect("install recording subscriber before Bevy startup");
     tracing_log::LogTracer::init().expect("bridge log crate events into tracing");
     let mut app = App::new();
-    app.insert_resource(overlay::Viewer::new(recorder.clone()))
+    app.insert_resource(overlay::Viewer::new(recorder.clone(), control))
         .init_resource::<scene::SceneSettings>()
         .add_plugins(
             DefaultPlugins

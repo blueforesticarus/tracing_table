@@ -8,7 +8,8 @@ bytemuck = { version = "1.23.0", features = ["derive"] }
 parking_lot = { version = "0.12.3", features = ["arc_lock"] }
 smallvec = { version = "1.15.0", features = ["const_generics"] }
 streaming-iterator = "0.1.9"
-string_cache = "0.8.9"
+string_cache = "0.11.0"
 tracing = "0.1.41"
 tracing-core = "0.1.33"
 tracing-subscriber = { version = "0.3.19", features = ["std"] }
+tracing-log = "0.2.0"

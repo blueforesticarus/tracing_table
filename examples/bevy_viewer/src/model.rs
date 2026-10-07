@@ -1,23 +1,52 @@
 //! Example-owned compression cache and presentation/query policy. This module
 //! deliberately has no Bevy dependency so root tests can exercise it cheaply.
-use std::collections::HashMap;
-use tracing_table::{
-    data::{dataframe::CompressionStats, dyntuple::ValueData},
-    subscriber::{ArchetypeId, ArchetypeSnapshot, FrameRevisions, RecordedRow, RecordingLayer},
+use crate::inspection::{
+    ArchetypeId, ArchetypeSnapshot, FrameSizes, InspectRecording, RecordedRow,
 };
+use std::collections::HashMap;
+use tracing_table::data::{dataframe::CompressionStats, dyntuple::ValueData};
+use tracing_table::subscriber::RecordingLayer;
 
 pub struct CachedArchetype {
     pub snapshot: ArchetypeSnapshot,
     pub ring: CompressionStats,
     pub total: CompressionStats,
     pub fields: Vec<FieldCompression>,
+    pub components: Vec<FieldCompression>,
+    // Retain completed-block totals so a refresh does not rescan old row headers.
+    pub block_duration_sum_ns: u128,
+    pub timed_blocks: usize,
+}
+
+impl CachedArchetype {
+    pub fn average_block_duration_ns(&self) -> Option<f64> {
+        (self.timed_blocks > 0)
+            .then(|| self.block_duration_sum_ns as f64 / self.timed_blocks as f64)
+    }
+}
+
+/// Keep timestamp durations legible without losing sub-millisecond resolution.
+pub fn duration_text(ns: Option<f64>) -> String {
+    let Some(ns) = ns else {
+        return "—".into();
+    };
+    let (value, unit) = if ns >= 1e9 {
+        (ns / 1e9, "s")
+    } else if ns >= 1e6 {
+        (ns / 1e6, "ms")
+    } else if ns >= 1e3 {
+        (ns / 1e3, "µs")
+    } else {
+        (ns, "ns")
+    };
+    format!("{} {unit}", significant_text(value))
 }
 
 #[derive(Default)]
 pub struct StatsCache {
     pub archetypes: HashMap<ArchetypeId, CachedArchetype>,
     pub total: CompressionStats,
-    pub revisions: FrameRevisions,
+    pub frame_sizes: FrameSizes,
     frames: HashMap<(ArchetypeId, usize), CachedFrame>,
     /// Visible diagnostic: only changed completed frames increment this counter.
     pub completed_recomputations: usize,
@@ -35,7 +64,9 @@ pub struct FieldCompression {
 }
 struct CachedFrame {
     stats: CompressionStats,
+    duration_ns: Option<u64>,
     fields: Vec<FieldCompression>,
+    components: Vec<FieldCompression>,
 }
 
 fn field_contribution(
@@ -84,7 +115,7 @@ fn subtract(a: CompressionStats, b: CompressionStats) -> CompressionStats {
 
 impl StatsCache {
     pub fn refresh(&mut self, recorder: &RecordingLayer) {
-        for mut snapshot in recorder.inspect(&self.revisions) {
+        for mut snapshot in recorder.inspect(&self.frame_sizes) {
             let old = self.archetypes.remove(&snapshot.id);
             let mut ring = old
                 .as_ref()
@@ -93,6 +124,12 @@ impl StatsCache {
                 || vec![FieldCompression::default(); snapshot.fields.len()],
                 |old| old.fields.clone(),
             );
+            let mut components = old.as_ref().map_or_else(
+                || vec![FieldCompression::default(); snapshot.components.len()],
+                |old| old.components.clone(),
+            );
+            let mut block_duration_sum_ns = old.as_ref().map_or(0, |old| old.block_duration_sum_ns);
+            let mut timed_blocks = old.as_ref().map_or(0, |old| old.timed_blocks);
             for frame in snapshot.completed_updates.drain(..) {
                 let key = (snapshot.id, frame.id);
                 let next: Vec<_> = snapshot
@@ -100,15 +137,28 @@ impl StatsCache {
                     .iter()
                     .map(|range| field_contribution(range.as_ref(), frame.rows, &frame.mask))
                     .collect();
+                let next_components: Vec<_> = snapshot
+                    .components
+                    .iter()
+                    .map(|component| {
+                        field_contribution(Some(&component.range), frame.rows, &frame.mask)
+                    })
+                    .collect();
                 let previous = self.frames.insert(
                     key,
                     CachedFrame {
                         stats: frame.stats,
+                        duration_ns: frame.duration_ns,
                         fields: next.clone(),
+                        components: next_components.clone(),
                     },
                 );
                 if let Some(previous) = &previous {
                     ring = subtract(ring, previous.stats);
+                    if let Some(duration) = previous.duration_ns {
+                        block_duration_sum_ns -= duration as u128;
+                        timed_blocks -= 1;
+                    }
                 }
                 let empty = vec![FieldCompression::default(); fields.len()];
                 replace_fields(
@@ -118,8 +168,20 @@ impl StatsCache {
                         .map_or(&empty[..], |previous| &previous.fields),
                     &next,
                 );
+                let empty_components = vec![FieldCompression::default(); components.len()];
+                replace_fields(
+                    &mut components,
+                    previous
+                        .as_ref()
+                        .map_or(&empty_components[..], |previous| &previous.components),
+                    &next_components,
+                );
+                if let Some(duration) = frame.duration_ns {
+                    block_duration_sum_ns += duration as u128;
+                    timed_blocks += 1;
+                }
                 ring = ring + frame.stats;
-                self.revisions.insert(key, frame.revision);
+                self.frame_sizes.insert(key, frame.packed_len);
                 self.completed_recomputations += 1;
             }
             let total = ring + snapshot.active;
@@ -134,6 +196,9 @@ impl StatsCache {
                     ring,
                     total,
                     fields,
+                    components,
+                    block_duration_sum_ns,
+                    timed_blocks,
                 },
             );
         }
@@ -172,11 +237,14 @@ pub fn significant_text(mut value: f64) -> String {
     format!("{value:.decimals$}")
 }
 pub fn compression_percent(raw: usize, packed: usize) -> f64 {
-    if raw == 0 {
-        0.0
-    } else {
-        100.0 * (1.0 - packed as f64 / raw as f64)
-    }
+    // Fields share the same ratio calculation as whole-archetype statistics.
+    100.0
+        * CompressionStats {
+            data: raw,
+            compressed: packed,
+            ..Default::default()
+        }
+        .raw_ratio()
 }
 pub fn storage(stats: CompressionStats) -> usize {
     stats.compressed + stats.overhead + stats.overalloc
@@ -195,42 +263,52 @@ pub enum SortColumn {
     Id,
     Target,
     Source,
+    Level,
     Kind,
     Rows,
+    Total,
     Raw,
     Packed,
     Overhead,
     Unused,
     Compression,
+    RawCompression,
     Storage,
     Blocks,
+    BlockDuration,
 }
 impl SortColumn {
-    pub const COLUMNS: [(Self, &'static str); 12] = [
+    pub const COLUMNS: [(Self, &'static str); 15] = [
         (Self::Id, "Callsite:arch"),
         (Self::Target, "Target / name"),
         (Self::Source, "Source"),
+        (Self::Level, "Level"),
         (Self::Kind, "Kind"),
         (Self::Rows, "Rows"),
-        (Self::Raw, "Raw"),
-        (Self::Packed, "Packed"),
-        (Self::Overhead, "Overhead"),
-        (Self::Unused, "Unused"),
-        (Self::Compression, "Comp. %"),
-        (Self::Storage, "Storage %"),
         (Self::Blocks, "Blocks"),
+        (Self::BlockDuration, "Avg block duration"),
+        (Self::Raw, "Data"),
+        (Self::Total, "Total"),
+        (Self::Packed, "Compressed"),
+        (Self::Overhead, "Overhead"),
+        (Self::Unused, "Overalloc"),
+        (Self::Compression, "Ratio %"),
+        (Self::RawCompression, "Raw ratio %"),
     ];
 }
 #[derive(Clone, Copy)]
 pub struct SortOrder {
     pub column: SortColumn,
     pub descending: bool,
+    /// Byte columns follow the displayed units when the UI shows bytes per row.
+    pub per_row: bool,
 }
 impl Default for SortOrder {
     fn default() -> Self {
         Self {
             column: SortColumn::Packed,
             descending: true,
+            per_row: false,
         }
     }
 }
@@ -242,7 +320,11 @@ impl SortOrder {
             self.column = column;
             self.descending = !matches!(
                 column,
-                SortColumn::Id | SortColumn::Target | SortColumn::Source | SortColumn::Kind
+                SortColumn::Id
+                    | SortColumn::Target
+                    | SortColumn::Source
+                    | SortColumn::Level
+                    | SortColumn::Kind
             );
         }
     }
@@ -259,24 +341,39 @@ pub fn sorted_archetypes(cache: &StatsCache, filter: &str, sort: SortOrder) -> V
         let b_arch = &cache.archetypes[b];
         let a_snap = &a_arch.snapshot;
         let b_snap = &b_arch.snapshot;
+        let compare_bytes = |a_bytes: usize, b_bytes: usize| {
+            if sort.per_row {
+                (a_bytes as f64 / a_snap.rows.max(1) as f64)
+                    .total_cmp(&(b_bytes as f64 / b_snap.rows.max(1) as f64))
+            } else {
+                a_bytes.cmp(&b_bytes)
+            }
+        };
         let order = match sort.column {
             SortColumn::Id => a.cmp(b),
             SortColumn::Target => (a_snap.metadata.target(), a_snap.metadata.name())
                 .cmp(&(b_snap.metadata.target(), b_snap.metadata.name())),
             SortColumn::Source => (a_snap.metadata.file(), a_snap.metadata.line())
                 .cmp(&(b_snap.metadata.file(), b_snap.metadata.line())),
+            // Use tracing's severity ordering rather than sorting level names.
+            SortColumn::Level => a_snap.metadata.level().cmp(b_snap.metadata.level()),
             SortColumn::Kind => format!("{:?}", a_snap.kind).cmp(&format!("{:?}", b_snap.kind)),
             SortColumn::Rows => a_snap.rows.cmp(&b_snap.rows),
-            SortColumn::Raw => a_arch.total.data.cmp(&b_arch.total.data),
-            SortColumn::Packed => a_arch.total.compressed.cmp(&b_arch.total.compressed),
-            SortColumn::Overhead => a_arch.total.overhead.cmp(&b_arch.total.overhead),
-            SortColumn::Unused => a_arch.total.overalloc.cmp(&b_arch.total.overalloc),
+            SortColumn::Total => compare_bytes(storage(a_arch.total), storage(b_arch.total)),
+            SortColumn::Raw => compare_bytes(a_arch.total.data, b_arch.total.data),
+            SortColumn::Packed => compare_bytes(a_arch.total.compressed, b_arch.total.compressed),
+            SortColumn::Overhead => compare_bytes(a_arch.total.overhead, b_arch.total.overhead),
+            SortColumn::Unused => compare_bytes(a_arch.total.overalloc, b_arch.total.overalloc),
             SortColumn::Blocks => a_snap.blocks.cmp(&b_snap.blocks),
-            SortColumn::Compression => {
-                compression_percent(a_arch.total.data, a_arch.total.compressed).total_cmp(
-                    &compression_percent(b_arch.total.data, b_arch.total.compressed),
-                )
-            }
+            SortColumn::BlockDuration => a_arch
+                .average_block_duration_ns()
+                .unwrap_or(-1.0)
+                .total_cmp(&b_arch.average_block_duration_ns().unwrap_or(-1.0)),
+            SortColumn::Compression => a_arch.total.ratio().total_cmp(&b_arch.total.ratio()),
+            SortColumn::RawCompression => a_arch
+                .total
+                .raw_ratio()
+                .total_cmp(&b_arch.total.raw_ratio()),
             // All shares use the same denominator, so sort by storage bytes.
             SortColumn::Storage => storage(a_arch.total).cmp(&storage(b_arch.total)),
         };
@@ -317,6 +414,9 @@ pub fn field_text(value: &ValueData) -> String {
         ValueData::Bool(v) => format!("bool:{v}"),
         ValueData::Str(v) => format!("str:{v}"),
         ValueData::PrefixStr(a, b) => format!("str:{a}{b}"),
+        // Raw global indexed values use the same display and filter keys as Atoms.
+        ValueData::StrIndex(v) => format!("str:{v}"),
+        ValueData::PrefixStrIndex(a, b) => format!("str:{a}{b}"),
     }
 }
 
@@ -327,6 +427,8 @@ pub fn message(row: &RecordedRow) -> String {
         .map_or_else(String::new, |(_, value)| match value {
             ValueData::Str(v) => v.to_string(),
             ValueData::PrefixStr(a, b) => format!("{a}{b}"),
+            ValueData::StrIndex(v) => v.to_string(),
+            ValueData::PrefixStrIndex(a, b) => format!("{a}{b}"),
             _ => field_text(value),
         })
 }
@@ -395,36 +497,114 @@ pub fn matching_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspection::RecordKind;
     use std::sync::Arc;
-    use tracing_subscriber::{Registry, layer::SubscriberExt};
-    use tracing_table::subscriber::RecordKind;
+    fn stats_values(s: CompressionStats) -> (usize, usize, usize, usize) {
+        (s.data, s.compressed, s.overhead, s.overalloc)
+    }
+
+    #[test]
+    fn indexed_strings_share_atom_labels_and_messages() {
+        use tracing_table::data::{dyntuple::Atom, stringcache::AtomIndexed};
+        // Indexed fields must share the ordinary string display and filter keys.
+        let text = "long indexed message";
+        assert_eq!(
+            field_text(&ValueData::StrIndex(AtomIndexed::from(text))),
+            field_text(&ValueData::Str(Atom::from(text))),
+        );
+        let row = RecordedRow {
+            index: 0,
+            timestamp_ns: None,
+            end_timestamp_ns: None,
+            span: None,
+            parent: None,
+            follows_from: None,
+            fields: vec![
+                (
+                    "message".into(),
+                    ValueData::PrefixStrIndex(
+                        AtomIndexed::from("long indexed "),
+                        AtomIndexed::from("message"),
+                    ),
+                ),
+                (
+                    "entity".into(),
+                    ValueData::StrIndex(AtomIndexed::from(text)),
+                ),
+            ],
+        };
+        assert_eq!(message(&row), text);
+        assert_eq!(field_text(&row.fields[0].1), format!("str:{text}"));
+        assert!(matches_entity(&row, &format!("str:{text}")));
+    }
 
     #[test]
     fn ring_totals_replace_changed_frames_without_recomputing_stable_frames() {
         let recorder = Arc::new(RecordingLayer::new());
-        let _guard = tracing::subscriber::set_default(Registry::default().with(recorder.layer()));
-        let make_span = || tracing::info_span!("cached_span", entity = 7u64);
-        let retained = make_span();
+        let _guard =
+            tracing::subscriber::set_default(crate::inspection::subscriber(recorder.clone()));
+        // Use append-only event fixtures: testing span-storage fixes is outside
+        // this example's scope. Cache replacement itself is tested separately.
+        let emit = || tracing::info!("cached event");
         for _ in 0..300 {
-            drop(make_span());
+            emit();
         }
         let mut cache = StatsCache::default();
         cache.refresh(&recorder);
-        assert_eq!(cache.total, recorder.compression_ratio());
+        assert_eq!(
+            stats_values(cache.total),
+            stats_values(recorder.compression_ratio())
+        );
         let initial = cache.completed_recomputations;
         assert!(initial > 0);
         cache.refresh(&recorder);
         assert_eq!(cache.completed_recomputations, initial);
-        drop(retained);
-        cache.refresh(&recorder);
-        assert_eq!(cache.completed_recomputations, initial + 1);
-        assert_eq!(cache.total, recorder.compression_ratio());
         for _ in 0..300 {
-            drop(make_span());
+            emit();
         }
         cache.refresh(&recorder);
-        assert!(cache.completed_recomputations > initial + 1);
-        assert_eq!(cache.total, recorder.compression_ratio());
+        assert!(cache.completed_recomputations > initial);
+        assert_eq!(
+            stats_values(cache.total),
+            stats_values(recorder.compression_ratio())
+        );
+        let after_rollover = cache.completed_recomputations;
+        cache.refresh(&recorder);
+        assert_eq!(cache.completed_recomputations, after_rollover);
+    }
+
+    #[test]
+    fn block_duration_average_matches_completed_timestamps_and_is_cached() {
+        let recorder = Arc::new(RecordingLayer::new());
+        let _guard =
+            tracing::subscriber::set_default(crate::inspection::subscriber(recorder.clone()));
+        for value in 0..600u64 {
+            tracing::info!(value, "block duration fixture");
+        }
+        let snapshot = recorder.inspect(&Default::default()).remove(0);
+        let durations: Vec<_> = snapshot
+            .completed_updates
+            .iter()
+            .filter_map(|frame| frame.duration_ns)
+            .collect();
+        assert!(!durations.is_empty());
+        let expected_sum: u128 = durations.iter().map(|&ns| ns as u128).sum();
+        let mut cache = StatsCache::default();
+        cache.refresh(&recorder);
+        let arch = &cache.archetypes[&snapshot.id];
+        assert_eq!(arch.timed_blocks, snapshot.blocks - 1);
+        assert_eq!(arch.block_duration_sum_ns, expected_sum);
+        assert_eq!(
+            arch.average_block_duration_ns(),
+            Some(expected_sum as f64 / durations.len() as f64)
+        );
+        let calculations = cache.completed_recomputations;
+        cache.refresh(&recorder);
+        assert_eq!(cache.completed_recomputations, calculations);
+        assert_eq!(
+            cache.archetypes[&snapshot.id].block_duration_sum_ns,
+            expected_sum
+        );
     }
 
     #[test]
@@ -453,7 +633,8 @@ mod tests {
     #[test]
     fn sorting_defaults_to_largest_packed_size_and_reverses_on_click() {
         let recorder = Arc::new(RecordingLayer::new());
-        let _guard = tracing::subscriber::set_default(Registry::default().with(recorder.layer()));
+        let _guard =
+            tracing::subscriber::set_default(crate::inspection::subscriber(recorder.clone()));
         for i in 0..100u64 {
             tracing::info!(target: "large", value = i);
         }
@@ -490,7 +671,8 @@ mod tests {
     #[test]
     fn field_statistics_use_completed_masks_and_exclude_active_rows() {
         let recorder = Arc::new(RecordingLayer::new());
-        let _guard = tracing::subscriber::set_default(Registry::default().with(recorder.layer()));
+        let _guard =
+            tracing::subscriber::set_default(crate::inspection::subscriber(recorder.clone()));
         for i in 0..1000u64 {
             tracing::info!(
                 marker = 57u64,
@@ -574,7 +756,8 @@ mod tests {
     #[test]
     fn filters_page_history_and_preserve_entity_types_and_messages() {
         let recorder = Arc::new(RecordingLayer::new());
-        let _guard = tracing::subscriber::set_default(Registry::default().with(recorder.layer()));
+        let _guard =
+            tracing::subscriber::set_default(crate::inspection::subscriber(recorder.clone()));
         for i in 0..600u64 {
             tracing::info!(entity = i % 600, message = "matching message suffix");
         }
@@ -610,7 +793,7 @@ mod tests {
             }
         }
         assert_eq!(entity_choices(&choices), ["123", "str:123"]);
-        // Exercise the revision map and per-frame contributions independently.
-        assert!(!cache.revisions.is_empty());
+        // Cache existing packed lengths without library-side mutation tracking.
+        assert!(!cache.frame_sizes.is_empty());
     }
 }

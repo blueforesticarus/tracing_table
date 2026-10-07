@@ -1,14 +1,13 @@
 //! Explicit synthetic workload: no sleeps, renderer, or timing assertions.
+#[path = "../examples/bevy_viewer/src/inspection.rs"]
+mod inspection;
+use inspection::{InspectRecording, RecordKind};
 use std::{
     sync::{Arc, Barrier},
     thread,
     time::Instant,
 };
-use tracing_subscriber::{Registry, layer::SubscriberExt};
-use tracing_table::{
-    data::dyntuple::ValueData,
-    subscriber::{RecordKind, RecordingLayer},
-};
+use tracing_table::{data::dyntuple::ValueData, subscriber::RecordingLayer};
 
 // Each expansion creates its own static tracing callsite; a runtime target or
 // message alone would still exercise only one callsite.
@@ -127,7 +126,7 @@ fn synthetic_multithreaded_tracing() {
     let iterations = setting("TRACING_BENCH_ITERATIONS", 100_000, usize::MAX / 64);
     let callsites = setting("TRACING_BENCH_CALLSITES", 32, 64);
     let recorder = Arc::new(RecordingLayer::new());
-    let dispatch = tracing::Dispatch::new(Registry::default().with(recorder.layer()));
+    let dispatch = tracing::Dispatch::new(inspection::subscriber(recorder.clone()));
     let barrier = Arc::new(Barrier::new(threads + 1));
     let mut workers = Vec::new();
     for worker in 0..threads {

@@ -140,6 +140,7 @@ impl BlockCache {
         self.active.compute_mask(self.active.length - 1);
     }
 
+    // track earliest and latest ts for block
     pub fn compute_timestamp(&mut self, ts: usize, index: Option<usize>) {
         let index = index.unwrap_or(self.count + self.active.length);
 

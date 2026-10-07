@@ -202,6 +202,7 @@ impl Frame {
         Some((&mut buffer[index..index + self.unit], self.length - 1))
     }
 
+    // updates mask with overlap of index and index-1
     pub fn compute_mask(&mut self, index: usize) {
         let (mask, buffer) = self.buffer.split_at_mut(self.unit);
         let index = self.unit * (self.length - 1);

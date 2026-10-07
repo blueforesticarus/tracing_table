@@ -8,17 +8,31 @@ use std::{
     path::Prefix,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{ArcRwLockWriteGuard, RawRwLock, RwLock};
-use tracing::{Metadata, field::Visit};
-use tracing_core::{Callsite, callsite::Identifier};
+use tracing::{
+    Level, Metadata,
+    field::{FieldSet, Visit},
+};
+use tracing_core::{Callsite, Kind, callsite::Identifier};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
-use crate::data::{blockbuffer::BlockCache, dataframe::CompressionStats, dyntuple::{Atom, BytePacker, ValueData, ValueKind}};
+use crate::data::stringcache::{Index, Stats};
+
+use crate::data::{
+    blockbuffer::BlockCache,
+    dataframe::CompressionStats,
+    dyntuple::{Atom, BytePacker, ValueData, ValueKind},
+};
+
+/// Controls indexed string storage for subsequently recorded fields in all layers.
+/// Defaults to Atom storage; toggle with store(value, Ordering::Relaxed).
+pub static USE_INDEXED_ATOM: AtomicBool = AtomicBool::new(false);
 
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
@@ -78,9 +92,99 @@ pub struct PerArchData {
     pub id: u32,
 }
 
-// Needed because tracing_log adapter doesn't register it's callsites
-fn leak_metadata<'a>(callsite: &'a Metadata<'a>) -> &'static Metadata<'static> {
-    todo!()
+/// the tracing_log crate adapts the log crates message to tracing events.
+/// log does not use 'static metadata. this function stores the strings and metadata perminantly so we can use it with the rest of the logger.
+/// it dedups by both string and metadata
+pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static> {
+    const MAX_CALLSITES: usize = 4000;
+    const MAX_STRINGS: usize = MAX_CALLSITES * 3 + 1; //should not be hit
+
+    if !e.is_log() {
+        return e.metadata();
+    }
+
+    // get normalized metadata with tracing_log::NormalizedMetadata. does no allocations
+    // NOTE log::Record has file_static() and module_path_static() which return options if the strings are in fact static.
+    // we could rewrite tracing_log to more intelligently produce 'static metadata.
+    // especially nice since we could skip string equality checks
+    let meta = e.normalized_metadata().expect("is_log");
+
+    fn intern(text: &str) -> &'static str {
+        use parking_lot::RwLock;
+        use std::{collections::HashSet, sync::LazyLock};
+
+        // One permanent copy per distinct string, shared across calls.
+        static STRINGS: LazyLock<RwLock<HashSet<&'static str>>> = LazyLock::new(Default::default);
+
+        if let Some(&stored) = STRINGS.read().get(text) {
+            return stored;
+        }
+
+        let mut strings = STRINGS.write();
+        // Another thread may have inserted it before we acquired the write lock.
+        if let Some(&stored) = strings.get(text) {
+            return stored;
+        }
+
+        let stored: &'static str = Box::leak(text.to_owned().into_boxed_str());
+        assert!(
+            strings.len() < MAX_STRINGS,
+            "should never happen, MAX_CALLSITES should be hit first"
+        );
+        strings.insert(stored);
+
+        stored
+    }
+
+    // intern strings that are 'a
+    let target = intern(meta.target());
+    let file = meta.file().map(intern);
+    let module = meta.module_path().map(intern);
+
+    // Interned strings have unique addresses: metadata lookup hashes no string bytes.
+    // The adapter callsite identifies the level; Options preserve missing vs empty.
+    type Key = (
+        Identifier,
+        Level,
+        usize,
+        Option<usize>,
+        Option<usize>,
+        Option<u32>,
+    );
+    static METADATA: std::sync::LazyLock<RwLock<HashMap<Key, &'static Metadata<'static>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = (
+        meta.callsite(),
+        *meta.level(),
+        target.as_ptr() as usize,
+        module.map(|text| text.as_ptr() as usize),
+        file.map(|text| text.as_ptr() as usize),
+        meta.line(),
+    );
+    if let Some(&stored) = METADATA.read().get(&key) {
+        return stored;
+    }
+
+    // Recheck under the write lock before allocating, so concurrent misses leak once.
+    let mut metadata = METADATA.write();
+    assert!(
+        metadata.len() < MAX_CALLSITES,
+        "most likely log targets are being dynamically generated"
+    );
+    metadata.entry(key).or_insert_with(|| {
+        let static_meta = Metadata::new(
+            "compat:log",
+            target,
+            *meta.level(),
+            file,
+            meta.line(),
+            module,
+            FieldSet::new(&["message"], meta.callsite()),
+            Kind::EVENT,
+        );
+
+        Box::leak(Box::new(static_meta))
+    })
 }
 
 // NOTE: this could include a basis to indicate whether it is system time or monotonic, and to convert between them
@@ -93,7 +197,10 @@ struct Time {
 
 pub struct RecordingLayer {
     // TODO need to seperate storage thread and layer
-    pub callsites: RwLock<HashMap<Identifier, Arc<RwLock<PerCallsiteData>>>>,
+    // Canonical metadata addresses distinguish log origins sharing tracing-log's Identifier.
+    pub callsites: RwLock<HashMap<usize, Arc<RwLock<PerCallsiteData>>>>,
+
+    /// these identify callsites
     /// starts at 1
     span_id_counter: AtomicU64,
     /// starts at u32MAX + 1, to not conflict with span ids
@@ -106,8 +213,13 @@ pub struct RecordingLayer {
     /// You can adjust this to only store as much precision as is meaningfull.
     /// This is needed because the CompactFrame cannot filter out noise. For many callsites, timestamps will be the only recorded data.
     /// low variance (more signifigant) bits get automatically compressed when constant within a frame.
+    /// TODO could be automatic based on time between messages.
     pub timestamp_bit_shift: u8,
 
+    /// XXX an actual problem with our system is that accurate log ordering cannot be recreated at the moment. Timestamps can be equal and we dont have ordering info across across archetypes
+    /// we probably also want thread number in the log somewhere
+    // pub last_ts: usize,
+    // pub ts_count: usize,
     system_time: SystemTime,
     started: Instant,
 }
@@ -128,7 +240,8 @@ impl RecordingLayer {
         &self,
         metadata: &'static Metadata<'static>,
     ) -> ArcRwLockWriteGuard<RawRwLock, PerCallsiteData> {
-        if let Some(v) = self.callsites.read().get(&metadata.callsite()) {
+        let key = metadata as *const Metadata<'static> as usize;
+        if let Some(v) = self.callsites.read().get(&key) {
             // metadata will almost always be registered
             return v.write_arc();
         }
@@ -144,7 +257,7 @@ impl RecordingLayer {
 
         self.callsites
             .write()
-            .entry(metadata.callsite())
+            .entry(key)
             .or_insert_with(|| {
                 Arc::new(
                     PerCallsiteData {
@@ -335,6 +448,7 @@ where
             _metadata: ctx.metadata(),
             data: &mut v,
             prefix: &mut callsite_data.last_message,
+            is_log_compat: false,
         };
 
         // records fields directly into PerCallsiteData temp buffer.
@@ -394,7 +508,7 @@ where
             // most won't have end data, so this is good
             for field in fields.iter() {
                 if let Some(field) = field {
-                    data.write_any(field, false);
+                    data.write_any_value(field, false);
                 }
             }
             arch.data.compute_mask();
@@ -430,6 +544,7 @@ where
             _metadata: attrs.metadata(),
             data: &mut callsite_data.last_values,
             prefix: &mut callsite_data.last_message,
+            is_log_compat: false,
         };
 
         // records fields directly into PerCallsiteData temp buffer.
@@ -500,16 +615,20 @@ where
             }
         }
 
-        let mut callsite_data = self.register(event.metadata());
+        let is_log_compat = event.is_log();
+        let metadata = log_callsite_adapter(event);
+
+        let mut callsite_data = self.register(metadata);
         let callsite_data = callsite_data.deref_mut();
         callsite_data.call_count += 1;
 
         // event id's currently not stored. since nothing refers to them
         callsite_data.last_values.fill(None);
         let mut visitor = ValueRecorder {
-            _metadata: event.metadata(),
+            _metadata: metadata,
             data: &mut callsite_data.last_values,
             prefix: &mut callsite_data.last_message,
+            is_log_compat,
         };
 
         // records fields directly into PerCallsiteData buffer.
@@ -570,10 +689,18 @@ struct ValueRecorder<'a> {
     // Note this can be a buffer so we aren't allocing on every log.
     data: &'a mut [Option<ValueData>],
     prefix: &'a mut Option<Atom>,
+
+    is_log_compat: bool,
 }
 
 impl<'a> Visit for ValueRecorder<'a> {
     fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
+        if self.is_log_compat && field.name() != "message" {
+            // do not store log.target and other metadata, we move that into the archetype with adapter.
+            // also we remove them from the FieldSet, so this would panic since there is no space allocated for them
+            return;
+        }
+
         if field.name() == "message" {
             match self.prefix {
                 Some(p) => {
@@ -598,7 +725,9 @@ impl<'a> Visit for ValueRecorder<'a> {
                                 Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
                         }
                         None => {
-                            let (prefix, rem) = value.split_at(p.len());
+                            // A shorter message can exhaust the character comparison.
+                            let (prefix, rem) = value.split_at(p.len().min(value.len()));
+                            *p = Atom::from(prefix);
                             self.data[field.index()] =
                                 Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
                         }
@@ -612,6 +741,18 @@ impl<'a> Visit for ValueRecorder<'a> {
             }
         } else {
             self.data[field.index()] = Some(ValueData::Str(Atom::from(value)));
+        }
+
+        // Convert after prefix splitting so both string modes share that behavior.
+        if USE_INDEXED_ATOM.load(Ordering::Relaxed) {
+            let slot = &mut self.data[field.index()];
+            *slot = slot.take().map(|value| match value {
+                ValueData::Str(atom) => ValueData::StrIndex(atom.into()),
+                ValueData::PrefixStr(prefix, remainder) => {
+                    ValueData::PrefixStrIndex(prefix.into(), remainder.into())
+                }
+                value => value,
+            });
         }
     }
 
@@ -628,6 +769,10 @@ impl<'a> Visit for ValueRecorder<'a> {
     }
 
     fn record_u64(&mut self, field: &tracing_core::Field, value: u64) {
+        // log.line lives in normalized metadata, outside the message-only row buffer.
+        if self.is_log_compat {
+            return;
+        }
         self.data[field.index()] = Some(ValueData::U64(value));
     }
 

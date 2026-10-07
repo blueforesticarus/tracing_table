@@ -13,6 +13,9 @@ pub enum ValueKind {
     Bool,
     Str,
     PrefixStr,
+    // Indexed strings use the recording layer’s interner.
+    StrIndex,
+    PrefixStrIndex,
 }
 
 impl From<ValueData> for ValueKind {
@@ -32,6 +35,8 @@ impl From<&ValueData> for ValueKind {
             ValueData::Bool(_) => ValueKind::Bool,
             ValueData::Str(_) => ValueKind::Str,
             ValueData::PrefixStr(_, _) => ValueKind::PrefixStr,
+            ValueData::StrIndex(_) => ValueKind::StrIndex,
+            ValueData::PrefixStrIndex(_, _) => ValueKind::PrefixStrIndex,
         }
     }
 }
@@ -184,6 +189,11 @@ impl<'a> BytePacker<'a> {
             ValueData::U128(v) => self.write_any(v, aligned),
             ValueData::Bool(v) => self.write_any(v, aligned),
             ValueData::Str(atom) => self.write_any(atom, aligned),
+            ValueData::StrIndex(atom) => self.write_any(atom, aligned),
+            ValueData::PrefixStrIndex(atom, atom1) => {
+                self.write_any(atom, aligned);
+                self.write_any(atom1, aligned);
+            }
             ValueData::PrefixStr(atom, atom1) => {
                 self.write_any(atom, aligned);
                 self.write_any(atom1, aligned);
@@ -244,6 +254,13 @@ impl<'a> BytePacker<'a> {
                 ValueKind::I128 => ValueData::I128(*self.read_any(aligned)),
                 ValueKind::U128 => ValueData::U128(*self.read_any(aligned)),
                 ValueKind::Bool => ValueData::Bool(*self.read_any(aligned)),
+                ValueKind::StrIndex => {
+                    ValueData::StrIndex(self.read_any::<AtomIndexed>(aligned).clone())
+                }
+                ValueKind::PrefixStrIndex => ValueData::PrefixStrIndex(
+                    self.read_any::<AtomIndexed>(aligned).clone(),
+                    self.read_any::<AtomIndexed>(aligned).clone(),
+                ),
                 ValueKind::Str => ValueData::Str(self.read_any::<Atom>(aligned).clone()),
                 ValueKind::PrefixStr => ValueData::PrefixStr(
                     self.read_any::<Atom>(aligned).clone(),
