@@ -8,8 +8,11 @@ use crate::{
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 use std::{
+    fs::OpenOptions,
+    io::{BufWriter, Write},
+    path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing_table::{
     data::{
@@ -43,6 +46,7 @@ pub struct Viewer {
     selected: Option<ArchetypeId>,
     rows: Vec<RecordedRow>,
     sort: SortOrder,
+    dump_status: Option<String>,
     // Ratio rather than pixels keeps both panes usable when resizing the window.
     split_fraction: f32,
 }
@@ -69,6 +73,7 @@ impl Viewer {
             selected: None,
             rows: Vec::new(),
             sort: SortOrder::default(),
+            dump_status: None,
             split_fraction: 0.38,
         }
     }
@@ -91,6 +96,17 @@ impl Viewer {
             model::matching_rows(&self.recorder, id, &self.entity_filter, self.row_limit)
         };
     }
+}
+
+// A unique filename preserves earlier captures; buffering keeps per-row writes cheap.
+fn dump_recording(recorder: &RecordingLayer) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = std::env::current_dir()?.join(format!("tracing_dump_{stamp}.msgpack"));
+    let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+    let mut output = BufWriter::new(file);
+    recorder.dump_all_data(&mut output)?;
+    output.flush()?;
+    Ok(path)
 }
 
 // Apply normalization only to byte values; counts and ratios remain unchanged.
@@ -415,7 +431,14 @@ pub fn draw(
         ui.horizontal(|ui| {
             ui.selectable_value(&mut viewer.strings_tab, false, "Logs");
             ui.selectable_value(&mut viewer.strings_tab, true, "Strings");
+            if ui.button("Dump MessagePack").on_hover_text("Save all recorded data to a new file in the current working directory").clicked() {
+                viewer.dump_status = Some(match dump_recording(&viewer.recorder) {
+                    Ok(path) => format!("Saved {}", path.display()),
+                    Err(error) => format!("Dump failed: {error}"),
+                });
+            }
         });
+        if let Some(status) = &viewer.dump_status { ui.small(status); }
         ui.separator();
         let mut reload = false;
         ui.collapsing("Tuning", |ui| {

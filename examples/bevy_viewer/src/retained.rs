@@ -65,7 +65,7 @@ impl RetainedLayer {
         let extra = write();
         let callsites = self.inner.callsites.read();
         let data = callsites.get(&key).unwrap().read();
-        for value in data.last_values.iter().flatten().chain(&extra) {
+        for value in data.field_value_scratchpad.iter().flatten().chain(&extra) {
             match value {
                 ValueData::Str(atom) => {
                     pool.insert(atom.clone());

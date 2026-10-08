@@ -28,6 +28,37 @@ Only a record's own entity field matches; parent spans are not consulted. Filter
 pages backwards through history to find the newest matches, rather than filtering
 just the latest unfiltered page.
 
+**Dump MessagePack** saves all currently recorded data to a uniquely named
+`tracing_dump_*.msgpack` file in the current working directory. The viewer shows
+the saved path or any write error below the button.
+
+The root [dump compression example](../dump_messsage_compression/README.md) reads the
+dump as a stream and prints aggregate CSV tables. Storage and duplicate-byte
+metrics default to bytes per original matched row, with dictionary and message
+payload reported separately. Comma-separated CLI dimensions
+cover deduplication, row block size, field group, Zstd level, dictionary size,
+and training sample size:
+
+```sh
+cargo run --release --example dump_message_compression -- \
+  --dedup=plain,block,archetype,global --block_size=100,1000 \
+  --fields=message,other --timing --sizes --summary path/to/dump.msgpack
+cargo run --release --example dump_message_compression -- --list_targets path/to/dump.msgpack
+cargo run --release --example dump_message_compression -- --dump_strings=messages.tsv path/to/dump.msgpack
+```
+
+Use `--target='glfw*'` to filter by target glob, or `--target=corngame` to
+include a target and its child modules. Plain/block dictionary samples concatenate
+whole messages to a target of 256 bytes by default. Archetype/global dictionaries
+train on individual unique messages and store each as raw or compressed,
+whichever is smaller. See the example's documentation
+for table definitions, tuning options, and further commands.
+Use `--dedup=block --prefix=off,on --compression_mode=blocks` to compare longest
+common block-prefix splitting before and after regular compression. Prefix mode
+supports only message fields with dedup; prefix + dictionary compression is discouraged.
+`--dump_strings` streams original message occurrences to a new TSV file with
+unique archetype ID, target, and message columns for further prefix exploration.
+
 The Tuning controls adjust refresh interval, matching-row limit (default 1,000),
 UI scale, scene log rate, and scene motion/scaling. Each archetype has an example-owned
 running total for completed frames. Unchanged packed block lengths reuse their stats;
