@@ -240,3 +240,22 @@ python3 -m unittest discover -s util
 64K is a good default lz4 size. my guess is that's as large as we want to go considering random access (following span heirarchy, indexing by entity, etc.)
 
 however, this increases the likelihood of needing more columns in the compacted frame
+
+## NOTES ON PATTERN EXTRACTION
+the message is different from other strings fields. handle it special case.
+
+priorities:
+1. storage
+   - deduplication of patterns
+   - compression for large data payload and pathological logs
+2. compression speed
+   - the case where we care about storage is the case where there are 1000s of logs per second.
+   - additionally, we want our system to be general purpose drop in. GOAL: keep within the ballpark of lz4 (which we may use on top) 
+     - format extraction must provided a benefit vs raw lz4 which justifies the additional compute. 
+3. deletion/free speed
+   - when freeing a block, we free its templates and values (assuming no global string cache for now)
+4. decompression speed and lookups 
+   - we do want to be able to fetch logs for display 
+
+We DO NOT CARE ABOUT
+- modification (log messages are immutable)

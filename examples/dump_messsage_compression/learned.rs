@@ -2,16 +2,47 @@
 
 use std::collections::HashMap;
 
-use super::{escape_template_literal, render_algorithm, Algorithm, Rendering, Row};
+use super::{Algorithm, Rendering, Row, escape_template_literal, render_algorithm};
 
 const MAX_PATTERNS: usize = 128;
 const MAX_SEEDS: usize = 16;
+
+#[cfg(test)]
+pub(super) fn test_pattern_captures(template: &str, row: &Row) -> Option<Vec<String>> {
+    Pattern::new(template.to_owned()).captures(row)
+}
+
+pub(super) fn capture_types(template: &str, row: &Row, fields: &[String]) -> Vec<super::ValueType> {
+    // Use original capture offsets, not a heuristic on the field's contents.
+    // A gap containing a mask plus punctuation or other text remains a string.
+    let pattern = Pattern::new(template.to_owned());
+    let mut cursor = pattern.literals[0].len();
+    fields
+        .iter()
+        .enumerate()
+        .map(|(slot, field)| {
+            let end = cursor + field.len();
+            let index = row.tokens.partition_point(|token| token.end <= cursor);
+            let kind = row
+                .tokens
+                .get(index)
+                .filter(|token| token.start == cursor && token.end == end)
+                .and_then(|_| row.masked.get(index).copied().flatten())
+                .unwrap_or(super::ValueType::String);
+            cursor = end + pattern.literals[slot + 1].len();
+            kind
+        })
+        .collect()
+}
 
 struct Pattern {
     template: String,
     // Decoded literal pieces on either side of each {} value slot.
     literals: Vec<String>,
     static_bytes: usize,
+    // Preextracted values stay variable even when a later block repeats one
+    // value. Other slots retain the existing constant-promotion behavior.
+    forced_slots: Vec<bool>,
 }
 
 impl Pattern {
@@ -38,12 +69,14 @@ impl Pattern {
         let static_bytes = literals.iter().map(String::len).sum();
         Self {
             template,
+            forced_slots: vec![false; literals.len() - 1],
             literals,
             static_bytes,
         }
     }
 
-    fn captures(&self, message: &str) -> Option<Vec<String>> {
+    fn captures(&self, row: &Row) -> Option<Vec<String>> {
+        let message = &row.message;
         let first = &self.literals[0];
         if !message.starts_with(first) {
             return None;
@@ -61,6 +94,9 @@ impl Pattern {
             } else {
                 cursor + message[cursor..].find(literal)?
             };
+            if row.inside_mask(cursor) || row.inside_mask(at) {
+                return None;
+            }
             fields.push(message[cursor..at].to_owned());
             cursor = at + literal.len();
         }
@@ -70,6 +106,9 @@ impl Pattern {
 
 #[derive(Default)]
 pub(super) struct LearnedState {
+    // Drain2 carries its typed regex clusters, independently of the generic
+    // literal-search cache used by the other exploratory algorithms.
+    drain2: super::drain2::State,
     patterns: Vec<Pattern>,
     exact: HashMap<String, usize>,
     // Unmatched examples can form a template with a later block's message.
@@ -77,7 +116,7 @@ pub(super) struct LearnedState {
 }
 
 impl LearnedState {
-    fn add_pattern(&mut self, template: String, message: &str) {
+    fn add_pattern(&mut self, template: String, row: &Row, fields: &[String]) {
         let index = if let Some(index) = self.patterns.iter().position(|p| p.template == template) {
             index
         } else {
@@ -89,15 +128,21 @@ impl LearnedState {
             self.patterns.push(Pattern::new(template));
             index
         };
+        let pattern = &mut self.patterns[index];
+        let mut cursor = pattern.literals[0].len();
+        for (slot, field) in fields.iter().enumerate() {
+            pattern.forced_slots[slot] |= row.contains_mask(cursor, cursor + field.len());
+            cursor += field.len() + pattern.literals[slot + 1].len();
+        }
         if self.exact.len() >= 4096 {
             self.exact.clear();
         }
-        self.exact.insert(message.to_owned(), index);
+        self.exact.insert(row.message.clone(), index);
     }
 
-    fn matched_pattern(&self, message: &str) -> Option<(usize, Vec<String>)> {
-        if let Some(&index) = self.exact.get(message) {
-            if let Some(fields) = self.patterns[index].captures(message) {
+    fn matched_pattern(&self, row: &Row) -> Option<(usize, Vec<String>)> {
+        if let Some(&index) = self.exact.get(&row.message) {
+            if let Some(fields) = self.patterns[index].captures(row) {
                 return Some((index, fields));
             }
         }
@@ -106,7 +151,7 @@ impl LearnedState {
             .enumerate()
             .filter_map(|(index, pattern)| {
                 pattern
-                    .captures(message)
+                    .captures(row)
                     .map(|fields| (index, pattern.static_bytes, fields))
             })
             .max_by_key(|(_, bytes, _)| *bytes)
@@ -124,7 +169,8 @@ impl LearnedState {
         for slot in 0..pattern.literals.len() - 1 {
             // Keep the reusable cached template for one-row blocks. When a
             // current block has repeated matches, promote constant values.
-            let constant = matches.len() >= 2
+            let constant = !pattern.forced_slots[slot]
+                && matches.len() >= 2
                 && matches
                     .iter()
                     .all(|(_, values)| values[slot] == matches[0].1[slot]);
@@ -155,12 +201,13 @@ impl LearnedState {
                         .zip(row.tokens.first())
                         .is_some_and(|_| seed.token(0) == row.token(0))
             }
+            Algorithm::Drain2 => false, // Uses its own regex-cluster carry state.
             Algorithm::Spell => seed
                 .tokens
                 .first()
                 .zip(row.tokens.first())
                 .is_some_and(|_| seed.token(0) == row.token(0)),
-            Algorithm::Mdl => seed.tokens.len() == row.tokens.len(),
+            Algorithm::Mdl | Algorithm::Mdl2 => seed.tokens.len() == row.tokens.len(),
             Algorithm::Msa | Algorithm::Sequitur => seed.tokens.iter().any(|token| {
                 let word = &seed.message[token.start..token.end];
                 word.len() > 1
@@ -179,6 +226,9 @@ impl LearnedState {
         rows: &[Row],
         algorithm: Algorithm,
     ) -> Vec<Option<Rendering>> {
+        if matches!(algorithm, Algorithm::Drain2) {
+            return self.drain2.render_block(rows);
+        }
         if matches!(algorithm, Algorithm::None) {
             return rows
                 .iter()
@@ -188,7 +238,7 @@ impl LearnedState {
         let mut rendered = vec![None; rows.len()];
         let mut cached = HashMap::<usize, Vec<(usize, Vec<String>)>>::new();
         for (index, row) in rows.iter().enumerate() {
-            if let Some((pattern, fields)) = self.matched_pattern(&row.message) {
+            if let Some((pattern, fields)) = self.matched_pattern(row) {
                 cached.entry(pattern).or_default().push((index, fields));
             }
         }
@@ -213,7 +263,7 @@ impl LearnedState {
             };
             for ((index, row), result) in unknown.iter().zip(analyzed) {
                 if let Some((template, fields)) = result {
-                    self.add_pattern(template.clone(), &row.message);
+                    self.add_pattern(template.clone(), row, &fields);
                     rendered[*index] = Some((template, fields));
                 }
             }
@@ -244,7 +294,7 @@ impl LearnedState {
                 }
             }
             if let Some((template, fields)) = learned {
-                self.add_pattern(template.clone(), &row.message);
+                self.add_pattern(template.clone(), row, &fields);
                 rendered[index] = Some((template, fields));
             }
         }
@@ -257,5 +307,9 @@ impl LearnedState {
             }
         }
         rendered
+    }
+
+    pub(super) fn drain2_field_types(&self) -> &[Option<Vec<super::ValueType>>] {
+        &self.drain2.field_types
     }
 }

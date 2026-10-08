@@ -86,7 +86,7 @@ python3 examples/dump_messsage_compression/print_strings.py \
   --block_size=100 messages.tsv
 ```
 
-For templates with variable fields, use the Rust inspector. It runs all seven
+For templates with variable fields, use the Rust inspector. It runs all nine
 methods by default; `--algo=mdl` selects one, and comma-separated names select
 several. `seq` is an alias for `sequitur` and its label in the report.
 `--block_size` has the same meaning as above. Both inspectors omit
@@ -98,6 +98,34 @@ run the Python prefix splitter first.
 cargo run --release --example print_strings_mdl -- \
   --block_size=100 messages.tsv
 ```
+
+Add `--preextract` to apply the same regex masks to every template method,
+including Drain2, before tokenization. Without the flag, no method runs the
+masking pass or prints capture types. `none` continues to store whole strings;
+with the flag it also scans for the type of an exact whole-message capture.
+Compare the flag on/off in separate runs:
+
+```sh
+cargo run --release --example print_strings_mdl -- \
+  --preextract --block_size=100 messages.tsv
+```
+
+The flag defaults to off. Bare `--preextract` and `--preextract=true` enable
+masking; `--preextract=false` disables it (`on/off` and `1/0` are also accepted
+after `=`). Ordinary algorithm tokenization runs in both modes; semantic regex
+preextraction and typed placeholder printing only run when enabled.
+
+Masks guide matching as atomic typed tokens, but never become literal anchors.
+Templates and values refer to the original strings; anchor scoring still uses
+original byte lengths. Cached templates cannot split a masked span or promote
+its value to a literal. With masking enabled, prefix finds a parameterized
+prefix of complete tokens rather than a raw character prefix. Every method
+prints capture types and uses them in `arch/blk` when the flag is enabled.
+For the shared-anchor methods, a value must exactly cover a regex span to
+receive its type; a gap combining a mask with surrounding text is a string.
+Drain2 retains its cluster's capture types. Unrecognized values use string
+fields. Types do not change the stored template or value bytes.
+Without masking, the prefix method skips tokenization entirely.
 
 Add `--colored` to render the template column in bright cyan in a terminal.
 Color is off by default, so ordinary output remains plain TSV.
@@ -113,17 +141,47 @@ average is `sum(block_ms * block_rows) / sum(block_rows)`, so a short final bloc
 has less weight than a full block. Both millisecond columns use decimal notation
 with precision chosen to retain three significant figures in small measurements.
 Each timing column uses the same number of decimal places, padding larger values.
+`lz4/blk` is mean LZ4 compression milliseconds per complete block, excluding
+short final blocks. Its input is that block's deduplicated templates and values
+(including whole-message values when extraction fails), sorted and concatenated
+as in the global storage estimate. Pool construction and sorting are outside
+this codec timer. Compression is separate from algorithm `total` and `avg/blk`.
+With no complete blocks, `lz4/blk` shows `n/a`. The LZ4 size column still measures
+the globally deduplicated pool; the timing column measures block-local pools.
 The report columns are space aligned. Each numeric column
 is colored independently from its smallest value (bright blue) to its largest (red); leading zero digits use dark grey, and other equal values
-use the midpoint color. Timing includes
-clustering and template extraction, including attempts that produce no template. It excludes
-TSV reading/tokenization, result merging, and printing. Single-message archetypes
+use the midpoint color. Timing covers each complete per-algorithm block pass,
+including cached matches, clustering, anchor scoring, template construction,
+and learned-state updates. Each method's tokenization and enabled regex
+preprocessing are inside its timer; methods are charged independently even
+when their preprocessing is identical. Attempts that produce no template still
+count. It excludes TSV reading, size and diversity accounting, result merging, and
+printing. Single-message archetypes
 are skipped and do not count; an empty run reports `n/a` for the average.
-Each method carries learned templates and a small set of unmatched examples
+`dedup/blk` reports milliseconds spent constructing the template/value
+dictionaries, weighted by row count like `avg/blk`. This includes hashing,
+dictionary allocations/copies and byte accounting for both the global size
+report pools and the additional block-local pools used for LZ4 timing on full
+blocks. Partial blocks only update the global pools. The column measures both
+dictionary workloads performed by this inspector; a storage implementation
+using one layout would only build its own dictionaries. Singleton archetypes
+are excluded from this timing average. Sorting and concatenating pools,
+diversity statistics, output merging and printing are excluded. Dedup work is
+outside algorithm and LZ4 timers.
+Drain2's measured pass includes optional masking, tokenization, regex compilation
+and regex extraction. It directly renders its cluster templates without the
+shared anchor scorer. Each other template method carries learned templates
+and a small set of unmatched examples
 across blocks within an archetype. Cached matches can promote values that are
-constant in the current block into its printed template. The cache resets for
-the next archetype. This is a bounded exploration cache, not a persistent
+constant in the current block into its printed template. Drain2 carries up to
+128 regex clusters (typed with `--preextract`) and keeps masked fields variable even when constant
+in a block. Each Drain2 cluster caches up to 256 exact-message regex results;
+changing its template invalidates those captures. The cache resets for the
+next archetype. This is a bounded exploration cache, not a persistent
 Drain3 tree or full Sequitur grammar.
+When every variable field has a mask type, Drain2 reuses the original mask
+regex captures. Clusters with generic string fields use an anchored template
+regex against the original message. Both paths retain exact original values.
 Use `--no-carry` to reset learning after every block for comparison.
 
 The stderr report also shows unique template bytes, unique value bytes, and
@@ -154,32 +212,103 @@ is their compressed size per row. `tpls` counts unique templates; `vals`
 counts all stored value slots across messages, including whole-message values when extraction
 fails. These counts help estimate the row-reference overhead excluded above.
 
+Storage stopping point: the roughly **2 bytes per row of text data after LZ4**
+are already as good as we care about. In the proposed fixed-width block layout,
+the template reference requires at least one byte per row, and value references
+require at least one byte per value. That reference overhead is additional to
+the text data measured here. Do not pursue further reductions in text-data
+bytes per row unless they let us skip LZ4; processing speed still matters.
+
+The [100-message preextraction benchmark](../../doc/pattern_extraction_comparison_2026-10-08.md),
+with regex preextraction on, gives the following storage estimate. Byte columns are
+bytes per non-singleton row; `values/row` counts value slots, including a
+whole-message value when extraction fails.
+
+| Method | LZ4 text B/row | Values/row | Min. refs B/row | Text + min. refs B/row |
+| --- | ---: | ---: | ---: | ---: |
+| msa | 2.04 | 1.82 | 2.82 | 4.86 |
+| seq | 2.07 | 1.66 | 2.66 | 4.73 |
+| mdl | 2.07 | 1.67 | 2.67 | 4.74 |
+| mdl2 | 1.81 | 1.94 | 2.94 | 4.75 |
+| drain | 1.77 | 1.95 | 2.95 | 4.72 |
+| drain2 | 1.48 | 2.48 | 3.48 | 4.96 |
+| spell | 1.89 | 2.14 | 3.14 | 5.03 |
+| prefix | 2.08 | 1.62 | 2.62 | 4.70 |
+
+For this proposed layout, `min. refs = 1 + values/row`: one byte for the
+template reference and one per value reference. `values/row` is calculated as
+`(vals - 41 singleton values) / 392015 non-singleton rows`. The measured LZ4
+column retains singleton text bytes, matching the report's accounting; totals
+are approximate because the report rounds LZ4 sizes.
+These are optimistic reference estimates: larger indices, string boundaries,
+field types and framing can add overhead. Even at this floor, references cost
+more than the compressed text for every method. For example, Drain2's 1.48
+text bytes sit alongside at least 3.48 reference bytes per row. This supports
+prioritizing processing speed and the possibility of skipping LZ4 over
+further reductions in text bytes alone.
+
+`pat/blk` is the average number of distinct emitted templates in each complete
+block. `arch/blk` is the average number of distinct field-type multisets in
+each complete block; field order does not matter, but multiplicity does, so
+`[string, ip]` equals `[ip, string]` while `[ip, string, string]` is different.
+With `--preextract`, regex captures supply number, IP address, file path and
+module path types to every method; other captures use string fields. Without
+the flag, all methods use string fields for this metric.
+A method with no template for a row contributes one whole-string field and
+no pattern. Both averages
+exclude short final blocks; with no complete blocks they show `n/a`. When
+`--block_size` is omitted, each multi-message archetype is one complete block.
+With `--preextract`, all methods print these types inside placeholders
+(`{module}`, `{path}`, `{ip}`, `{number}`, `{string}`). Without it they print
+plain `{}`. Rows merge when their template, values and capture types agree. Values
+remain in placeholder order. Stored templates and byte accounting still use
+`{}`, so displaying type labels adds no measured bytes.
+
 Each Rust output row is `tag<TAB>archetype<TAB>target<TAB>template<TAB>value...`.
-The seven-character tag uses `a`, `q`, `m`, `d`, `s`, `p`, and `n` for alignment,
-Sequitur, MDL, Drain, Spell, simple prefix, and no algorithm; spaces fill inactive positions. Results for a message
+The nine-character tag `aqmdspnMD` uses `a`, `q`, `m`, `d`, `s`, `p`, and `n` for
+alignment, Sequitur, MDL, Drain, Spell, simple prefix, and no algorithm. `M`
+and `D` mark the new `mdl2` and `drain2` variants; spaces fill inactive positions. Results for a message
 are printed together in input order. Methods with identical templates and
 values share a row and combine their tag letters. A method that finds no
 useful template for a block or cluster prints no result for it.
-Each `{}` in the template consumes one value field in order. Escapes use the
+Each placeholder in the template consumes one value field in order. Escapes use the
 same convention as the TSV export; literal braces in templates are `\{` and
 `\}`. These are fast exploratory variants rather
 than exact reproductions of the research implementations:
 
 | `--algo` | Method used here |
 | --- | --- |
-| `msa` | Progressively align message tokens with longest common subsequences, then keep shared anchors. |
-| `sequitur` | Replace repeated token pairs with up to 12 grammar rules, group by a shared rule, then extract a template. |
+| `msa` | Progressively align borrowed token slices with longest common subsequences, then keep shared anchors. This avoids cloning strings during alignment. |
+| `sequitur` or `seq` | Replace repeated token pairs with up to 12 grammar rules; choose the longest nested rule used by at least two messages. |
 | `mdl` | Choose shared position-aligned tokens that minimize template plus residual byte cost. |
+| `mdl2` | Apply the original MDL scorer separately to messages with the same token count. |
 | `drain` (or `drain3`) | Group by token count and first token, then use a positional similarity threshold. |
-| `spell` | Maintain online clusters with longest common subsequence templates; use token overlap to select a candidate cluster. |
+| `drain2` | Cluster tokens directly and extract original values using an anchored template regex; with `--preextract`, mask whole numbers, IP addresses, file paths and module paths first and reuse typed mask captures when possible. |
+| `spell` | Maintain online LCS clusters; use token overlap to prune candidates and actual LCS length to select the best surviving cluster. |
 | `prefix` | Split a shared Unicode-safe prefix from each message in a block. |
 | `none` | Store every original message as one whole-string value. |
 
 For speed, `msa` samples 32 messages before validating anchors against the
 entire group, `spell` keeps at most eight clusters per leading token, and very
-long pairwise alignments are skipped. The first five methods score the final
-shared anchors with the same byte-cost model so their printed fields have a
-consistent format.
+long pairwise alignments are skipped. The six shared-anchor template methods
+score the final shared anchors with the same byte-cost model so their printed
+fields have a consistent format.
+The original `mdl` and `drain` branches remain available for direct comparison
+with their variants. These changes are small experiments, not full paper
+implementations: `seq` still bounds the grammar to 12 rules and `drain2`
+still uses token-count/first-token buckets instead of a full Drain tree.
+Drain2 uses the common punctuation tokenizer, with optional whole-value masking.
+The shared built-in regexes cover absolute/relative Unix and Windows paths without
+spaces, IPv4/common IPv6, decimal/scientific/hex numbers, and module paths with
+up to four nested generic argument levels (including spaces in generics).
+One regex scanner orders semantic alternatives before numbers; there is no
+separate number pass. Both numeric boundaries are enforced by that regex. A number
+must have whitespace or punctuation on each side (string edges also qualify).
+This includes ASCII punctuation such as `_`, `.`, `=` and brackets, and Unicode
+punctuation such as curly quotes; letters, combining marks and emoji do not
+qualify as numeric boundaries. Digits inside a recognized path/module/IP remain
+part of that whole value.
+This is a bounded regex recognizer, not a full Rust type parser.
 
 Filter reports to one target group or compare several target groups:
 

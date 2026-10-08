@@ -1,4 +1,4 @@
-//! Inspect dumped messages with five fast, self-contained template strategies.
+//! Inspect dumped messages with template strategies and comparison variants.
 //! Each row prints: algorithm tag, archetype, target, template, then values for {} slots.
 
 use std::collections::{HashMap, HashSet};
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 #[path = "learned.rs"]
 mod learned;
 use learned::LearnedState;
+mod drain2;
+mod preextract;
 
 // Change this ANSI SGR code to tune the template color for a terminal theme.
 const TEMPLATE_COLOR: &str = "\x1b[1;36m";
@@ -19,6 +21,9 @@ const COLOR_RESET: &str = "\x1b[0m";
 const REPORT_LOW_RGB: [u8; 3] = [80, 165, 255];
 const REPORT_HIGH_RGB: [u8; 3] = [235, 75, 75];
 const REPORT_ZERO_RGB: [u8; 3] = [90, 90, 90];
+// Keep the original seven tag positions stable; the new comparison branches
+// use the final M and D positions.
+const TAG_BYTES: &[u8; 9] = b"aqmdspnMD";
 
 #[derive(Clone, Copy)]
 struct Token {
@@ -32,12 +37,49 @@ struct Row {
     target: String,
     message: String,
     tokens: Vec<Token>,
+    // Typed regex spans are atomic tokens; empty for an unmasked input row.
+    masked: Vec<Option<ValueType>>,
 }
 
 impl Row {
     fn token(&self, index: usize) -> &str {
+        if let Some(Some(kind)) = self.masked.get(index) {
+            // These multi-character markers cannot collide with a literal
+            // token from the punctuation tokenizer. They are never printed.
+            return match kind {
+                ValueType::Number => "<number>",
+                ValueType::Ip => "<ip>",
+                ValueType::Path => "<path>",
+                ValueType::Module => "<module>",
+                ValueType::String => "<string>",
+            };
+        }
         let token = self.tokens[index];
         &self.message[token.start..token.end]
+    }
+
+    fn inside_mask(&self, offset: usize) -> bool {
+        // A cached generic template must not split a preextracted regex span.
+        if self.masked.is_empty() {
+            return false;
+        }
+        let index = self.tokens.partition_point(|token| token.end <= offset);
+        self.tokens
+            .get(index)
+            .is_some_and(|token| token.start < offset)
+            && self.masked.get(index).is_some_and(Option::is_some)
+    }
+
+    fn contains_mask(&self, start: usize, end: usize) -> bool {
+        if self.masked.is_empty() {
+            return false;
+        }
+        let index = self.tokens.partition_point(|token| token.end <= start);
+        self.tokens[index..]
+            .iter()
+            .zip(self.masked.iter().skip(index))
+            .take_while(|(token, _)| token.start < end)
+            .any(|(_, kind)| kind.is_some())
     }
 }
 
@@ -50,14 +92,18 @@ enum Algorithm {
     Spell,
     Prefix,
     None,
+    Mdl2,
+    Drain2,
 }
 
 impl Algorithm {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::Msa,
         Self::Sequitur,
         Self::Mdl,
+        Self::Mdl2,
         Self::Drain,
+        Self::Drain2,
         Self::Spell,
         Self::Prefix,
         Self::None,
@@ -72,6 +118,8 @@ impl Algorithm {
             Self::Spell => 4,
             Self::Prefix => 5,
             Self::None => 6,
+            Self::Mdl2 => 7,
+            Self::Drain2 => 8,
         }
     }
 
@@ -80,7 +128,9 @@ impl Algorithm {
             "msa" => Some(Self::Msa),
             "sequitur" | "seq" => Some(Self::Sequitur),
             "mdl" => Some(Self::Mdl),
+            "mdl2" => Some(Self::Mdl2),
             "drain" | "drain3" => Some(Self::Drain),
+            "drain2" => Some(Self::Drain2),
             "spell" => Some(Self::Spell),
             "prefix" => Some(Self::Prefix),
             "none" => Some(Self::None),
@@ -97,6 +147,8 @@ impl Algorithm {
             Self::Spell => "spell",
             Self::Prefix => "prefix",
             Self::None => "none",
+            Self::Mdl2 => "mdl2",
+            Self::Drain2 => "drain2",
         }
     }
 }
@@ -104,9 +156,17 @@ impl Algorithm {
 #[derive(Default)]
 struct Timing {
     elapsed: Duration,
+    // Codec-only work on block-local pools; separate from algorithm timing.
+    compression_elapsed: Duration,
     weighted_ms: f64,
+    // Dictionary construction is separate from extraction and codec work.
+    // Weight partial blocks by rows, using the same divisor as avg/blk.
+    dedup_weighted_ms: f64,
     blocks: u64,
     rows: u64,
+    full_blocks: u64,
+    distinct_patterns: u64,
+    distinct_archetypes: u64,
     sizes: StringSizes,
 }
 
@@ -121,6 +181,129 @@ impl Timing {
 
     fn weighted_avg_ms_per_block(&self) -> Option<f64> {
         (self.rows > 0).then(|| self.weighted_ms / self.rows as f64)
+    }
+
+    fn record_dedup_block(&mut self, elapsed: Duration, rows: usize) {
+        self.dedup_weighted_ms += elapsed.as_secs_f64() * 1000.0 * rows as f64;
+    }
+
+    fn weighted_avg_dedup_ms_per_block(&self) -> Option<f64> {
+        (self.rows > 0).then(|| self.dedup_weighted_ms / self.rows as f64)
+    }
+
+    fn avg_compression_ms_per_full_block(&self) -> Option<f64> {
+        (self.full_blocks > 0)
+            .then(|| self.compression_elapsed.as_secs_f64() * 1000.0 / self.full_blocks as f64)
+    }
+
+    fn record_full_block(&mut self, summary: &BlockSummary) {
+        // Only complete blocks contribute to these unweighted block averages.
+        self.full_blocks += 1;
+        self.distinct_patterns += summary.patterns.len() as u64;
+        self.distinct_archetypes += summary.archetypes.len() as u64;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ValueType {
+    String = 0,
+    Number = 1,
+    Ip = 2,
+    Path = 3,
+    Module = 4,
+}
+
+impl ValueType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Ip => "ip",
+            Self::Path => "path",
+            Self::Module => "module",
+        }
+    }
+}
+
+fn value_type(value: &str) -> ValueType {
+    // A small, shared field classifier for report statistics only. It never
+    // changes extraction, template text, or the bytes stored as a value.
+    let value = value.trim().trim_matches(['"', '\'']);
+    if value
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        return ValueType::Ip;
+    }
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"));
+    let is_number = hex
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+        || (value.bytes().any(|b| b.is_ascii_digit())
+            && value.parse::<f64>().is_ok_and(f64::is_finite));
+    if is_number {
+        return ValueType::Number;
+    }
+    if !value.contains(char::is_whitespace) && (value.contains('/') || value.contains('\\')) {
+        return ValueType::Path;
+    }
+    if value.contains("::")
+        && value.split("::").all(|part| {
+            !part.is_empty() && part.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+        })
+    {
+        return ValueType::Module;
+    }
+    ValueType::String
+}
+
+fn value_archetype<'a>(values: impl IntoIterator<Item = &'a str>, typed: bool) -> [u32; 5] {
+    // The counts retain multiplicity while making field order irrelevant:
+    // [string, ip] and [ip, string] match, but two strings do not.
+    let mut counts = [0; 5];
+    for value in values {
+        let kind = if typed {
+            value_type(value)
+        } else {
+            ValueType::String
+        };
+        counts[kind as usize] += 1;
+    }
+    counts
+}
+
+#[derive(Default)]
+struct BlockSummary {
+    patterns: HashSet<String>,
+    archetypes: HashSet<[u32; 5]>,
+}
+
+impl BlockSummary {
+    fn record_types(&mut self, template: Option<&str>, types: &[ValueType]) {
+        // Share the actual capture schema with the printed placeholders;
+        // whole-message baselines contribute a schema but no stored pattern.
+        if let Some(template) = template {
+            self.patterns.insert(template.to_owned());
+        }
+        let mut counts = [0; 5];
+        for kind in types {
+            counts[*kind as usize] += 1;
+        }
+        self.archetypes.insert(counts);
+    }
+
+    fn record<'a>(
+        &mut self,
+        template: Option<&str>,
+        values: impl IntoIterator<Item = &'a str>,
+        typed: bool,
+    ) {
+        if let Some(template) = template {
+            self.patterns.insert(template.to_owned());
+        }
+        self.archetypes.insert(value_archetype(values, typed));
     }
 }
 
@@ -414,13 +597,26 @@ fn write_aligned_table(
     Ok(())
 }
 
-fn print_timings(selected: &[bool; 7], timings: &[Timing; 7]) -> io::Result<()> {
+fn print_timings(selected: &[bool; 9], timings: &[Timing; 9], preextract: bool) -> io::Result<()> {
     // Render once so the colocated artifact and terminal receive identical bytes,
     // including headings, alignment, and ANSI colors, regardless of caller cwd.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/dump_messsage_compression/formats.result");
     let mut report = Vec::new();
-    writeln!(report, "Algorithm timing (ms; row-weighted block average):")?;
+    writeln!(
+        report,
+        "Shared regex preextraction: {}; tokenization{} included in algorithm timing.",
+        if preextract { "on" } else { "off" },
+        if preextract {
+            " and regex preprocessing"
+        } else {
+            ""
+        }
+    )?;
+    writeln!(
+        report,
+        "Timing (ms; avg/blk and dedup/blk row-weighted; lz4/blk full blocks only):"
+    )?;
     let mut time_rows = Vec::new();
     for algorithm in Algorithm::ALL {
         let index = algorithm.index();
@@ -433,23 +629,54 @@ fn print_timings(selected: &[bool; 7], timings: &[Timing; 7]) -> io::Result<()> 
             || ReportCell::label("n/a"),
             |ms| ReportCell::number(format_ms(ms), ms),
         );
+        let compression = timing.avg_compression_ms_per_full_block().map_or_else(
+            || ReportCell::label("n/a"),
+            |ms| ReportCell::number(format_ms(ms), ms),
+        );
+        let dedup = timing.weighted_avg_dedup_ms_per_block().map_or_else(
+            || ReportCell::label("n/a"),
+            |ms| ReportCell::number(format_ms(ms), ms),
+        );
         time_rows.push(vec![
             ReportCell::label(algorithm.name()),
             ReportCell::number(format_ms(total_ms), total_ms),
             average,
+            compression,
+            dedup,
         ]);
     }
-    align_decimal_places(&mut time_rows, &[1, 2]);
-    write_aligned_table(&mut report, &["algo", "total", "avg/blk"], &time_rows)?;
+    align_decimal_places(&mut time_rows, &[1, 2, 3, 4]);
+    write_aligned_table(
+        &mut report,
+        &["algo", "total", "avg/blk", "lz4/blk", "dedup/blk"],
+        &time_rows,
+    )?;
     writeln!(
         report,
-        "String sizes (UTF-8 B/non-singleton row; tpl/val deduped; all_val retains duplicates; singleton values included; K/M/G decimal; 3 sig figs):"
+        "String sizes and block diversity (UTF-8 B/non-singleton row; tpl/val deduped; all_val retains duplicates; singleton values included; K/M/G decimal; 3 sig figs):"
+    )?;
+    let complete_blocks = Algorithm::ALL
+        .into_iter()
+        .find(|algorithm| selected[algorithm.index()])
+        .map_or(0, |algorithm| timings[algorithm.index()].full_blocks);
+    writeln!(
+        report,
+        "Block diversity averages use {complete_blocks} complete blocks; short blocks are excluded."
     )?;
     let mut size_rows = Vec::new();
     for algorithm in Algorithm::ALL {
         let index = algorithm.index();
         if selected[index] {
-            let sizes = &timings[index].sizes;
+            let timing = &timings[index];
+            let sizes = &timing.sizes;
+            let average = |sum: u64| {
+                if timing.full_blocks == 0 {
+                    ReportCell::label("n/a")
+                } else {
+                    let value = sum as f64 / timing.full_blocks as f64;
+                    ReportCell::number(format!("{value:.2}"), value)
+                }
+            };
             size_rows.push(vec![
                 ReportCell::label(algorithm.name()),
                 byte_cell(sizes.unique_template_bytes, timings[index].rows),
@@ -465,11 +692,13 @@ fn print_timings(selected: &[bool; 7], timings: &[Timing; 7]) -> io::Result<()> 
                     sizes.templates.len() as f64,
                 ),
                 ReportCell::number(sizes.value_count.to_string(), sizes.value_count as f64),
+                average(timing.distinct_patterns),
+                average(timing.distinct_archetypes),
             ]);
         }
     }
     let headers = [
-        "algo", "tpl", "val", "all_val", "total", "lz4", "tpls", "vals",
+        "algo", "tpl", "val", "all_val", "total", "lz4", "tpls", "vals", "pat/blk", "arch/blk",
     ];
     write_aligned_table(&mut report, &headers, &size_rows)?;
     std::fs::write(path, &report)?;
@@ -536,7 +765,7 @@ fn escape_template_literal(value: &str) -> String {
     escape(value).replace('{', "\\{").replace('}', "\\}")
 }
 
-fn lcs_indices(left: &[String], right: &[String]) -> Vec<usize> {
+fn lcs_indices<T: PartialEq>(left: &[T], right: &[T]) -> Vec<usize> {
     // Keep exact matches cheap. Otherwise, skip oversized pairwise alignment
     // instead of substituting another method or blocking on a giant message.
     if left == right {
@@ -595,11 +824,10 @@ fn msa_candidates(rows: &[&Row]) -> Vec<usize> {
     // A small progressive alignment finds internal anchors; the later linear
     // validation pass checks every row, including rows beyond this sample.
     for row in rows.iter().skip(1).take(31) {
-        let left: Vec<_> = candidates
-            .iter()
-            .map(|&i| first.token(i).to_owned())
-            .collect();
-        let right = row_words(row);
+        // Borrow token slices from already-parsed rows; the old path cloned
+        // every token for each of the sampled alignments.
+        let left: Vec<_> = candidates.iter().map(|&i| first.token(i)).collect();
+        let right: Vec<_> = (0..row.tokens.len()).map(|i| row.token(i)).collect();
         let kept = lcs_indices(&left, &right);
         candidates = kept.into_iter().map(|i| candidates[i]).collect();
         if candidates.is_empty() {
@@ -707,7 +935,12 @@ fn render_template(
     rows: &[&Row],
     initial_candidates: Vec<usize>,
 ) -> Option<(String, Vec<Vec<String>>)> {
-    let mut candidates = initial_candidates;
+    // Mask markers can guide alignment/clustering, but cannot become literal
+    // anchors. The scorer still uses original byte offsets and residual sizes.
+    let mut candidates: Vec<_> = initial_candidates
+        .into_iter()
+        .filter(|&index| !rows[0].masked.get(index).is_some_and(Option::is_some))
+        .collect();
     let positions = matching_positions(rows, &mut candidates);
     let chosen = chosen_anchors(rows, &candidates, &positions);
     // A raw-message {} template is not an algorithm result for this block.
@@ -753,6 +986,29 @@ fn render_template(
 }
 
 fn prefix_render(rows: &[Row]) -> Vec<Option<Rendering>> {
+    if rows
+        .iter()
+        .any(|row| row.masked.iter().any(Option::is_some))
+    {
+        // An optional masked prefix is a sequence of complete literal/typed
+        // tokens. It may contain parameter slots before the residual suffix.
+        let common = (0..rows[0].tokens.len())
+            .take_while(|&index| {
+                rows.iter()
+                    .all(|row| index < row.tokens.len() && row.token(index) == rows[0].token(index))
+            })
+            .collect();
+        let selected: Vec<_> = rows.iter().collect();
+        return render_template(&selected, common).map_or_else(
+            || vec![None; rows.len()],
+            |(template, fields)| {
+                fields
+                    .into_iter()
+                    .map(|fields| Some((template.clone(), fields)))
+                    .collect()
+            },
+        );
+    }
     if rows.len() < 2 {
         return vec![None; rows.len()];
     }
@@ -843,10 +1099,22 @@ fn drain_clusters(rows: &[Row]) -> Vec<usize> {
     assignments
 }
 
+fn mdl2_clusters(rows: &[Row]) -> Vec<usize> {
+    // The original MDL compares every row in a block at once. Keeping token
+    // counts together gives its same cost scorer less heterogeneous groups.
+    let mut groups = HashMap::<usize, usize>::new();
+    rows.iter()
+        .map(|row| {
+            let next = groups.len();
+            *groups.entry(row.tokens.len()).or_insert(next)
+        })
+        .collect()
+}
+
 fn spell_clusters(rows: &[Row]) -> Vec<usize> {
     // Spell-style online LCS clusters, indexed by the first token as in its
-    // prefix tree. Token overlap picks one LCS candidate; exact repeats reuse
-    // their previous cluster immediately.
+    // prefix tree. Overlap prunes impossible candidates; actual LCS picks the
+    // best survivor. Exact repeats reuse their previous cluster immediately.
     let mut templates: Vec<Vec<String>> = Vec::new();
     let mut token_sets: Vec<HashSet<String>> = Vec::new();
     let mut buckets = HashMap::<String, Vec<usize>>::new();
@@ -857,35 +1125,39 @@ fn spell_clusters(rows: &[Row]) -> Vec<usize> {
             assignments.push(cluster);
             continue;
         }
-        let words = row_words(row);
-        let key = words.first().cloned().unwrap_or_default();
+        // Borrow the incoming tokens until a new cluster needs to own them.
+        let words: Vec<_> = (0..row.tokens.len()).map(|i| row.token(i)).collect();
+        let key = words.first().copied().unwrap_or("").to_owned();
         let members = buckets.entry(key).or_default();
         let mut best = None;
-        let mut best_overlap = 0;
+        let mut best_lcs = Vec::new();
         for &i in members.iter() {
+            // Token overlap is an upper bound on LCS length. It cheaply
+            // rejects impossible matches, then actual LCS picks the cluster.
             let overlap = words
                 .iter()
-                .filter(|word| token_sets[i].contains(*word))
+                .filter(|word| token_sets[i].contains(**word))
                 .count();
-            if best.is_none() || overlap > best_overlap {
+            if overlap * 2 < words.len().max(1) || overlap <= best_lcs.len() {
+                continue;
+            }
+            let pattern: Vec<_> = templates[i].iter().map(String::as_str).collect();
+            let kept = lcs_indices(&pattern, &words);
+            if kept.len() > best_lcs.len() && kept.len() * 2 >= words.len().max(1) {
                 best = Some(i);
-                best_overlap = overlap;
+                best_lcs = kept;
             }
         }
-        let kept = best.map(|i| lcs_indices(&templates[i], &words));
-        let matched = kept
-            .as_ref()
-            .is_some_and(|indices| indices.len() * 2 >= words.len().max(1));
-        let cluster = if matched {
-            let id = best.unwrap_or(0);
-            if let Some(kept) = kept {
-                templates[id] = kept.into_iter().map(|i| templates[id][i].clone()).collect();
-                token_sets[id] = templates[id].iter().cloned().collect();
-            }
+        let cluster = if let Some(id) = best {
+            templates[id] = best_lcs
+                .into_iter()
+                .map(|i| templates[id][i].clone())
+                .collect();
+            token_sets[id] = templates[id].iter().cloned().collect();
             id
         } else if members.len() < 8 {
-            templates.push(words.clone());
-            token_sets.push(words.iter().cloned().collect());
+            templates.push(words.iter().map(|word| (*word).to_owned()).collect());
+            token_sets.push(words.iter().map(|word| (*word).to_owned()).collect());
             let id = templates.len() - 1;
             members.push(id);
             id
@@ -915,6 +1187,8 @@ fn sequitur_clusters(rows: &[Row]) -> Vec<usize> {
         sequences.push(sequence);
     }
     let first_rule = symbols.len() as u32;
+    let mut rule_children = Vec::<[u32; 2]>::new();
+    let mut rule_lengths = Vec::<usize>::new();
     for rule_number in 0..12 {
         let mut counts = HashMap::<(u32, u32), usize>::new();
         for sequence in &sequences {
@@ -932,6 +1206,17 @@ fn sequitur_clusters(rows: &[Row]) -> Vec<usize> {
             break;
         }
         let rule = first_rule + rule_number;
+        // Retain the hierarchy: a later rule may hide an earlier rule inside
+        // it, but both remain available when grouping messages.
+        let length = |symbol: u32| {
+            if symbol < first_rule {
+                1
+            } else {
+                rule_lengths[(symbol - first_rule) as usize]
+            }
+        };
+        rule_lengths.push(length(pair.0) + length(pair.1));
+        rule_children.push([pair.0, pair.1]);
         for sequence in &mut sequences {
             let mut rewritten = Vec::with_capacity(sequence.len());
             let mut i = 0;
@@ -947,15 +1232,42 @@ fn sequitur_clusters(rows: &[Row]) -> Vec<usize> {
             *sequence = rewritten;
         }
     }
-    sequences
+    let used_by_row: Vec<_> = sequences
         .iter()
         .map(|sequence| {
-            sequence
+            let mut used = vec![false; rule_children.len()];
+            let mut pending: Vec<_> = sequence
                 .iter()
                 .copied()
                 .filter(|&symbol| symbol >= first_rule)
-                .max()
-                .map_or(usize::MAX, |rule| rule as usize)
+                .collect();
+            while let Some(symbol) = pending.pop() {
+                let index = (symbol - first_rule) as usize;
+                if used[index] {
+                    continue;
+                }
+                used[index] = true;
+                pending.extend(
+                    rule_children[index]
+                        .into_iter()
+                        .filter(|&child| child >= first_rule),
+                );
+            }
+            used
+        })
+        .collect();
+    let support: Vec<_> = (0..rule_children.len())
+        .map(|rule| used_by_row.iter().filter(|used| used[rule]).count())
+        .collect();
+    used_by_row
+        .into_iter()
+        .map(|used| {
+            // A rule repeated only inside one message cannot make a shared
+            // template; prefer the longest rule appearing in at least two rows.
+            (0..used.len())
+                .filter(|&rule| used[rule] && support[rule] >= 2)
+                .max_by_key(|&rule| (rule_lengths[rule], support[rule], rule))
+                .map_or(usize::MAX, |rule| (first_rule as usize) + rule)
         })
         .collect()
 }
@@ -963,15 +1275,42 @@ fn sequitur_clusters(rows: &[Row]) -> Vec<usize> {
 type Rendering = (String, Vec<String>);
 
 struct Variant {
-    // Positions mean alignment, Sequitur, MDL, Drain, Spell, prefix, none.
-    tag: [u8; 7],
+    // Original positions stay stable; M and D are the comparison variants.
+    tag: [u8; 9],
     template: String,
     fields: Vec<String>,
+    // Display-only metadata; stored templates retain positional {} markers.
+    field_types: Option<Vec<ValueType>>,
+}
+
+fn typed_template(template: &str, types: &[ValueType]) -> String {
+    // Respect escaped literal braces/backslashes when decorating placeholders.
+    let mut result = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    let mut types = types.iter();
+    while let Some(ch) = chars.next() {
+        result.push(ch);
+        if ch == '\\' {
+            if let Some(escaped) = chars.next() {
+                result.push(escaped);
+            }
+        } else if ch == '{' && chars.peek() == Some(&'}') {
+            if let Some(kind) = types.next() {
+                result.push_str(kind.label());
+            }
+            result.push(chars.next().unwrap());
+        }
+    }
+    result
 }
 
 fn render_algorithm(rows: &[Row], algorithm: Algorithm) -> Vec<Option<Rendering>> {
+    if matches!(algorithm, Algorithm::Drain2) {
+        return drain2::State::default().render_block(rows);
+    }
     let assignments = match algorithm {
         Algorithm::Drain => drain_clusters(rows),
+        Algorithm::Mdl2 => mdl2_clusters(rows),
         Algorithm::Spell => spell_clusters(rows),
         Algorithm::Sequitur => sequitur_clusters(rows),
         _ => vec![0; rows.len()],
@@ -1003,13 +1342,15 @@ fn render_algorithm(rows: &[Row], algorithm: Algorithm) -> Vec<Option<Rendering>
 
 fn print_group(
     rows: &[Row],
-    selected: &[bool; 7],
+    full_block: bool,
+    selected: &[bool; 9],
     colored: bool,
     carry: bool,
+    preextract: bool,
     output: &mut impl Write,
     first: &mut bool,
-    timings: &mut [Timing; 7],
-    learned: &mut [LearnedState; 7],
+    timings: &mut [Timing; 9],
+    learned: &mut [LearnedState; 9],
 ) -> io::Result<()> {
     let mut variants: Vec<Vec<Variant>> = (0..rows.len()).map(|_| Vec::new()).collect();
     for algorithm in Algorithm::ALL {
@@ -1017,45 +1358,150 @@ fn print_group(
         if !selected[position] {
             continue;
         }
-        // Measure clustering and template extraction, excluding TSV parsing,
-        // result merging, and output. Attempts with no result still count.
+        // Time the complete per-algorithm block pass: cached matches, clustering,
+        // candidate alignment, chosen_anchors scoring, template construction,
+        // and learned-state updates. Drain2 includes regex extraction/cache
+        // work. Every method includes optional masks and capture type tracking.
+        // TSV parsing, size/diversity accounting, merging, and
+        // output are shared/reporting work outside this interval.
         let started = Instant::now();
-        let rendered = if carry {
-            learned[position].render_block(rows, algorithm)
+        // Each method pays for its own preprocessing, even when identical
+        // masks could be shared. Raw prefix matching needs only message bytes;
+        // tokenizing it wastes work without contributing to the extraction.
+        // The raw baseline only needs preprocessing when requested, to label
+        // an exact whole-message capture's type.
+        let raw_baseline = matches!(algorithm, Algorithm::None) && !preextract;
+        let raw_prefix = matches!(algorithm, Algorithm::Prefix) && !preextract;
+        let prepared = if raw_baseline || raw_prefix {
+            Vec::new()
         } else {
-            LearnedState::default().render_block(rows, algorithm)
+            preextract::prepare_rows(rows, preextract)
+        };
+        let algorithm_rows = if raw_baseline || raw_prefix {
+            rows
+        } else {
+            &prepared
+        };
+        let mut fresh = LearnedState::default();
+        let state = if carry {
+            &mut learned[position]
+        } else {
+            &mut fresh
+        };
+        let rendered = state.render_block(algorithm_rows, algorithm);
+        // Type labels also feed the block archetype metric. Keep this capture
+        // bookkeeping inside the timed algorithm pass, before output merging.
+        let field_types: Vec<Option<Vec<ValueType>>> = if !preextract {
+            Vec::new()
+        } else if matches!(algorithm, Algorithm::Drain2) {
+            state.drain2_field_types().to_vec()
+        } else {
+            rendered
+                .iter()
+                .zip(algorithm_rows)
+                .map(|(result, row)| {
+                    result
+                        .as_ref()
+                        .map(|(template, fields)| learned::capture_types(template, row, fields))
+                })
+                .collect()
         };
         let elapsed = started.elapsed();
         timings[position].record_block(elapsed, rows.len());
+        let mut summary = BlockSummary::default();
+        let mut block_sizes = StringSizes::default();
+        // Batch the dictionary work under one timer per block, so timing
+        // overhead does not grow with the number of templates/value fields.
+        // Both report-global pools and the full-block codec pool are counted.
+        // Sorting, concatenation, diversity, merging and output stay outside.
+        let dedup_started = Instant::now();
+        for (row, result) in rows.iter().zip(&rendered) {
+            match result {
+                Some((template, fields)) if !matches!(algorithm, Algorithm::None) => {
+                    timings[position].sizes.record(template, fields);
+                    if full_block {
+                        block_sizes.record(template, fields);
+                    }
+                }
+                _ => {
+                    // Raw baselines and failed extraction store whole strings.
+                    timings[position].sizes.record_value(&row.message);
+                    if full_block {
+                        block_sizes.record_value(&row.message);
+                    }
+                }
+            }
+        }
+        timings[position].record_dedup_block(dedup_started.elapsed(), rows.len());
         for (row_index, result) in rendered.into_iter().enumerate() {
             let Some((template, fields)) = result else {
-                timings[position]
-                    .sizes
-                    .record_value(&rows[row_index].message);
+                if full_block {
+                    // Failed extraction stores the whole original message.
+                    summary.record(
+                        None,
+                        std::iter::once(rows[row_index].message.as_str()),
+                        false,
+                    );
+                }
                 continue;
             };
-            // Attribute each method's result before identical output rows are
-            // merged. Accounting is outside the algorithm's measured runtime.
+            // Diversity and output merging have their own work, outside all
+            // three timers. Dictionary accounting was completed above.
             if matches!(algorithm, Algorithm::None) {
-                timings[position]
-                    .sizes
-                    .record_value(&rows[row_index].message);
+                if full_block {
+                    if let Some(Some(types)) = field_types.get(row_index) {
+                        summary.record_types(None, types);
+                    } else {
+                        summary.record(
+                            None,
+                            std::iter::once(rows[row_index].message.as_str()),
+                            false,
+                        );
+                    }
+                }
             } else {
-                timings[position].sizes.record(&template, &fields);
+                if full_block {
+                    if let Some(Some(types)) = field_types.get(row_index) {
+                        summary.record_types(Some(&template), types);
+                    } else {
+                        summary.record(Some(&template), fields.iter().map(String::as_str), false);
+                    }
+                }
             }
             let matching = variants[row_index]
                 .iter_mut()
-                .find(|item| item.template == template && item.fields == fields);
+                // Typed placeholders are part of the displayed template.
+                // Keep differing capture schemas on separate output lines.
+                .find(|item| {
+                    item.template == template
+                        && item.fields == fields
+                        && item.field_types == field_types.get(row_index).cloned().flatten()
+                });
             if let Some(existing) = matching {
-                existing.tag[position] = b"aqmdspn"[position];
+                existing.tag[position] = TAG_BYTES[position];
+                if let Some(Some(types)) = field_types.get(row_index) {
+                    existing.field_types = Some(types.clone());
+                }
             } else {
-                let mut tag = [b' '; 7];
-                tag[position] = b"aqmdspn"[position];
+                let mut tag = [b' '; 9];
+                tag[position] = TAG_BYTES[position];
                 variants[row_index].push(Variant {
                     tag,
                     template,
                     fields,
+                    field_types: field_types.get(row_index).cloned().flatten(),
                 });
+            }
+        }
+        if full_block {
+            timings[position].record_full_block(&summary);
+            // Pool sorting/concatenation are outside all three timers.
+            // Time only LZ4 compression of the block-local template/value pool.
+            let payload = block_sizes.unique_payload();
+            if !payload.is_empty() {
+                let started = Instant::now();
+                std::hint::black_box(lz4_flex::block::compress(&payload));
+                timings[position].compression_elapsed += started.elapsed();
             }
         }
     }
@@ -1072,10 +1518,14 @@ fn print_group(
             output.write_all(&variant.tag)?;
             write!(output, "\t{}\t{}\t", row.archetype, row.target)?;
             // Keep ANSI codes inside the template column so tabs stay plain.
+            let template = variant.field_types.as_ref().map_or_else(
+                || variant.template.clone(),
+                |types| typed_template(&variant.template, types),
+            );
             if colored {
-                write!(output, "{TEMPLATE_COLOR}{}{COLOR_RESET}", variant.template)?;
+                write!(output, "{TEMPLATE_COLOR}{template}{COLOR_RESET}")?;
             } else {
-                write!(output, "{}", variant.template)?;
+                write!(output, "{template}")?;
             }
             for field in variant.fields {
                 write!(output, "\t{}", escape(&field))?;
@@ -1089,12 +1539,13 @@ fn print_group(
 fn print_archetype(
     rows: &[Row],
     block_size: Option<usize>,
-    selected: &[bool; 7],
+    selected: &[bool; 9],
     colored: bool,
     carry: bool,
+    preextract: bool,
     output: &mut impl Write,
     first: &mut bool,
-    timings: &mut [Timing; 7],
+    timings: &mut [Timing; 9],
 ) -> io::Result<()> {
     if rows.len() < 2 {
         // Singleton archetypes are omitted from display and timing, but their
@@ -1116,9 +1567,11 @@ fn print_archetype(
     for block in rows.chunks(size) {
         print_group(
             block,
+            block.len() == size,
             selected,
             colored,
             carry,
+            preextract,
             output,
             first,
             timings,
@@ -1128,12 +1581,25 @@ fn print_archetype(
     Ok(())
 }
 
+fn parse_preextract(value: &str) -> Result<bool, String> {
+    // Boolean options with attached values must honor explicit false instead
+    // of treating every occurrence of the option name as an enabled flag.
+    match value {
+        "" | "true" | "on" | "1" => Ok(true),
+        "false" | "off" | "0" => Ok(false),
+        _ => Err(format!(
+            "invalid --preextract value: {value}; expected true or false"
+        )),
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = None;
     let mut block_size = None;
-    let mut selected = [true; 7];
+    let mut selected = [true; 9];
     let mut colored = false;
     let mut carry = true;
+    let mut preextract = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         let (name, attached) = arg.split_once('=').unwrap_or((&arg, ""));
@@ -1144,10 +1610,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     attached.to_owned()
                 };
-                selected = [false; 7];
+                selected = [false; 9];
                 for name in value.split(',') {
                     if name == "all" {
-                        selected = [true; 7];
+                        selected = [true; 9];
                     } else {
                         let algorithm = Algorithm::parse(name)
                             .ok_or_else(|| format!("unknown algorithm: {name}"))?;
@@ -1169,21 +1635,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--colored" => colored = true,
             "--no-carry" => carry = false,
+            "--preextract" => preextract = parse_preextract(attached)?,
             "--help" | "-h" => {
                 println!(
-                    "Usage: print_strings_mdl [--algo=msa,seq,mdl,drain,spell,prefix,none] [--block_size=ROWS] [--colored] [--no-carry] DUMP.tsv"
+                    "Usage: print_strings_mdl [--algo=msa,seq,mdl,mdl2,drain,drain2,spell,prefix,none] [--block_size=ROWS] [--colored] [--no-carry] [--preextract[=true|false]] DUMP.tsv"
                 );
                 println!(
-                    "Default: all seven algorithms. Output: tag<TAB>archetype<TAB>target<TAB>template<TAB>value..."
+                    "Default: all nine algorithms. Output: tag<TAB>archetype<TAB>target<TAB>template<TAB>value..."
                 );
                 println!(
-                    "Tag positions: aqmdspn; spaces mean that method did not produce this row."
+                    "Tag positions: aqmdspnMD; spaces mean that method did not produce this row."
                 );
                 println!(
                     "{{}} marks each value slot. Methods without a useful template emit no row."
                 );
+                println!(
+                    "With --preextract, all methods print slot types: {{module}}, {{path}}, {{ip}}, {{number}}, {{string}}."
+                );
                 println!("--colored wraps only the template column in ANSI cyan.");
                 println!("--no-carry resets learned templates after every block.");
+                println!(
+                    "--preextract enables regex masks and capture types, including for Drain2; preprocessing is timed."
+                );
+                println!(
+                    "Omit --preextract or pass --preextract=false to disable regex masking; ordinary tokenization still runs."
+                );
                 println!(
                     "Completion reports timing and sizes to stderr and the example’s formats.result."
                 );
@@ -1213,6 +1689,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &selected,
                 colored,
                 carry,
+                preextract,
                 &mut output,
                 &mut first,
                 &mut timings,
@@ -1220,12 +1697,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             rows.clear();
         }
         let message = unescape(message);
-        let tokens = tokenize(&message);
         rows.push(Row {
             archetype: archetype.to_owned(),
             target: target.to_owned(),
             message,
-            tokens,
+            // Preprocessing happens inside each algorithm's block timer.
+            tokens: Vec::new(),
+            masked: Vec::new(),
         });
     }
     print_archetype(
@@ -1234,13 +1712,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &selected,
         colored,
         carry,
+        preextract,
         &mut output,
         &mut first,
         &mut timings,
     )?;
     // Detect a closed output pipe before reporting timings for an incomplete run.
     output.flush()?;
-    print_timings(&selected, &timings)?;
+    print_timings(&selected, &timings, preextract)?;
     Ok(())
 }
 
@@ -1269,6 +1748,29 @@ mod tests {
             target: "test".to_owned(),
             message: message.to_owned(),
             tokens: tokenize(message),
+            masked: Vec::new(),
+        }
+    }
+
+    fn token_row(words: &[&str]) -> Row {
+        // Synthetic tokens isolate clustering decisions from punctuation and
+        // whitespace tokenization in the real TSV format.
+        let mut message = String::new();
+        let mut tokens = Vec::new();
+        for word in words {
+            let start = message.len();
+            message.push_str(word);
+            tokens.push(Token {
+                start,
+                end: message.len(),
+            });
+        }
+        Row {
+            archetype: "a".into(),
+            target: "test".into(),
+            message,
+            tokens,
+            masked: Vec::new(),
         }
     }
 
@@ -1297,16 +1799,72 @@ mod tests {
             &[row("a", "job ID(3) done"), row("a", "job ID(3) done")],
             Algorithm::Mdl,
         );
-        assert!(repeated
-            .iter()
-            .all(|item| item.as_ref().unwrap().0 == "job ID(3) done"));
-        assert!(repeated
-            .iter()
-            .all(|item| item.as_ref().unwrap().1.is_empty()));
+        assert!(
+            repeated
+                .iter()
+                .all(|item| item.as_ref().unwrap().0 == "job ID(3) done")
+        );
+        assert!(
+            repeated
+                .iter()
+                .all(|item| item.as_ref().unwrap().1.is_empty())
+        );
         // The caller creates a fresh learner at each archetype boundary.
-        assert!(LearnedState::default()
-            .render_block(&[row("b", "job ID(3) done")], Algorithm::Mdl)[0]
-            .is_none());
+        assert!(
+            LearnedState::default().render_block(&[row("b", "job ID(3) done")], Algorithm::Mdl)[0]
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_preextraction_preserves_whole_fields_for_every_template_method() {
+        // Different module depths and generic lengths become one atomic token,
+        // while literal braces, tabs and original UTF-8 values remain lossless.
+        let raw = [
+            row("a", "added plugin: foo::Plugin"),
+            row("a", "added plugin: baz::deep::Plugin<Vec<other::Type>>"),
+        ];
+        let prepared = preextract::prepare_rows(&raw, true);
+        assert_eq!(prepared[0].tokens.len(), prepared[1].tokens.len());
+        for algorithm in Algorithm::ALL
+            .into_iter()
+            .filter(|algo| !matches!(algo, Algorithm::None))
+        {
+            let mut state = LearnedState::default();
+            let results = state.render_block(&prepared, algorithm);
+            for (original, result) in raw.iter().zip(results) {
+                let (template, fields) =
+                    result.unwrap_or_else(|| panic!("{} omitted module path", algorithm.name()));
+                assert_eq!(template, "added plugin: {}", "{}", algorithm.name());
+                assert_eq!(format!("added plugin: {}", fields[0]), original.message);
+            }
+            let repeated = preextract::prepare_rows(
+                &[
+                    row("a", "added plugin: same::Plugin"),
+                    row("a", "added plugin: same::Plugin"),
+                ],
+                true,
+            );
+            assert!(
+                state
+                    .render_block(&repeated, algorithm)
+                    .iter()
+                    .all(|output| output
+                        .as_ref()
+                        .is_some_and(|(template, _)| template == "added plugin: {}")),
+                "{} promoted a regex-masked field",
+                algorithm.name()
+            );
+        }
+    }
+
+    #[test]
+    fn cached_patterns_cannot_split_regex_spans() {
+        // A literal inside a generic type must not become the cached delimiter
+        // between two slots. Matching may be declined and rediscovered.
+        let source = preextract::prepare_rows(&[row("a", "plug foo::A<bar::B done> done")], true);
+        let pattern = learned::test_pattern_captures("plug {} done{}", &source[0]);
+        assert!(pattern.is_none());
     }
 
     #[test]
@@ -1340,20 +1898,28 @@ mod tests {
         let mut timing = Timing::default();
         timing.record_block(Duration::from_millis(2), 2);
         timing.record_block(Duration::from_millis(10), 1);
+        timing.record_dedup_block(Duration::from_millis(3), 2);
+        timing.record_dedup_block(Duration::from_millis(12), 1);
         assert_eq!(timing.blocks, 2);
         assert_eq!(timing.rows, 3);
         assert!((timing.weighted_avg_ms_per_block().unwrap() - 14.0 / 3.0).abs() < 1e-9);
+        assert!((timing.weighted_avg_dedup_ms_per_block().unwrap() - 6.0).abs() < 1e-9);
         assert!(Timing::default().weighted_avg_ms_per_block().is_none());
+        assert!(
+            Timing::default()
+                .weighted_avg_dedup_ms_per_block()
+                .is_none()
+        );
     }
 
     #[test]
     fn byte_columns_use_non_singleton_rows() {
         // The singleton still occupies storage, but does not enlarge the
         // divisor used to compare methods on the processable archetypes.
-        let mut timings: [Timing; 7] = std::array::from_fn(|_| Timing::default());
+        let mut timings: [Timing; 9] = std::array::from_fn(|_| Timing::default());
         let mut output = Vec::new();
         let mut first = true;
-        let mut selected = [false; 7];
+        let mut selected = [false; 9];
         selected[Algorithm::None.index()] = true;
         print_archetype(
             &[row("single", "123456")],
@@ -1361,6 +1927,7 @@ mod tests {
             &selected,
             false,
             true,
+            false,
             &mut output,
             &mut first,
             &mut timings,
@@ -1372,6 +1939,7 @@ mod tests {
             &selected,
             false,
             true,
+            false,
             &mut output,
             &mut first,
             &mut timings,
@@ -1477,5 +2045,345 @@ mod tests {
         assert_eq!(lines[1].find('.'), lines[2].find('.'));
         assert_eq!(lines[1].len(), lines[2].len());
         assert_eq!(lines[2].len(), lines[3].len());
+    }
+
+    #[test]
+    fn new_variants_change_grouping_without_changing_original_methods() {
+        let samples = [row("a", "10 sent"), row("a", "20 sent")];
+        assert_ne!(drain_clusters(&samples)[0], drain_clusters(&samples)[1]);
+        let prepared = preextract::prepare_rows(&samples, true);
+        let rendered = render_algorithm(&prepared, Algorithm::Drain2);
+        assert_eq!(rendered[0], Some(("{} sent".into(), vec!["10".into()])));
+        assert_eq!(rendered[1], Some(("{} sent".into(), vec!["20".into()])));
+
+        let mixed = [
+            row("a", "job 1 done"),
+            row("a", "job 2 done"),
+            row("a", "job done"),
+        ];
+        assert_eq!(mdl2_clusters(&mixed)[0], mdl2_clusters(&mixed)[1]);
+        assert_ne!(mdl2_clusters(&mixed)[0], mdl2_clusters(&mixed)[2]);
+        assert!(
+            mdl2_clusters(&mixed)
+                .iter()
+                .all(|&group| group != usize::MAX)
+        );
+    }
+
+    #[test]
+    fn spell_uses_actual_lcs_and_seq_requires_cross_message_rule() {
+        let spell_rows = [
+            token_row(&["a", "4", "3", "2", "1"]),
+            token_row(&["a", "x", "1", "2", "3", "z"]),
+            token_row(&["a", "1", "2", "3", "4"]),
+        ];
+        let clusters = spell_clusters(&spell_rows);
+        assert_ne!(clusters[0], clusters[1]);
+        assert_eq!(clusters[1], clusters[2]);
+
+        let seq_rows = [
+            token_row(&["x", "y", "x", "y"]),
+            token_row(&["a", "b", "c"]),
+        ];
+        assert_eq!(sequitur_clusters(&seq_rows), [usize::MAX; 2]);
+    }
+
+    #[test]
+    fn every_extracted_template_reconstructs_its_message() {
+        // The alternate grouping and rule paths must still emit exact fields.
+        let samples = vec![
+            row("a", "user 10 opened /tmp/a"),
+            row("a", "user 20 opened /tmp/b"),
+            row("a", "user 30 opened /tmp/c"),
+        ];
+        for algorithm in Algorithm::ALL
+            .into_iter()
+            .filter(|algo| !matches!(algo, Algorithm::None | Algorithm::Prefix))
+        {
+            let rendered = render_algorithm(&samples, algorithm);
+            let mut emitted = 0;
+            for (source, result) in samples.iter().zip(rendered) {
+                let Some((template, fields)) = result else {
+                    continue;
+                };
+                emitted += 1;
+                let mut parts = template.split("{}");
+                let mut rebuilt = parts.next().unwrap_or("").to_owned();
+                for (value, literal) in fields.iter().zip(parts) {
+                    rebuilt.push_str(value);
+                    rebuilt.push_str(literal);
+                }
+                assert_eq!(rebuilt, source.message, "{}", algorithm.name());
+            }
+            assert!(emitted > 0, "{}", algorithm.name());
+        }
+    }
+
+    #[test]
+    fn comparison_variants_keep_fixed_tag_positions() {
+        // All selected methods may merge onto one printed row, but their
+        // positions remain stable for downstream readers of the TSV.
+        let rows = [row("a", "job 1 done"), row("a", "job 2 done")];
+        let mut selected = [false; 9];
+        for algorithm in [
+            Algorithm::Mdl,
+            Algorithm::Mdl2,
+            Algorithm::Drain,
+            Algorithm::Drain2,
+        ] {
+            selected[algorithm.index()] = true;
+        }
+        let mut output = Vec::new();
+        let mut first = true;
+        let mut timings = std::array::from_fn(|_| Timing::default());
+        print_archetype(
+            &rows,
+            None,
+            &selected,
+            false,
+            true,
+            false,
+            &mut output,
+            &mut first,
+            &mut timings,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let tags: Vec<_> = output
+            .lines()
+            .map(|line| line.split('\t').next().unwrap())
+            .collect();
+        assert!(!tags.is_empty());
+        assert!(tags.iter().all(|tag| tag.len() == TAG_BYTES.len()));
+        assert!(
+            tags.iter()
+                .any(|tag| tag.contains('m') && tag.contains('M'))
+        );
+        assert!(
+            tags.iter()
+                .any(|tag| tag.contains('d') && tag.contains('D'))
+        );
+    }
+
+    #[test]
+    fn preextract_flag_honors_explicit_false() {
+        // CLI splits --name=value before dispatch: false/off/0 must remain off,
+        // and misspelled values must fail rather than silently enabling masks.
+        for value in ["", "true", "on", "1"] {
+            assert_eq!(parse_preextract(value), Ok(true));
+        }
+        for value in ["false", "off", "0"] {
+            assert_eq!(parse_preextract(value), Ok(false));
+        }
+        assert!(parse_preextract("flase").is_err());
+    }
+
+    #[test]
+    fn all_methods_print_capture_types_only_with_preextraction() {
+        // Escaped literal {} and backslashes must not consume type labels.
+        assert_eq!(
+            typed_template(r"literal \{\} \\{} {}", &[ValueType::Module, ValueType::Ip]),
+            r"literal \{\} \\{module} {ip}"
+        );
+        let rows = [
+            row("a", "added plugin: foo::Plugin<bar::A>"),
+            row("a", "added plugin: baz::deep::Plugin"),
+        ];
+        let selected = [true; 9];
+        for colored in [false, true] {
+            let mut output = Vec::new();
+            let mut first = true;
+            let mut timings = std::array::from_fn(|_| Timing::default());
+            print_archetype(
+                &rows,
+                Some(2),
+                &selected,
+                colored,
+                true,
+                true,
+                &mut output,
+                &mut first,
+                &mut timings,
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            for line in output.lines().filter(|line| !line.is_empty()) {
+                let columns: Vec<_> = line.split('\t').collect();
+                if columns[0].contains('n') {
+                    assert!(columns[3].contains("{string}"));
+                } else {
+                    assert!(columns[3].contains("added plugin: {module}"), "{line}");
+                }
+            }
+            // All eight template methods agree here. The raw baseline prints
+            // its whole message as a string.
+            assert_eq!(output.matches("added plugin: {module}").count(), 2);
+            assert!(output.lines().any(|line| line.starts_with("aqmdsp MD\t")));
+            assert_eq!(output.contains(TEMPLATE_COLOR), colored);
+            let timing = &timings[Algorithm::Drain2.index()];
+            assert_eq!(
+                timing.sizes.templates,
+                HashSet::from(["added plugin: {}".into()])
+            );
+            assert_eq!(timing.distinct_archetypes, 1);
+            assert_eq!(timing.sizes.value_count, 2);
+        }
+        // Type decoration must not depend on merging with a Drain2 output.
+        let mut selected = [true; 9];
+        selected[Algorithm::Drain2.index()] = false;
+        let mut output = Vec::new();
+        let mut timings = std::array::from_fn(|_| Timing::default());
+        print_archetype(
+            &rows,
+            Some(2),
+            &selected,
+            false,
+            true,
+            true,
+            &mut output,
+            &mut true,
+            &mut timings,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("added plugin: {module}").count(), 2);
+        assert!(output.lines().any(|line| line.starts_with("aqmdsp M \t")));
+
+        // The whole-message baseline can be typed when its sole value exactly
+        // matches a regex capture, while still storing the untouched message.
+        let source = preextract::prepare_rows(&[row("a", "42")], true);
+        assert_eq!(
+            learned::capture_types("{}", &source[0], &["42".into()]),
+            [ValueType::Number]
+        );
+    }
+
+    #[test]
+    fn capture_types_use_exact_spans_and_handle_escaped_literals() {
+        // A composite gap must not be mislabeled as a number or module path.
+        let source = preextract::prepare_rows(&[row("a", "literal {} \\42 foo::Bar")], true);
+        assert_eq!(
+            learned::capture_types(
+                r"literal \{\} \\{} {}",
+                &source[0],
+                &["42".into(), "foo::Bar".into()]
+            ),
+            [ValueType::Number, ValueType::Module],
+        );
+        assert_eq!(
+            learned::capture_types("literal {}", &source[0], &["{} \\42 foo::Bar".into()]),
+            [ValueType::String],
+        );
+    }
+
+    #[test]
+    fn unmasked_output_has_plain_placeholders_for_every_method() {
+        // This also exercises generic regex extraction in unmasked Drain2.
+        let rows = [row("a", "job 1 done"), row("a", "job 2 done")];
+        let mut output = Vec::new();
+        let mut timings = std::array::from_fn(|_| Timing::default());
+        print_archetype(
+            &rows,
+            Some(2),
+            &[true; 9],
+            false,
+            true,
+            false,
+            &mut output,
+            &mut true,
+            &mut timings,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("job {} done"));
+        for kind in ["string", "number", "ip", "path", "module"] {
+            assert!(!output.contains(&format!("{{{kind}}}")), "{output}");
+        }
+        assert!(
+            output
+                .lines()
+                .any(|line| line.split('\t').next().unwrap().contains('D'))
+        );
+    }
+
+    #[test]
+    fn field_archetypes_ignore_order_but_keep_type_counts() {
+        assert_eq!(value_type(" 192.168.1.2 "), ValueType::Ip);
+        assert_eq!(value_type("-12.5"), ValueType::Number);
+        assert_eq!(value_type("/tmp/data.log"), ValueType::Path);
+        assert_eq!(value_type("app::module"), ValueType::Module);
+        assert_eq!(value_type("ordinary text"), ValueType::String);
+        assert_eq!(
+            value_archetype(["ordinary text", "192.168.1.2"], true),
+            value_archetype(["192.168.1.2", "ordinary text"], true)
+        );
+        assert_ne!(
+            value_archetype(["ordinary text", "192.168.1.2"], true),
+            value_archetype(["192.168.1.2", "ordinary text", "more text"], true)
+        );
+        // Untyped methods count only string slots, even for IP-like values.
+        assert_eq!(
+            value_archetype(["192.168.1.2", "ordinary text"], false),
+            [2, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn block_diversity_uses_only_complete_blocks() {
+        let mut timings: [Timing; 9] = std::array::from_fn(|_| Timing::default());
+        let mut selected = [false; 9];
+        selected[Algorithm::Mdl.index()] = true;
+        selected[Algorithm::None.index()] = true;
+        let mut output = Vec::new();
+        let mut first = true;
+        print_archetype(
+            &[
+                row("a", "job 1 done"),
+                row("a", "job 2 done"),
+                row("a", "other message"),
+            ],
+            Some(2),
+            &selected,
+            false,
+            true,
+            false,
+            &mut output,
+            &mut first,
+            &mut timings,
+        )
+        .unwrap();
+        let mdl = &timings[Algorithm::Mdl.index()];
+        assert_eq!((mdl.blocks, mdl.full_blocks), (2, 1));
+        assert_eq!((mdl.distinct_patterns, mdl.distinct_archetypes), (1, 1));
+        assert_eq!(
+            mdl.avg_compression_ms_per_full_block(),
+            Some(mdl.compression_elapsed.as_secs_f64() * 1000.0)
+        );
+        let none = &timings[Algorithm::None.index()];
+        assert_eq!((none.distinct_patterns, none.distinct_archetypes), (0, 1));
+
+        // A two-row archetype is incomplete when the requested block size is 3.
+        let mut partial = std::array::from_fn(|_| Timing::default());
+        print_archetype(
+            &[row("b", "one"), row("b", "two")],
+            Some(3),
+            &selected,
+            false,
+            true,
+            false,
+            &mut output,
+            &mut first,
+            &mut partial,
+        )
+        .unwrap();
+        assert_eq!(partial[Algorithm::Mdl.index()].full_blocks, 0);
+        assert_eq!(
+            partial[Algorithm::Mdl.index()].compression_elapsed,
+            Duration::ZERO
+        );
+        assert_eq!(
+            partial[Algorithm::Mdl.index()].avg_compression_ms_per_full_block(),
+            None
+        );
     }
 }
