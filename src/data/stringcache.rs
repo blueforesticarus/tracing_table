@@ -284,14 +284,24 @@ mod test {
             stats.inc(&a);
             assert_eq!(stats.get(&a), count);
 
-            stats.dec(&a);
-            assert_eq!(stats.get(&a), count - 1);
-
             let i = db.insert(a.clone());
 
             assert!(!i.is_inlined());
             assert_eq!(i.as_index(), vi);
             assert_eq!(a, db.get(i).unwrap());
+        }
+
+        // Decrement after all inserts so the duplicated string reaches count two.
+        for (s, remaining) in [
+            ("some longer strings", 0),
+            ("to test out the indexing", 0),
+            ("this one is duplicated", 1),
+            ("this one is duplicated", 0),
+            ("this is different", 0),
+        ] {
+            let a = Atom::from(s);
+            stats.dec(&a);
+            assert_eq!(stats.get(&a), remaining);
         }
 
         for s in ["hello", "", "1234567", "A"] {

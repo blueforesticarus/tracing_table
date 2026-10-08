@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime},
 };
 
 use parking_lot::{ArcRwLockWriteGuard, RawRwLock, RwLock};
@@ -33,6 +33,8 @@ use crate::data::{
     dyntuple::{Atom, BytePacker, ValueData, ValueKind},
 };
 
+mod dump;
+
 /// Controls indexed string storage for subsequently recorded fields in all layers.
 /// Defaults to Atom storage; toggle with store(value, Ordering::Relaxed).
 pub static USE_INDEXED_ATOM: AtomicBool = AtomicBool::new(false);
@@ -46,7 +48,7 @@ pub struct PerCallsiteData {
     last_message: Option<Atom>,
 
     // Stored here to avoid heap allocations
-    pub last_values: Vec<Option<ValueData>>,
+    pub field_value_scratchpad: Vec<Option<ValueData>>,
     last_archetype: Archetype,
 
     call_count: usize,
@@ -275,7 +277,7 @@ impl RecordingLayer {
                         id,
                         metadata,
                         last_message: None,
-                        last_values: vec![None; vcount],
+                        field_value_scratchpad: vec![None; vcount],
                         cache: Default::default(),
                         lookup: Default::default(),
                         call_count: 0,
@@ -320,16 +322,6 @@ impl RecordingLayer {
                 CompressionStats::default(), /*TODO better estimate overhead */
                 Add::add,
             )
-    }
-
-    pub fn dump_all_data(&self) {
-        let ids: Vec<usize> = self.callsites.read().keys().cloned().collect();
-        for id in ids {
-            let shared = self.callsites.read().get(&id).unwrap().clone();
-            let callsite = shared.read();
-
-            for buffer in callsite.cache {}
-        }
     }
 }
 
@@ -493,10 +485,10 @@ where
     ) {
         let time = self.timestamp();
         let ctx = ctx.span(&tracing_id).unwrap();
-        let ext = ctx.extensions();
-        let fields: Option<&Vec<Option<ValueData>>> = ext.get();
-        let follow_from: Option<&FollowFrom> = ext.get();
-        let id: SpanId = *ext.get().unwrap();
+        let mut ext = ctx.extensions_mut();
+        let follow_from = ext.get_mut::<FollowFrom>().map(|value| value.0);
+        let id: SpanId = *ext.get_mut().unwrap();
+        let fields: Option<&mut Vec<Option<ValueData>>> = ext.get_mut();
 
         let mut callsite_data = self.register(ctx.metadata());
         let callsite_data = callsite_data.deref_mut();
@@ -520,11 +512,12 @@ where
 
             let (data, _index) = arch.data.allocate();
             let mut data = BytePacker::new(data);
-            // data.write_any(&time.value, false);
-            data.write_any(&id, false); // end data points to start data
+            // Fix the packed type here so a reference cannot silently become the row value.
+            data.write_any::<SpanId>(id, false); // end data points to start data
             // most won't have end data, so this is good
-            for field in fields.iter() {
-                if let Some(field) = field {
+            // Transfer each value to the row; the packer keeps its Atom bits alive.
+            for field in fields.iter_mut() {
+                if let Some(field) = field.take() {
                     data.write_any_value(field, false);
                 }
             }
@@ -546,10 +539,10 @@ where
                 let row = row.get_mut();
                 let mut packer = BytePacker::new(row);
                 packer.skip::<PackedTimestamp>(false);
-                packer.write_any(&time.value, false); // end timestamp;
-                packer.write_any(&extra_fields, false);
-                if let Some(FollowFrom(f)) = follow_from {
-                    packer.write_any(f, false)
+                packer.write_any::<PackedTimestamp>(time.value, false); // end timestamp;
+                packer.write_any::<SpanFieldsRef>(extra_fields, false);
+                if let Some(f) = follow_from {
+                    packer.write_any::<SpanId>(f, false)
                 }
             }
             data.compute_timestamp(time.value as usize, Some(id.index as usize));
@@ -579,10 +572,10 @@ where
         let callsite_data = callsite_data.deref_mut();
         callsite_data.call_count += 1;
 
-        callsite_data.last_values.fill(None);
+        callsite_data.field_value_scratchpad.fill(None);
         let mut visitor = ValueRecorder {
             _metadata: attrs.metadata(),
-            data: &mut callsite_data.last_values,
+            data: &mut callsite_data.field_value_scratchpad,
             prefix: &mut callsite_data.last_message,
             is_log_compat: false,
         };
@@ -594,7 +587,7 @@ where
         callsite_data.last_archetype.field_types.clear();
         callsite_data.last_archetype.field_types.extend(
             callsite_data
-                .last_values
+                .field_value_scratchpad
                 .iter()
                 .map(|opt| opt.as_ref().map(|v| v.into())),
         );
@@ -625,15 +618,15 @@ where
         // probably should change this in the future.
         // NOTE: with compaction, probably could use serialization.
         let mut data = BytePacker::new(data);
-        data.write_any(&time.value, false);
-        data.write_any(&PackedTimestamp::default(), false); // space for end_timestamp
-        data.write_any(&SpanFieldsRef::default(), false); // deferred fields are unknown until close
-        data.write_any(&PLACE_HOLDER, false); // space for follows_from
+        data.write_any::<PackedTimestamp>(time.value, false);
+        data.write_any::<PackedTimestamp>(PackedTimestamp::default(), false); // space for end_timestamp
+        data.write_any::<SpanFieldsRef>(SpanFieldsRef::default(), false); // deferred fields are unknown until close
+        data.write_any::<SpanId>(PLACE_HOLDER, false); // space for follows_from
         if arch.archetype.parent {
-            data.write_any(&span_id.unwrap(), false);
+            data.write_any::<SpanId>(span_id.unwrap(), false);
         }
-        for field in callsite_data.last_values.iter() {
-            if let Some(field) = field {
+        for field in callsite_data.field_value_scratchpad.iter_mut() {
+            if let Some(field) = field.take() {
                 data.write_any_value(field, false);
             }
         }
@@ -664,10 +657,10 @@ where
         callsite_data.call_count += 1;
 
         // event id's currently not stored. since nothing refers to them
-        callsite_data.last_values.fill(None);
+        callsite_data.field_value_scratchpad.fill(None);
         let mut visitor = ValueRecorder {
             _metadata: metadata,
-            data: &mut callsite_data.last_values,
+            data: &mut callsite_data.field_value_scratchpad,
             prefix: &mut callsite_data.last_message,
             is_log_compat,
         };
@@ -679,7 +672,7 @@ where
         callsite_data.last_archetype.field_types.clear();
         callsite_data.last_archetype.field_types.extend(
             callsite_data
-                .last_values
+                .field_value_scratchpad
                 .iter()
                 .map(|opt| opt.as_ref().map(|v| v.into())),
         );
@@ -708,12 +701,12 @@ where
         // probably should change this in the future.
         // NOTE: with compaction, probably could use serialization.
         let mut data = BytePacker::new(data);
-        data.write_any(&time.value, false);
+        data.write_any::<PackedTimestamp>(time.value, false);
         if arch.archetype.parent {
-            data.write_any(&span_id.unwrap(), false);
+            data.write_any::<SpanId>(span_id.unwrap(), false);
         }
-        for field in callsite_data.last_values.iter() {
-            if let Some(field) = field {
+        for field in callsite_data.field_value_scratchpad.iter_mut() {
+            if let Some(field) = field.take() {
                 data.write_any_value(field, false);
             }
         }

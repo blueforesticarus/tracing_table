@@ -180,7 +180,7 @@ impl<'a> BytePacker<'a> {
         self.offset += size;
     }
 
-    pub fn write_any_value(&mut self, data: &ValueData, aligned: bool) {
+    pub fn write_any_value(&mut self, data: ValueData, aligned: bool) {
         match data {
             ValueData::F64(v) => self.write_any(v, aligned),
             ValueData::I64(v) => self.write_any(v, aligned),
@@ -201,12 +201,16 @@ impl<'a> BytePacker<'a> {
         }
     }
 
-    pub fn write_any_owned<T>(&mut self, data: T, aligned: bool) {
-        self.write_any(&data, aligned);
+    // moves value into the row
+    pub fn write_any<T: 'static + Unpin>(&mut self, data: T, aligned: bool) {
+        unsafe {
+            self.write_any_by_ref(&data, aligned);
+        }
         let _ = ManuallyDrop::new(data);
     }
 
-    pub fn write_any<T>(&mut self, data: &T, aligned: bool) {
+    // this is unsafe because loading is meant to be safe.
+    unsafe fn write_any_by_ref<T>(&mut self, data: &T, aligned: bool) {
         if aligned {
             self.align_fill(align_of::<T>());
         }
