@@ -2,6 +2,9 @@
 pub mod data;
 pub mod subscriber;
 
+// Make scanner types and artifact readers available to this library's consumers.
+pub use tracing_scan_elf;
+
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }

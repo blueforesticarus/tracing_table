@@ -259,3 +259,15 @@ priorities:
 
 We DO NOT CARE ABOUT
 - modification (log messages are immutable)
+
+## MVP
+1. archetype on format of message (takes care of well behaved)
+2. store templates once, globally deduped, with cap. 
+3. implement our own string interner, which supports multiple instances and custom size
+4. lz4 old blocks message values. 
+
+hiccup: if we do message template extraction, then we change archetype when we compact, headache
+
+then:
+- static storage for module paths
+- evaluate theoretically possible compression by looking at actual logs

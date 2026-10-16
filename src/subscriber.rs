@@ -791,6 +791,9 @@ impl<'a> Visit for ValueRecorder<'a> {
     }
 
     fn record_debug(&mut self, field: &tracing_core::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            dump::dump_debug_message(self._metadata, value, self.is_log_compat);
+        }
         self.record_str(field, &format!("{:?}", value));
     }
 

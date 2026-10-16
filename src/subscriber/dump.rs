@@ -1,13 +1,95 @@
-use std::{io::Write, mem::ManuallyDrop, time::UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    fmt,
+    io::Write,
+    mem::ManuallyDrop,
+    sync::{LazyLock, Mutex},
+    time::UNIX_EPOCH,
+};
 
 use rmpv::Value as MpValue;
 use streaming_iterator::StreamingIterator;
+use tracing::Metadata;
 
 use super::RecordingLayer;
 use crate::data::{
     dyntuple::{Atom, ValueKind},
     stringcache::AtomIndexed,
 };
+
+/// Print everything exposed by an erased debug message the first time a
+/// callsite supplies a value with a particular trait-object vtable.
+///
+/// This is intentionally diagnostic rather than part of the MessagePack dump:
+/// a vtable address is useful for grouping values in one process, but is not a
+/// stable type identifier and must not become part of the storage format.
+pub(super) fn dump_debug_message(
+    metadata: &Metadata<'_>,
+    value: &dyn fmt::Debug,
+    is_log_compat: bool,
+) {
+    type SeenKey = (usize, String);
+    static SEEN: LazyLock<Mutex<HashSet<SeenKey>>> = LazyLock::new(Default::default);
+
+    // Vtable equality is only a useful observation within this process: codegen
+    // may duplicate a type's vtable or merge identical vtables from two types.
+    let value_metadata = std::ptr::metadata(value);
+    // Store the diagnostic representation rather than DynMetadata itself so
+    // the erased value's non-static object lifetime cannot escape this call.
+    let value_metadata_identity = format!("{value_metadata:?}");
+    let data_address = value as *const dyn fmt::Debug as *const ();
+    let callsite_address = metadata as *const Metadata<'_> as usize;
+    if !SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((callsite_address, value_metadata_identity))
+    {
+        return;
+    }
+
+    let fields: Vec<_> = metadata.fields().iter().map(|field| field.name()).collect();
+    let debug = format!("{value:?}");
+    let alternate_debug = format!("{value:#?}");
+    let lower_hex_debug = format!("{value:x?}");
+    let upper_hex_debug = format!("{value:X?}");
+
+    // tracing-log 0.2's LogTracer constructs its `message` Value directly
+    // from `log::Record::args()`. Therefore, for this explicitly identified
+    // path, the erased concrete value is guaranteed to be fmt::Arguments.
+    // `as_str` exposes a literal/compile-time-folded message, but returns None
+    // for the usual case containing runtime formatting arguments.
+    let log_arguments_as_str = is_log_compat.then(|| {
+        let arguments = unsafe { &*(data_address as *const fmt::Arguments<'_>) };
+        arguments.as_str()
+    });
+
+    eprintln!(
+        "tracing_table debug-message dump:\n  callsite_metadata: {{ address: {callsite_address:#x}, name: {:?}, target: {:?}, level: {:?}, kind: {}, file: {:?}, line: {:?}, module: {:?}, fields: {:?} }}\n  value_metadata: {{ data_address: {:#x}, vtable: {:?}, dynamic_size: {}, dynamic_alignment: {}, erased_type_name: {:?}, source: {:?} }}\n  first_value: {{ debug: {:?}, alternate_debug: {:?}, lower_hex_debug: {:?}, upper_hex_debug: {:?}, tracing_log_arguments_as_str: {:?} }}",
+        metadata.name(),
+        metadata.target(),
+        metadata.level(),
+        if metadata.is_event() { "event" } else { "span" },
+        metadata.file(),
+        metadata.line(),
+        metadata.module_path(),
+        fields,
+        data_address as usize,
+        value_metadata,
+        value_metadata.size_of(),
+        value_metadata.align_of(),
+        std::any::type_name_of_val(value),
+        if is_log_compat {
+            "tracing_log::LogTracer (known fmt::Arguments)"
+        } else {
+            "tracing (concrete Debug type erased)"
+        },
+        debug,
+        alternate_debug,
+        lower_hex_debug,
+        upper_hex_debug,
+        log_arguments_as_str,
+    );
+}
 
 impl RecordingLayer {
     /// Write consecutive MessagePack maps for format, callsite, archetype, and row records.

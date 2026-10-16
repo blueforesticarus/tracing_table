@@ -18,7 +18,7 @@ rmpv = "1.3.1"
 [dev-dependencies]
 libloading = "0.8.9"
 lz4_flex = "0.11"
-# Drain2's whole-value masking and lossless parameter extraction.
+# Shared semantic preextraction and template-related regex helpers.
 regex = "1.12"
 
 # Preserve the command name when the example's sources live in their own folder.
