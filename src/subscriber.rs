@@ -83,10 +83,7 @@ impl PerCallsiteData {
             }
         };
         // &mut self.cache[i]
-        i // if you are going to design your language around not allowing aliased mutability
-        // even in unsafe blocks. Then you need to have a way to deal with partial borrows.
-        // better yet, just let be break aliased mutability in unsafe blocks.
-        // this will never be a systems language
+        i
     }
 }
 
@@ -791,9 +788,10 @@ impl<'a> Visit for ValueRecorder<'a> {
     }
 
     fn record_debug(&mut self, field: &tracing_core::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            dump::dump_debug_message(self._metadata, value, self.is_log_compat);
-        }
+        // This was test code to investigate extracting format strings directly.
+        // if field.name() == "message" {
+        // dump::dump_debug_message(self._metadata, value, self.is_log_compat);
+        // }
         self.record_str(field, &format!("{:?}", value));
     }
 
