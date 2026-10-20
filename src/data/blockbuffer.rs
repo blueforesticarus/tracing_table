@@ -9,7 +9,7 @@ use std::{
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
 use super::CompressionStats;
-use super::dataframe::{CompactFrame, CompactFrameIter, Frame, Row};
+use super::dataframe::{CompactFrame, CompactFrameIter, Frame, Row, RowBuffer};
 
 /// a quasi ring buffer of dataframes.
 
@@ -113,7 +113,7 @@ impl BlockCache {
 
     pub fn push(&mut self, data: &[u8], ts: usize) {
         self.allocate().0.copy_from_slice(data);
-        self.compute_mask();
+        self.update_mask_after_append();
         self.compute_timestamp(ts, None);
     }
 
@@ -121,8 +121,7 @@ impl BlockCache {
         if index >= self.count {
             Row {
                 init: false, // we aren't copying the data, just providing the buffer
-                buffered: None,
-                owned: None,
+                buffer: RowBuffer::Owned(Box::default()),
                 index: index - self.count,
                 frame: crate::data::dataframe::AnyFrame::Frame(&mut self.active),
             }
@@ -134,8 +133,7 @@ impl BlockCache {
 
             Row {
                 init: false, // we aren't copying the data, just providing the buffer
-                buffered: Some(self.edit_buffer.as_mut_slice()),
-                owned: None,
+                buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
                 index: index - data.index,
                 frame: crate::data::dataframe::AnyFrame::Compact(&mut data.data),
             }
@@ -144,8 +142,8 @@ impl BlockCache {
     }
 
     /// NOTE: could simplify by computing mask when compacting. Pretty sure it's the same amount of processing.
-    pub fn compute_mask(&mut self) {
-        self.active.compute_mask(self.active.length - 1);
+    pub fn update_mask_after_append(&mut self) {
+        self.active.update_mask(self.active.length - 1, false /*only need to check for newly constant bits when changing data, not when appending. */);
     }
 
     // track earliest and latest ts for block

@@ -19,15 +19,94 @@ use tracing::{
 
 use super::CompressionStats;
 
+mod bitcompact;
+pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
+
 pub enum AnyFrame<'a> {
     Frame(&'a mut Box<Frame>),
     Compact(&'a mut Box<CompactFrame>),
+    BitCompact(&'a mut Box<BitCompactFrame>),
+}
+
+/// The edit changes omitted data and requires rebuilding; the frame is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeedsRebuild;
+
+impl AnyFrame<'_> {
+    /// Write a row, rebuilding and replacing its owning box only when necessary.
+    pub fn write_row(&mut self, index: usize, row: &[u8]) {
+        match self {
+            Self::Frame(frame) => {
+                assert!(index < frame.length, "row index out of bounds");
+                let start = (index + 1) * frame.unit;
+                frame.buffer[start..start + frame.unit].copy_from_slice(row);
+                frame.update_mask(index, true);
+            }
+            Self::Compact(frame) => {
+                if frame.try_write_row(index, row).is_ok() {
+                    return;
+                }
+                let mut unpacked = Frame::new(frame.unit, frame.length);
+                frame.uncompact(&mut unpacked);
+                AnyFrame::Frame(&mut unpacked).write_row(index, row);
+                **frame = CompactFrame::new_from(&unpacked);
+            }
+            Self::BitCompact(frame) => {
+                if frame.try_write_row(index, row).is_ok() {
+                    return;
+                }
+                let mut unpacked = Frame::new(frame.unit(), frame.len());
+                frame.uncompact(&mut unpacked);
+                AnyFrame::Frame(&mut unpacked).write_row(index, row);
+                **frame = BitCompactFrame::new_from(&unpacked);
+            }
+        }
+    }
+}
+
+/// Mutable scratch storage, either lent by the caller or owned by the row.
+pub enum RowBuffer<'a> {
+    Borrowed(&'a mut [u8]),
+    Owned(Box<[u8]>),
+}
+
+impl RowBuffer<'_> {
+    fn get_or_init(&mut self, size: usize) -> &mut [u8] {
+        // An empty owned box defers allocation until a compact row is accessed.
+        if let Self::Owned(buffer) = self {
+            if buffer.is_empty() {
+                // TODO: Decode into MaybeUninit<u8> storage to avoid this zero fill.
+                // SAFETY: All allocated bytes are zeroed, which is valid for u8.
+                *buffer = unsafe { Box::<[u8]>::new_zeroed_slice(size).assume_init() };
+            }
+        }
+        self
+    }
+}
+
+impl Deref for RowBuffer<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Owned(buffer) => buffer,
+        }
+    }
+}
+
+impl DerefMut for RowBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Owned(buffer) => buffer,
+        }
+    }
 }
 
 pub struct Row<'a> {
     pub init: bool,
-    pub buffered: Option<&'a mut [u8]>,
-    pub owned: Option<Vec<u8>>,
+    pub buffer: RowBuffer<'a>,
     pub index: usize,
     pub frame: AnyFrame<'a>,
 }
@@ -39,78 +118,33 @@ impl<'a> Row<'a> {
                 let index = (1 + self.index) * frame.unit;
                 &mut frame.buffer[index..index + frame.unit]
             }
-            AnyFrame::Compact(compact_frame) => {
-                let slice = if self.buffered.is_none() {
-                    if self.owned.is_none() {
-                        self.owned = Some(vec![0u8; compact_frame.unit]);
-                    }
-                    self.owned.as_mut().unwrap().as_mut_slice()
-                } else {
-                    self.buffered.as_mut().unwrap()
-                };
-
-                //todo cleanup
+            AnyFrame::BitCompact(frame) => {
+                let slice = self.buffer.get_or_init(frame.unit());
                 if !self.init {
+                    frame.read_row(self.index, slice);
                     self.init = true;
-                    slice.copy_from_slice(compact_frame.first());
-                    if self.index != 0 {
-                        let index = 2 * compact_frame.unit
-                            + (compact_frame.unit - compact_frame.mask().constant_bytes())
-                                * (self.index - 1);
-                        for (a, b) in MaskIter::new(compact_frame.mask()) {
-                            slice[b].copy_from_slice(&compact_frame.buffer[index..][a]);
-                        }
-                    }
                 }
-
+                slice
+            }
+            AnyFrame::Compact(compact_frame) => {
+                let slice = self.buffer.get_or_init(compact_frame.unit);
+                if !self.init {
+                    compact_frame.read_row(self.index, slice);
+                    self.init = true;
+                }
                 slice
             }
         }
     }
 }
 
+// when the row is dropped we have to write the scratchpad back to frame storage (if it exists)
 impl<'a> Drop for Row<'a> {
     fn drop(&mut self) {
         match &mut self.frame {
-            AnyFrame::Frame(frame) => frame.compute_mask(self.index),
-            AnyFrame::Compact(compact_frame) => {
-                if !self.init {
-                    return;
-                }
-                let unit = compact_frame.unit;
-                let buffer = match self.buffered.as_mut() {
-                    Some(v) => v,
-                    None => self.owned.as_mut().unwrap().as_mut_slice(),
-                };
-
-                let mut rebuild = false;
-                for (i, b) in compact_frame.mask().iter().enumerate() {
-                    if *b == 0 && buffer[i] != compact_frame.buffer[unit + i] {
-                        rebuild = true;
-                        break;
-                    }
-                }
-
-                if !rebuild {
-                    let layout = compact_frame.buffer();
-                    if self.index != 0 {
-                        let index = (self.index - 1) * layout.mask.compact_unit();
-                        for (a, b) in MaskIter::new(layout.mask) {
-                            layout.data[index..][a].copy_from_slice(&buffer[b]);
-                        }
-                    } else {
-                        layout.first.copy_from_slice(&buffer);
-                    }
-                } else {
-                    let mut unpacked = Frame::new(unit, compact_frame.length);
-                    compact_frame.uncompact(&mut unpacked);
-                    unpacked.buffer[unit..][unit * self.index..][..unit].copy_from_slice(&buffer);
-                    // A formerly constant header byte can change when a span closes.
-                    unpacked.compute_mask(self.index);
-                    let new = CompactFrame::new_from(&unpacked);
-                    **compact_frame = new;
-                }
-            }
+            AnyFrame::Frame(frame) => frame.update_mask(self.index, true),
+            frame if self.init => frame.write_row(self.index, &self.buffer),
+            _ => {}
         }
     }
 }
@@ -181,6 +215,7 @@ impl Frame {
     /// set the mask for these bytes, preventing them from being compacted
     /// usefull if a field needs to remain mutable in the compacted frame
     /// TODO really need to figure out rule of thumb for int sizes in cases like these
+    /// TODO will be undone if update_mask is called with check_for_new_const=true
     pub fn lock_editable(&mut self, i1: usize, i2: usize) {
         for i in i1..i2 {
             self.buffer[i] = 0xFF;
@@ -207,8 +242,8 @@ impl Frame {
     pub fn push(&mut self, data: &[u8]) {
         let (buffer, _) = self.allocate().unwrap();
         buffer.copy_from_slice(data);
-        drop(buffer);
-        self.compute_mask(self.length - 1)
+        // drop(buffer);
+        self.update_mask(self.length - 1, false)
     }
 
     pub fn allocate(&mut self) -> Option<(&mut [u8], usize)> {
@@ -223,8 +258,35 @@ impl Frame {
 
     // Appends inspect the previous row; edits inspect both neighboring pairs.
     // This also catches edits to row zero, whose new constants affect every row.
-    pub fn compute_mask(&mut self, index: usize) {
+    // XXX: check_for_new_consts is ONLY used by Row and AnyFrame::write_row, it is questionable whether we want it there.
+    //      undoes lock_editible
+    //      mask is asked to be both source of truth for compaction and actual variability which we might want to differ if we prefer editing to not trigger recompaction.
+    //      FOR NOW avoid passing check_for_new_const=true
+    pub fn update_mask(&mut self, index: usize, check_for_new_const: bool) {
+        assert!(index < self.length, "row index out of bounds");
         let (mask, buffer) = self.buffer.split_at_mut(self.unit);
+        let buffer = &buffer[..self.unit * self.length];
+
+        if check_for_new_const {
+            // update newly constant bits
+            for (i, m) in mask.iter_mut().enumerate() {
+                if *m == 0 {
+                    continue;
+                }
+                let first = buffer[i];
+                let mut varying = 0;
+                for row in buffer.chunks_exact(self.unit).skip(1) {
+                    varying |= first ^ row[i];
+                    // Stop once every previously marked bit has shown variation.
+                    if varying & *m == *m {
+                        break;
+                    }
+                }
+                *m &= varying;
+            }
+        }
+
+        // update newly varying bits
         for next in index.max(1)..=(index + 1).min(self.length.saturating_sub(1)) {
             let offset = self.unit * next;
             for ((m, a), b) in mask
@@ -292,7 +354,7 @@ impl Frame {
     }
 }
 
-/// TODO implement bit compacted frame for even more density at the cost of compute
+/// Byte-wise compaction; see BitCompactFrame for bit-level packing.
 /// TODO implement bit per byte mask because frames may have as many rows as they have bytes
 /// TODO this NEEDS to store the compact unit, but unfortionately that breaks compatibility with Frame.
 ///      should also store the mask as regions. it doesn't need the bitwise... does it?
@@ -362,6 +424,46 @@ impl CompactFrame {
 
     pub fn first(&self) -> &[u8] {
         &self.buffer[self.unit..2 * self.unit]
+    }
+
+    /// Decode into caller-provided storage; Row handles writing edits back on drop.
+    pub fn read_row(&self, index: usize, output: &mut [u8]) {
+        assert!(index < self.length, "row index out of bounds");
+        assert_eq!(output.len(), self.unit, "row size mismatch");
+        output.copy_from_slice(self.first());
+        if index != 0 {
+            let mask = self.mask();
+            let offset = 2 * self.unit + mask.compact_unit() * (index - 1);
+            for (packed, unpacked) in MaskIter::new(mask) {
+                output[unpacked].copy_from_slice(&self.buffer[offset..][packed]);
+            }
+        }
+    }
+
+    /// Update in place, or return NeedsRebuild without changes if a constant byte changes.
+    pub fn try_write_row(&mut self, index: usize, row: &[u8]) -> Result<(), NeedsRebuild> {
+        assert!(index < self.length, "row index out of bounds");
+        assert_eq!(row.len(), self.unit, "row size mismatch");
+        let first = self.first();
+        let constants_changed = self
+            .mask()
+            .iter()
+            .enumerate()
+            .any(|(i, &mask)| mask == 0 && row[i] != first[i]);
+        if constants_changed {
+            return Err(NeedsRebuild);
+        }
+
+        let layout = self.buffer();
+        if index == 0 {
+            layout.first.copy_from_slice(row);
+        } else {
+            let offset = (index - 1) * layout.mask.compact_unit();
+            for (packed, unpacked) in MaskIter::new(layout.mask) {
+                layout.data[offset..][packed].copy_from_slice(&row[unpacked]);
+            }
+        }
+        Ok(())
     }
 
     pub fn buffer(&mut self) -> CompactFrameLayout {
@@ -676,7 +778,7 @@ mod test {
 
     use crate::data::dataframe::{CompactFrame, CompactFrameIter};
 
-    use super::{Frame, StackVec, frame_allocation_layout};
+    use super::{AnyFrame, Frame, NeedsRebuild, Row, RowBuffer, StackVec, frame_allocation_layout};
 
     #[test]
     fn frame_allocations_match_dynamic_box_layouts() {
@@ -791,6 +893,54 @@ mod test {
     }
 
     #[test]
+    fn compact_row_writeback_reuses_storage_until_constants_change() {
+        for index in [0, 1] {
+            let mut expected = [[0xAA, 0x55], [0xAB, 0x55], [0xAA, 0x55]];
+            let mut frame = Frame::new(2, expected.len());
+            for row in &expected {
+                frame.push(row);
+            }
+            let mut compact = CompactFrame::new_from(&frame);
+            for (byte, change, reuse) in [(0, 0x80, true), (1, 2, false)] {
+                if !reuse {
+                    // A rejected in-place write must leave the mask and every row intact.
+                    let mask = compact.mask().to_vec();
+                    let mut edit = expected[index];
+                    edit[byte] ^= change;
+                    assert_eq!(compact.try_write_row(index, &edit), Err(NeedsRebuild));
+                    assert_eq!(&**compact.mask(), mask.as_slice());
+                    for (i, expected) in expected.iter().enumerate() {
+                        let mut decoded = [0; 2];
+                        compact.read_row(i, &mut decoded);
+                        assert_eq!(&decoded, expected);
+                    }
+                }
+                let address = &*compact as *const CompactFrame;
+                let mut row = Row {
+                    init: false,
+                    buffer: RowBuffer::Owned(Box::default()),
+                    index,
+                    frame: AnyFrame::Compact(&mut compact),
+                };
+                assert_eq!(row.get_mut(), &expected[index]);
+                row.get_mut()[byte] ^= change;
+                expected[index][byte] ^= change;
+                assert_eq!(row.get_mut(), &expected[index]);
+                drop(row);
+                if reuse {
+                    // Byte compaction stores the entire varying byte, including bit 7.
+                    assert!(std::ptr::eq(address, &*compact));
+                }
+                for (index, expected) in expected.iter().enumerate() {
+                    let mut decoded = [0; 2];
+                    compact.read_row(index, &mut decoded);
+                    assert_eq!(&decoded, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compact_correct_size() {
         let mut frame = Frame::new(8, 100);
         frame.push("foobar  ".as_bytes());
@@ -822,5 +972,22 @@ mod test {
         assert_eq!(frame.mask().0, [0u8, 0, 0, 2, 0, 0, 0, 0][..]);
         assert_eq!(frame.mask().constant_bytes(), 7);
         assert_eq!(frame.unit, 8);
+    }
+
+    #[test]
+    fn mask_revalidation_removes_constants_before_adding_new_variation() {
+        // Cover baseline edits and variation found only in a later row, with spare
+        // capacity left unwritten so validation must examine committed rows only.
+        for index in [0, 1, 3] {
+            let mut frame = Frame::new(3, 6);
+            for row in 0..4 {
+                frame.push(&[if row == index { 3 } else { 0 }, 0x40, 0x80]);
+            }
+            assert_eq!(&**frame.mask(), &[3, 0, 0]);
+            AnyFrame::Frame(&mut frame).write_row(index, &[1, 0x44, 0x80]);
+            assert_eq!(&**frame.mask(), &[1, 4, 0]);
+            AnyFrame::Frame(&mut frame).write_row(index, &[0, 0x40, 0x80]);
+            assert_eq!(&**frame.mask(), &[0, 0, 0]);
+        }
     }
 }

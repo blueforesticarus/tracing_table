@@ -544,7 +544,7 @@ where
                     data.write_any_value(field, false);
                 }
             }
-            arch.data.compute_mask();
+            arch.data.update_mask_after_append();
             arch.data.compute_timestamp(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
             SpanFieldsRef {
@@ -658,7 +658,7 @@ where
                 data.write_any_value(field, false);
             }
         }
-        arch.data.compute_mask();
+        arch.data.update_mask_after_append();
         arch.data.compute_timestamp(time.value as usize, None);
     }
 
@@ -743,7 +743,7 @@ where
                 data.write_any_value(field, false);
             }
         }
-        arch.data.compute_mask();
+        arch.data.update_mask_after_append();
         arch.data.compute_timestamp(time.value as usize, None);
     }
 }
