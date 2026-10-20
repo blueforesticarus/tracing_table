@@ -8,7 +8,8 @@ use std::{
 
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
-use crate::data::dataframe::{CompactFrame, CompactFrameIter, CompressionStats, Frame, Row};
+use super::CompressionStats;
+use super::dataframe::{CompactFrame, CompactFrameIter, Frame, Row};
 
 /// a quasi ring buffer of dataframes.
 
@@ -36,6 +37,9 @@ pub struct BlockCache {
     // starting index of active frame
     pub count: usize,
 
+    /// BufferCollection ID used by string offsets in the active chunk.
+    pub string_buffer: usize,
+
     // timestamp
     timestamp: Range<usize>,
 
@@ -46,6 +50,8 @@ pub struct BlockCache {
 pub struct Data {
     pub data: Box<CompactFrame>,
     pub index: usize,
+    /// BufferCollection ID shared by every string field in this chunk.
+    pub string_buffer: usize,
     timestamp: Range<usize>,
 }
 
@@ -58,6 +64,7 @@ impl BlockCache {
             ring: Vec::new(),
             timestamp: Range { start: 0, end: 0 },
             count: 1,
+            string_buffer: 0,
             edit_buffer: vec![0; unit],
         }
     }
@@ -89,6 +96,7 @@ impl BlockCache {
                     data: frame,
                     timestamp: self.timestamp.clone(),
                     index: self.count,
+                    string_buffer: self.string_buffer,
                 });
                 self.count += length;
                 self.timestamp = Range { start: 0, end: 0 };

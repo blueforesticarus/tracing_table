@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     fmt,
     io::Write,
-    mem::ManuallyDrop,
     sync::{LazyLock, Mutex},
     time::UNIX_EPOCH,
 };
@@ -12,10 +11,7 @@ use streaming_iterator::StreamingIterator;
 use tracing::Metadata;
 
 use super::RecordingLayer;
-use crate::data::{
-    dyntuple::{Atom, ValueKind},
-    stringcache::AtomIndexed,
-};
+use crate::data::{dyntuple::ValueKind, stringbuffer::ExpandedBuffer};
 
 /// Print everything exposed by an erased debug message the first time a
 /// callsite supplies a value with a particular trait-object vtable.
@@ -93,7 +89,7 @@ pub(super) fn dump_debug_message(
 
 impl RecordingLayer {
     /// Write consecutive MessagePack maps for format, callsite, archetype, and row records.
-    /// Headers and numeric fields are binary; string fields are text (prefixes have two parts).
+    /// Headers and numeric fields are binary; string fields are text resolved through each chunk's buffer.
     pub fn dump_all_data(&self, mut out: impl Write) -> Result<(), Box<dyn std::error::Error>> {
         fn record(
             out: &mut impl Write,
@@ -201,9 +197,23 @@ impl RecordingLayer {
                         Some(*n)
                     })
                     .collect();
+                // Reuse a decompressed buffer across consecutive chunks sharing its ID.
+                let mut strings = None;
+                let mut string_id = None;
                 let mut rows = arch.data.iter();
                 let mut index = 0;
                 while let Some(bytes) = rows.next() {
+                    let block = ends.partition_point(|&end| end <= index);
+                    let id = arch
+                        .data
+                        .ring
+                        .get(block)
+                        .map_or(arch.data.string_buffer, |b| b.string_buffer);
+                    if string_id != Some(id) {
+                        strings = arch.strings.get(id);
+                        string_id = Some(id);
+                    }
+                    let strings = strings.as_deref().expect("chunk string buffer retained");
                     let mut offset = header_len;
                     let fields: Vec<_> = a
                         .field_types
@@ -213,11 +223,11 @@ impl RecordingLayer {
                             Some(kind) => {
                                 let part = &bytes[offset..offset + kind.unit()];
                                 offset += kind.unit();
-                                dump_field(kind, part)
+                                dump_field(kind, part, strings)
                             }
                         })
                         .collect();
-                    let block = ends.partition_point(|&end| end <= index) + 1;
+                    let block = block + 1;
                     record(
                         &mut out,
                         [
@@ -238,27 +248,13 @@ impl RecordingLayer {
     }
 }
 
-// Read packed Atom bits without dropping the row's owner; indexes resolve to text too.
-fn dump_field(kind: &ValueKind, bytes: &[u8]) -> MpValue {
-    fn atom(bytes: &[u8]) -> String {
-        let value = ManuallyDrop::new(unsafe { (bytes.as_ptr() as *const Atom).read_unaligned() });
-        value.to_string()
-    }
-    fn indexed(bytes: &[u8]) -> String {
-        let value = unsafe { (bytes.as_ptr() as *const AtomIndexed).read_unaligned() };
-        value.to_string()
-    }
+// String fields contain plain offsets; no row owns heap-allocated string handles.
+fn dump_field(kind: &ValueKind, bytes: &[u8], strings: &ExpandedBuffer) -> MpValue {
     match kind {
-        ValueKind::Str => atom(bytes).into(),
-        ValueKind::StrIndex => indexed(bytes).into(),
-        ValueKind::PrefixStr => {
-            let n = size_of::<Atom>();
-            (atom(&bytes[..n]) + &atom(&bytes[n..])).into()
-        }
-        ValueKind::PrefixStrIndex => {
-            let n = size_of::<AtomIndexed>();
-            (indexed(&bytes[..n]) + &indexed(&bytes[n..])).into()
-        }
+        ValueKind::BufferOffset => strings
+            .get_offset(u32::from_ne_bytes(bytes.try_into().unwrap()) as usize)
+            .expect("valid string offset")
+            .into(),
         _ => bytes.to_vec().into(),
     }
 }
@@ -279,11 +275,12 @@ mod tests {
             tracing::Dispatch::new(Registry::default().with(LocalRecordingLayer(recorder.clone())));
         tracing::dispatcher::with_default(&dispatch, || {
             let span = tracing::info_span!("dump_span", deferred = tracing::field::Empty);
+            span.record("deferred", "superseded text");
             span.record("deferred", "deferred dynamic text");
             let _entered = span.enter();
             for n in 0..150u64 {
                 let message = format!("dump message {n}");
-                tracing::info!(message = message.as_str(), count = n);
+                tracing::info!(message = message.as_str(), count = n, detail = ?("é", n), empty = "");
             }
         });
         let mut output = Vec::new();
@@ -317,10 +314,13 @@ mod tests {
             .collect();
         assert_eq!(event_rows.len(), 150);
         assert!(event_rows.iter().any(|v| v["block"].as_u64().unwrap() > 1));
-        assert_eq!(
-            event_rows[0]["fields"][0],
-            MpValue::Array(vec!["dump message 0".into(), "".into()])
-        );
+        assert_eq!(event_rows[0]["fields"][0], MpValue::from("dump message 0"));
+        // Multiple scratch ranges, including formatted UTF-8 and empty text, stay distinct.
+        for (n, row) in event_rows.iter().enumerate() {
+            assert_eq!(row["fields"][0], MpValue::from(format!("dump message {n}")));
+            assert_eq!(row["fields"][2], MpValue::from(format!("{:?}", ("é", n))));
+            assert_eq!(row["fields"][3].as_str(), Some(""));
+        }
         assert_eq!(
             event_rows[149]["fields"][1].as_slice().unwrap(),
             149u64.to_ne_bytes()
@@ -345,13 +345,5 @@ mod tests {
                     .iter()
                     .any(|f| f.as_str() == Some("deferred dynamic text"))
         }));
-        // Exercise indexed-string conversion without changing the global recording mode.
-        let mut bytes = [0u8; size_of::<crate::data::stringcache::AtomIndexed>()];
-        let indexed = crate::data::stringcache::AtomIndexed::from("indexed dynamic text");
-        crate::data::dyntuple::BytePacker::new(&mut bytes).write_any(indexed, false);
-        assert_eq!(
-            super::dump_field(&crate::data::dyntuple::ValueKind::StrIndex, &bytes),
-            MpValue::from("indexed dynamic text")
-        );
     }
 }

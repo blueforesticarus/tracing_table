@@ -5,10 +5,9 @@ use std::{
     fs::metadata,
     hash::Hash,
     ops::{Add, Deref, DerefMut},
-    path::Prefix,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, LazyLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, SystemTime},
 };
@@ -25,30 +24,28 @@ use tracing_core::{
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{Layer, registry::LookupSpan};
 
-use crate::data::stringcache::{Index, Stats};
-
 use crate::data::{
+    CompressionStats,
     blockbuffer::BlockCache,
-    dataframe::CompressionStats,
-    dyntuple::{Atom, BytePacker, ValueData, ValueKind},
+    dyntuple::{BytePacker, ValueData, ValueKind},
+    stringbuffer::BufferCollection,
 };
 
 mod dump;
 
-/// Controls indexed string storage for subsequently recorded fields in all layers.
-/// Defaults to Atom storage; toggle with store(value, Ordering::Relaxed).
-pub static USE_INDEXED_ATOM: AtomicBool = AtomicBool::new(false);
+/// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
+#[rustfmt::skip]
+pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
+    AtomicUsize::new(std::env::var("STRING_BUFFER_TARGET_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 15))
+});
 
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
     pub id: u64,
     pub metadata: &'static Metadata<'static>,
 
-    // used for prefix
-    last_message: Option<Atom>,
-
-    // Stored here to avoid heap allocations
-    pub field_value_scratchpad: Vec<Option<ValueData>>,
+    // Reuse each field's string capacity across recordings.
+    field_value_scratchpad: FieldValues,
     last_archetype: Archetype,
 
     call_count: usize,
@@ -73,6 +70,8 @@ impl PerCallsiteData {
                 self.cache.push(
                     PerArchData {
                         data: BlockCache::new(unit, 1, cap),
+                        strings: BufferCollection::default(),
+                        chunk_string_start: 0,
                         // id_counter: 1.into(),
                         archetype: archetype.clone(),
                         id: i as u32,
@@ -89,9 +88,33 @@ impl PerCallsiteData {
 
 pub struct PerArchData {
     pub data: BlockCache,
+    pub strings: BufferCollection,
+    // Uncompressed bytes when the active message chunk began. (used to decide when to replace buffer)
+    chunk_string_start: usize,
     // id_counter: AtomicU64,
     pub archetype: Archetype,
     pub id: u32,
+}
+
+// TODO this and cycle_if_needed ought to be next to each other.
+impl PerArchData {
+    /// Keep message-chunk policy here; BufferCollection only knows how to rotate.
+    fn prepare_chunk(&mut self) {
+        self.data.cycle_if_needed();
+        // Only an empty chunk can change buffers, regardless of who cycled it.
+        if self.data.active.length == 0 {
+            let size = self.strings.active.byte_len();
+            let delta = size - self.chunk_string_start;
+            // Rotate if another equal-growth chunk would approach (or pass) the
+            // target within half a delta. Oversized chunks remain indivisible.
+            let projected = size.saturating_add(delta).saturating_add(delta / 2);
+            if size > 0 && projected >= STRING_BUFFER_TARGET_SIZE.load(Ordering::Relaxed) {
+                self.strings.rotate(false); // Rows address offsets, so omit the frozen index.
+            }
+            self.chunk_string_start = self.strings.active.byte_len();
+            self.data.string_buffer = self.strings.active_index();
+        }
+    }
 }
 
 /// the tracing_log crate adapts the log crates message to tracing events.
@@ -273,8 +296,7 @@ impl RecordingLayer {
                     PerCallsiteData {
                         id,
                         metadata,
-                        last_message: None,
-                        field_value_scratchpad: vec![None; vcount],
+                        field_value_scratchpad: FieldValues::new(vcount),
                         cache: Default::default(),
                         lookup: Default::default(),
                         call_count: 0,
@@ -450,24 +472,20 @@ where
     ) {
         let ctx = ctx.span(span).unwrap();
         let mut ext = ctx.extensions_mut();
-        let v = ext.get_mut::<Vec<Option<ValueData>>>();
+        let v = ext.get_mut::<FieldValues>();
 
         let mut v = match v {
             Some(v) => v,
             None => {
-                let v: Vec<Option<ValueData>> = vec![None; ctx.fields().len()];
+                let v = FieldValues::new(ctx.fields().len());
                 ext.insert(v);
-                ext.get_mut::<Vec<Option<ValueData>>>().unwrap()
+                ext.get_mut::<FieldValues>().unwrap()
             }
         };
-
-        let mut callsite_data = self.register(ctx.metadata());
-        let callsite_data = callsite_data.deref_mut();
 
         let mut visitor = ValueRecorder {
             _metadata: ctx.metadata(),
             data: &mut v,
-            prefix: &mut callsite_data.last_message,
             is_log_compat: false,
         };
 
@@ -485,7 +503,7 @@ where
         let mut ext = ctx.extensions_mut();
         let follow_from = ext.get_mut::<FollowFrom>().map(|value| value.0);
         let id: SpanId = *ext.get_mut().unwrap();
-        let fields: Option<&mut Vec<Option<ValueData>>> = ext.get_mut();
+        let fields: Option<&mut FieldValues> = ext.get_mut();
 
         let mut callsite_data = self.register(ctx.metadata());
         let callsite_data = callsite_data.deref_mut();
@@ -493,10 +511,12 @@ where
 
         let extra_fields = if let Some(fields) = fields {
             callsite_data.last_archetype.field_types.clear();
-            callsite_data
-                .last_archetype
-                .field_types
-                .extend(fields.iter().map(|opt| opt.as_ref().map(|v| v.into())));
+            callsite_data.last_archetype.field_types.extend(
+                fields
+                    .values
+                    .iter()
+                    .map(|opt| opt.as_ref().map(ValueKind::from)),
+            );
             callsite_data.last_archetype.extra_hash = 0;
             callsite_data.last_archetype.follows_from = false;
             callsite_data.last_archetype.is_span_end = true;
@@ -507,14 +527,19 @@ where
             let arch = callsite_data.get_arch();
             let arch = &mut callsite_data.cache[arch];
 
+            arch.prepare_chunk();
             let (data, _index) = arch.data.allocate();
             let mut data = BytePacker::new(data);
             // Fix the packed type here so a reference cannot silently become the row value.
             data.write_any::<SpanId>(id, false); // end data points to start data
             // most won't have end data, so this is good
-            // Transfer each value to the row; the packer keeps its Atom bits alive.
-            for field in fields.iter_mut() {
-                if let Some(field) = field.take() {
+            // Transfer values into the row, interning strings in this chunk's buffer.
+            for (index, field) in fields.values.iter_mut().enumerate() {
+                if let Some(mut field) = field.take() {
+                    if let ValueData::BufferOffset(offset) = &mut field {
+                        // Buffer checks its narrower 20-bit offset limit on insertion.
+                        *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
+                    }
                     data.write_any_value(field, false);
                 }
             }
@@ -569,11 +594,10 @@ where
         let callsite_data = callsite_data.deref_mut();
         callsite_data.call_count += 1;
 
-        callsite_data.field_value_scratchpad.fill(None);
+        callsite_data.field_value_scratchpad.values.fill(None);
         let mut visitor = ValueRecorder {
             _metadata: attrs.metadata(),
             data: &mut callsite_data.field_value_scratchpad,
-            prefix: &mut callsite_data.last_message,
             is_log_compat: false,
         };
 
@@ -585,8 +609,9 @@ where
         callsite_data.last_archetype.field_types.extend(
             callsite_data
                 .field_value_scratchpad
+                .values
                 .iter()
-                .map(|opt| opt.as_ref().map(|v| v.into())),
+                .map(|opt| opt.as_ref().map(ValueKind::from)),
         );
         callsite_data.last_archetype.extra_hash = 0;
         callsite_data.last_archetype.follows_from = true; //only known later
@@ -601,6 +626,7 @@ where
         // Id not used for events
 
         // all that is left is to write to the store.
+        arch.prepare_chunk();
         let (data, index) = arch.data.allocate();
 
         let id = SpanId {
@@ -622,8 +648,12 @@ where
         if arch.archetype.parent {
             data.write_any::<SpanId>(span_id.unwrap(), false);
         }
-        for field in callsite_data.field_value_scratchpad.iter_mut() {
-            if let Some(field) = field.take() {
+        let fields = &mut callsite_data.field_value_scratchpad;
+        for (index, field) in fields.values.iter_mut().enumerate() {
+            if let Some(mut field) = field.take() {
+                if let ValueData::BufferOffset(offset) = &mut field {
+                    *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
+                }
                 data.write_any_value(field, false);
             }
         }
@@ -654,11 +684,10 @@ where
         callsite_data.call_count += 1;
 
         // event id's currently not stored. since nothing refers to them
-        callsite_data.field_value_scratchpad.fill(None);
+        callsite_data.field_value_scratchpad.values.fill(None);
         let mut visitor = ValueRecorder {
             _metadata: metadata,
             data: &mut callsite_data.field_value_scratchpad,
-            prefix: &mut callsite_data.last_message,
             is_log_compat,
         };
 
@@ -670,8 +699,9 @@ where
         callsite_data.last_archetype.field_types.extend(
             callsite_data
                 .field_value_scratchpad
+                .values
                 .iter()
-                .map(|opt| opt.as_ref().map(|v| v.into())),
+                .map(|opt| opt.as_ref().map(ValueKind::from)),
         );
         callsite_data.last_archetype.extra_hash = 0;
         callsite_data.last_archetype.follows_from = false;
@@ -686,6 +716,7 @@ where
         // Id not used for events
 
         // all that is left is to write to the store.
+        arch.prepare_chunk();
         let (data, index) = arch.data.allocate();
 
         let _id = SpanId {
@@ -702,8 +733,12 @@ where
         if arch.archetype.parent {
             data.write_any::<SpanId>(span_id.unwrap(), false);
         }
-        for field in callsite_data.field_value_scratchpad.iter_mut() {
-            if let Some(field) = field.take() {
+        let fields = &mut callsite_data.field_value_scratchpad;
+        for (index, field) in fields.values.iter_mut().enumerate() {
+            if let Some(mut field) = field.take() {
+                if let ValueData::BufferOffset(offset) = &mut field {
+                    *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
+                }
                 data.write_any_value(field, false);
             }
         }
@@ -714,93 +749,60 @@ where
 
 // ----------------  CRUFT ------------------------
 
+// Text belongs to the subscriber until its archetype is known (or a span closes).
+// Strings retain capacity; BufferOffset(0) refers to the start of that field's text
+// and is replaced with its deduplicated chunk offset before packing.
+struct FieldValues {
+    values: Vec<Option<ValueData>>,
+    strings: Vec<String>,
+}
+impl FieldValues {
+    fn new(count: usize) -> Self {
+        Self {
+            values: vec![None; count],
+            strings: vec![String::new(); count],
+        }
+    }
+}
+
 struct ValueRecorder<'a> {
     _metadata: &'a Metadata<'a>,
-
-    // Note this can be a buffer so we aren't allocing on every log.
-    data: &'a mut [Option<ValueData>],
-    prefix: &'a mut Option<Atom>,
-
+    data: &'a mut FieldValues,
     is_log_compat: bool,
 }
 
-impl<'a> Visit for ValueRecorder<'a> {
-    fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
+impl ValueRecorder<'_> {
+    fn record_text(&mut self, field: &tracing_core::Field, value: impl std::fmt::Display) {
+        use std::fmt::Write;
         if self.is_log_compat && field.name() != "message" {
-            // do not store log.target and other metadata, we move that into the archetype with adapter.
-            // also we remove them from the FieldSet, so this would panic since there is no space allocated for them
-            return;
+            return; // tracing_log metadata is fields, but we already extracted it
         }
 
-        if field.name() == "message" {
-            match self.prefix {
-                Some(p) => {
-                    let mut new_prefix_index = None; // in bytes
-                    for (p_char, value_char) in p.char_indices().zip(value.chars()) {
-                        if p_char.1 != value_char {
-                            new_prefix_index = Some(p_char.0);
-                            break;
-                        }
-                    }
+        // we record the text to a temporary buffer, and put a dummy BufferOffset.
+        // after archetype is known, these strings are copied into the archetypes string buffer.
+        let text = &mut self.data.strings[field.index()];
+        text.clear();
+        write!(text, "{value}").expect("writing to String");
+        self.data.values[field.index()] = Some(ValueData::BufferOffset(0));
+    }
+}
 
-                    match new_prefix_index {
-                        Some(0) => {
-                            *p = Atom::from(value);
-                            self.data[field.index()] =
-                                Some(ValueData::PrefixStr(p.clone(), Atom::from("")))
-                        }
-                        Some(n) => {
-                            let (prefix, rem) = value.split_at(n);
-                            *p = Atom::from(prefix);
-                            self.data[field.index()] =
-                                Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
-                        }
-                        None => {
-                            // A shorter message can exhaust the character comparison.
-                            let (prefix, rem) = value.split_at(p.len().min(value.len()));
-                            *p = Atom::from(prefix);
-                            self.data[field.index()] =
-                                Some(ValueData::PrefixStr(p.clone(), Atom::from(rem)))
-                        }
-                    }
-                }
-                None => {
-                    *self.prefix = Some(Atom::from(value));
-                    self.data[field.index()] =
-                        Some(ValueData::PrefixStr(Atom::from(value), Atom::from("")))
-                }
-            }
-        } else {
-            self.data[field.index()] = Some(ValueData::Str(Atom::from(value)));
-        }
-
-        // Convert after prefix splitting so both string modes share that behavior.
-        if USE_INDEXED_ATOM.load(Ordering::Relaxed) {
-            let slot = &mut self.data[field.index()];
-            *slot = slot.take().map(|value| match value {
-                ValueData::Str(atom) => ValueData::StrIndex(atom.into()),
-                ValueData::PrefixStr(prefix, remainder) => {
-                    ValueData::PrefixStrIndex(prefix.into(), remainder.into())
-                }
-                value => value,
-            });
-        }
+impl Visit for ValueRecorder<'_> {
+    fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
+        self.record_text(field, value);
     }
 
     fn record_debug(&mut self, field: &tracing_core::Field, value: &dyn std::fmt::Debug) {
-        // This was test code to investigate extracting format strings directly.
-        // if field.name() == "message" {
-        // dump::dump_debug_message(self._metadata, value, self.is_log_compat);
-        // }
-        self.record_str(field, &format!("{:?}", value));
+        // Format once, directly into reusable text for events and span starts.
+        self.record_text(field, format_args!("{value:?}"));
     }
 
     fn record_f64(&mut self, field: &tracing_core::Field, value: f64) {
-        self.data[field.index()] = Some(ValueData::F64(value));
+        self.data.values[field.index()] = Some(ValueData::F64(value));
     }
 
     fn record_i64(&mut self, field: &tracing_core::Field, value: i64) {
-        self.data[field.index()] = Some(ValueData::I64(value));
+        self.data.values[field.index()] = Some(ValueData::I64(value));
     }
 
     fn record_u64(&mut self, field: &tracing_core::Field, value: u64) {
@@ -808,19 +810,19 @@ impl<'a> Visit for ValueRecorder<'a> {
         if self.is_log_compat {
             return;
         }
-        self.data[field.index()] = Some(ValueData::U64(value));
+        self.data.values[field.index()] = Some(ValueData::U64(value));
     }
 
     fn record_i128(&mut self, field: &tracing_core::Field, value: i128) {
-        self.data[field.index()] = Some(ValueData::I128(value));
+        self.data.values[field.index()] = Some(ValueData::I128(value));
     }
 
     fn record_u128(&mut self, field: &tracing_core::Field, value: u128) {
-        self.data[field.index()] = Some(ValueData::U128(value));
+        self.data.values[field.index()] = Some(ValueData::U128(value));
     }
 
     fn record_bool(&mut self, field: &tracing_core::Field, value: bool) {
-        self.data[field.index()] = Some(ValueData::Bool(value));
+        self.data.values[field.index()] = Some(ValueData::Bool(value));
     }
 
     fn record_bytes(&mut self, field: &tracing_core::Field, value: &[u8]) {
@@ -852,8 +854,7 @@ mod test {
         // Set up the tracing registry with the RecordingLayer
         let recording_layer = LocalRecordingLayer(Arc::new(RecordingLayer::new()));
         let subscriber = Registry::default().with(recording_layer.clone());
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Failed to set global subscriber");
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         // Generate logs in a loop
         for i in 0..1000 {
@@ -873,5 +874,41 @@ mod test {
                 assert_eq!(arch.data.iter().count(), 1000);
             }
         }
+    }
+    #[test]
+    fn only_empty_chunks_can_change_string_buffers() {
+        use super::*;
+        let recorder = Arc::new(RecordingLayer::new());
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(LocalRecordingLayer(recorder.clone())),
+        );
+        let text = "x".repeat(
+            STRING_BUFFER_TARGET_SIZE
+                .load(Ordering::Relaxed)
+                .min(crate::data::stringbuffer::Buffer::MAX_STRING_LENGTH),
+        );
+        tracing::info!(message = text.as_str());
+        let sites = recorder.callsites.read();
+        let mut site = sites.values().next().unwrap().write();
+        let arch = &mut site.cache[0];
+        // Reach the default target with several strings that fit the packed length.
+        for value in ["a", "b", "c"] {
+            arch.strings.active.add_string(&value.repeat(text.len()));
+        }
+
+        // Tiny dummy row chunks exercise populated and already-cycled states.
+        arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
+        arch.data.push(&vec![0; arch.archetype.unit()], 0);
+        arch.prepare_chunk();
+        assert_eq!(arch.data.string_buffer, 0);
+        arch.data.push(&vec![0; arch.archetype.unit()], 0);
+        arch.data.cycle_if_needed();
+        assert_eq!(arch.data.active.length, 0);
+        arch.prepare_chunk();
+        arch.prepare_chunk(); // Repeated preparation must not rotate again.
+        assert_eq!(arch.data.ring[0].string_buffer, 0);
+        assert_eq!(arch.data.string_buffer, 1);
+        let old = arch.strings.get(0).unwrap();
+        assert_eq!(old.get_index(0), Some(text.as_str()));
     }
 }

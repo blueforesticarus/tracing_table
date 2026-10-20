@@ -1,7 +1,5 @@
 use std::{any::TypeId, mem::ManuallyDrop};
 
-use crate::data::stringcache::AtomIndexed;
-
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueKind {
@@ -11,11 +9,7 @@ pub enum ValueKind {
     I128,
     U128,
     Bool,
-    Str,
-    PrefixStr,
-    // Indexed strings use the recording layer’s interner.
-    StrIndex,
-    PrefixStrIndex,
+    BufferOffset,
 }
 
 impl From<ValueData> for ValueKind {
@@ -33,10 +27,7 @@ impl From<&ValueData> for ValueKind {
             ValueData::I128(_) => ValueKind::I128,
             ValueData::U128(_) => ValueKind::U128,
             ValueData::Bool(_) => ValueKind::Bool,
-            ValueData::Str(_) => ValueKind::Str,
-            ValueData::PrefixStr(_, _) => ValueKind::PrefixStr,
-            ValueData::StrIndex(_) => ValueKind::StrIndex,
-            ValueData::PrefixStrIndex(_, _) => ValueKind::PrefixStrIndex,
+            ValueData::BufferOffset(_) => ValueKind::BufferOffset,
         }
     }
 }
@@ -51,17 +42,13 @@ impl ValueKind {
             ValueKind::I128 => size_of::<i128>(),
             ValueKind::U128 => size_of::<u128>(),
             ValueKind::Bool => size_of::<bool>(),
-            ValueKind::Str => size_of::<Atom>(),
-            ValueKind::PrefixStr => size_of::<(Atom, Atom)>(),
-            ValueKind::StrIndex => size_of::<AtomIndexed>(),
-            ValueKind::PrefixStrIndex => size_of::<(AtomIndexed, AtomIndexed)>(),
+            // String offsets occupy four bytes regardless of the platform pointer width.
+            ValueKind::BufferOffset => size_of::<u32>(),
         }
     }
 }
 
-pub type Atom = string_cache::Atom<string_cache::EmptyStaticAtomSet>;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum ValueData {
     F64(f64),
     I64(i64),
@@ -69,10 +56,8 @@ pub enum ValueData {
     I128(i128),
     U128(u128),
     Bool(bool),
-    Str(Atom),
-    PrefixStr(Atom, Atom),
-    StrIndex(AtomIndexed),
-    PrefixStrIndex(AtomIndexed, AtomIndexed),
+    /// A resolved byte offset. The caller supplies the buffer and resolves reads.
+    BufferOffset(u32),
 }
 
 /// Write data into a byte buffer and take it out again
@@ -180,6 +165,7 @@ impl<'a> BytePacker<'a> {
         self.offset += size;
     }
 
+    /// The caller supplies offsets into its own storage.
     pub fn write_any_value(&mut self, data: ValueData, aligned: bool) {
         match data {
             ValueData::F64(v) => self.write_any(v, aligned),
@@ -188,16 +174,7 @@ impl<'a> BytePacker<'a> {
             ValueData::I128(v) => self.write_any(v, aligned),
             ValueData::U128(v) => self.write_any(v, aligned),
             ValueData::Bool(v) => self.write_any(v, aligned),
-            ValueData::Str(atom) => self.write_any(atom, aligned),
-            ValueData::StrIndex(atom) => self.write_any(atom, aligned),
-            ValueData::PrefixStrIndex(atom, atom1) => {
-                self.write_any(atom, aligned);
-                self.write_any(atom1, aligned);
-            }
-            ValueData::PrefixStr(atom, atom1) => {
-                self.write_any(atom, aligned);
-                self.write_any(atom1, aligned);
-            }
+            ValueData::BufferOffset(offset) => self.write_any(offset, aligned),
         }
     }
 
@@ -234,7 +211,8 @@ impl<'a> BytePacker<'a> {
 
         let mut ptr = self.buffer[start..self.offset].as_ptr() as *const ();
         if ptr as usize % align_of::<T>() != 0 {
-            // use scratchpad
+            // Reserve aligned storage before decoding unaligned packed fields.
+            self.scratchpad.resize(size.div_ceil(size_of::<u128>()), 0);
             let scratchpad = self.scratchpad.as_mut_slice();
             let scratchpad = &mut bytemuck::cast_slice_mut::<u128, u8>(scratchpad)[..size];
             scratchpad[..size].copy_from_slice(&self.buffer[start..self.offset]);
@@ -249,6 +227,7 @@ impl<'a> BytePacker<'a> {
         value
     }
 
+    /// String fields return offsets; this layer does not resolve referenced storage.
     pub unsafe fn read_value(&mut self, kind: ValueKind, aligned: bool) -> ValueData {
         unsafe {
             match kind {
@@ -258,19 +237,32 @@ impl<'a> BytePacker<'a> {
                 ValueKind::I128 => ValueData::I128(*self.read_any(aligned)),
                 ValueKind::U128 => ValueData::U128(*self.read_any(aligned)),
                 ValueKind::Bool => ValueData::Bool(*self.read_any(aligned)),
-                ValueKind::StrIndex => {
-                    ValueData::StrIndex(self.read_any::<AtomIndexed>(aligned).clone())
-                }
-                ValueKind::PrefixStrIndex => ValueData::PrefixStrIndex(
-                    self.read_any::<AtomIndexed>(aligned).clone(),
-                    self.read_any::<AtomIndexed>(aligned).clone(),
-                ),
-                ValueKind::Str => ValueData::Str(self.read_any::<Atom>(aligned).clone()),
-                ValueKind::PrefixStr => ValueData::PrefixStr(
-                    self.read_any::<Atom>(aligned).clone(),
-                    self.read_any::<Atom>(aligned).clone(),
-                ),
+                ValueKind::BufferOffset => ValueData::BufferOffset(*self.read_any(aligned)),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_offsets_round_trip_unaligned() {
+        let mut bytes = vec![0; 1 + ValueKind::BufferOffset.unit()];
+        let mut packer = BytePacker::new(&mut bytes);
+        packer.write_any_value(ValueData::Bool(true), false);
+        packer.write_any_value(ValueData::BufferOffset(70_000), false);
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(u32::from_ne_bytes(bytes[1..].try_into().unwrap()), 70_000);
+        // The bool forces the following offset to be unaligned in a packed row.
+        let mut packer = BytePacker::new(&mut bytes);
+        unsafe {
+            packer.skip::<bool>(false);
+            assert!(matches!(
+                packer.read_value(ValueKind::BufferOffset, false),
+                ValueData::BufferOffset(70_000)
+            ));
         }
     }
 }
