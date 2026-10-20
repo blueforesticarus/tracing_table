@@ -4,13 +4,12 @@ use std::{
     collections::{HashMap, HashSet},
     default,
     hash::{DefaultHasher, Hash, Hasher},
-    mem::{self, MaybeUninit},
     ops::{Add, Deref, DerefMut, Range},
     ptr, slice,
     sync::{Arc, Weak},
 };
 
-use bytemuck::{Pod, cast_mut};
+use bytemuck::Pod;
 use smallvec::SmallVec;
 use streaming_iterator::StreamingIterator;
 use tracing::{
@@ -121,9 +120,9 @@ impl<'a> Drop for Row<'a> {
 /// these should be made large enough to compact data.
 /// theoretically work with all non-pin types.
 ///
-/// TODO: aligned Frame
 /// TODO: const generic unit Frame?
-#[repr(C)]
+// Box must use the same alignment as the raw allocation when freeing this DST.
+#[repr(C, align(16))]
 pub struct Frame {
     // NOTE: these could be stored with the pointer.
     // in fact unit could be stored once for the whole block_buffer
@@ -138,15 +137,29 @@ pub struct FrameBufferLayout<'a> {
     data: &'a [u8],
 }
 
+// Both frame types have two usize fields followed by a byte slice. Include the
+// trailing padding in the allocation so Box's dynamically computed drop layout
+// matches exactly; the slice metadata must still exclude that padding.
+fn frame_allocation_layout(buffer_size: usize) -> Layout {
+    let total_size = size_of::<[usize; 2]>()
+        .checked_add(buffer_size)
+        .expect("frame allocation size overflow");
+    Layout::from_size_align(total_size, 16)
+        .expect("frame allocation exceeds layout limits")
+        .pad_to_align()
+}
+
 impl Frame {
     pub fn new(unit: usize, cap: usize) -> Box<Frame> {
-        // Size = buffer + mask + fields
-        let buffer_size = cap * unit + unit;
-        let total_size = buffer_size + 2 * 8;
-
-        // Layout must match the Frame type's alignment
-        // let align = mem::align_of::<Frame>();
-        let layout = Layout::from_size_align(total_size, 16).unwrap();
+        // TODO(soundness): Only the mask is initialized, but the public buffer and
+        // allocate() expose unwritten row bytes through safe APIs. Hide spare bytes
+        // from safe reads and use MaybeUninit for allocation without zeroing capacity.
+        // Reject overflow before it can produce an undersized allocation in release builds.
+        let buffer_size = cap
+            .checked_mul(unit)
+            .and_then(|size| size.checked_add(unit))
+            .expect("frame buffer size overflow");
+        let layout = frame_allocation_layout(buffer_size);
 
         // Allocate raw memory
         let ptr = unsafe { alloc::alloc(layout) };
@@ -180,8 +193,10 @@ impl Frame {
     }
 
     pub fn buffer(&mut self) -> FrameBufferLayout {
-        // TODO check safety in constructor
-        let (mask, data) = unsafe { self.buffer.split_at_mut_unchecked(self.unit) };
+        // TODO: Before restoring unchecked splits, encapsulate unit and ensure every
+        // constructor/mutation preserves unit <= buffer.len(), including on panic.
+        // let (mask, data) = unsafe { self.buffer.split_at_mut_unchecked(self.unit) };
+        let (mask, data) = self.buffer.split_at_mut(self.unit);
         FrameBufferLayout { mask, data }
     }
 
@@ -270,7 +285,8 @@ impl Frame {
         CompressionStats {
             data: self.length * self.unit,
             compressed: self.length * self.unit,
-            overhead: mask.0.len() + 2 * 8,
+            // The DST size includes the usize header and trailing alignment padding.
+            overhead: size_of_val(self) - self.buffer.len() + mask.0.len(),
             overalloc: self.buffer.len() - mask.0.len() - (self.length * self.unit),
         }
     }
@@ -280,7 +296,8 @@ impl Frame {
 /// TODO implement bit per byte mask because frames may have as many rows as they have bytes
 /// TODO this NEEDS to store the compact unit, but unfortionately that breaks compatibility with Frame.
 ///      should also store the mask as regions. it doesn't need the bitwise... does it?
-#[repr(C)]
+// Keep this representation in sync with Frame and frame_allocation_layout.
+#[repr(C, align(16))]
 pub struct CompactFrame {
     pub unit: usize,
     pub length: usize,
@@ -296,13 +313,18 @@ pub struct CompactFrameLayout<'a> {
 
 impl CompactFrame {
     pub fn new_uninitialized(unit: usize, length: usize, const_bytes: usize) -> Box<CompactFrame> {
-        // Size = buffer + mask + fields
-        let buffer_size = length * (unit - const_bytes) + unit * 2;
-        let total_size = buffer_size + 2 * 8;
-
-        // Layout must match the Frame type's alignment
-        // let align = mem::align_of::<Frame>();
-        let layout = Layout::from_size_align(total_size, 16).unwrap();
+        // Validate subtraction as well as multiplication/addition before allocating.
+        let compact_unit = unit
+            .checked_sub(const_bytes)
+            .expect("constant byte count exceeds frame unit");
+        let header_size = unit
+            .checked_mul(2)
+            .expect("compact frame header size overflow");
+        let buffer_size = length
+            .checked_mul(compact_unit)
+            .and_then(|size| size.checked_add(header_size))
+            .expect("compact frame buffer size overflow");
+        let layout = frame_allocation_layout(buffer_size);
 
         // Allocate raw memory
         let ptr = unsafe { alloc::alloc(layout) };
@@ -315,8 +337,9 @@ impl CompactFrame {
             Box::from_raw(frame_ptr)
         };
 
-        // TODO return uninit instead?
-        // this can't meaningfully init the data without the mask.
+        // TODO(soundness): This safe constructor returns uninitialized unit/length
+        // fields and buffer bytes. Initialize headers before forming the typed Box
+        // and prevent safe reads of payload bytes until they have been written.
         v
     }
 
@@ -342,8 +365,12 @@ impl CompactFrame {
     }
 
     pub fn buffer(&mut self) -> CompactFrameLayout {
-        let (header, data) = unsafe { self.buffer.split_at_mut_unchecked(self.unit * 2) };
-        let (mask, first) = unsafe { header.split_at_mut_unchecked(self.unit) };
+        // TODO: Before restoring unchecked splits, encapsulate unit and ensure every
+        // constructor/mutation preserves unit <= buffer.len() / 2, including on panic.
+        // let (header, data) = unsafe { self.buffer.split_at_mut_unchecked(self.unit * 2) };
+        // let (mask, first) = unsafe { header.split_at_mut_unchecked(self.unit) };
+        let (header, data) = self.buffer.split_at_mut(self.unit * 2);
+        let (mask, first) = header.split_at_mut(self.unit);
         CompactFrameLayout {
             mask: Mask::get_mut(mask),
             first,
@@ -382,7 +409,8 @@ impl CompactFrame {
         let compressed = (self.length - 1) * (self.unit - mask.constant_bytes()) + self.unit;
         CompressionStats {
             data: self.length * self.unit,
-            overhead: mask.0.len() + 2 * 8,
+            // Count header and alignment padding as overhead, separate from spare bytes.
+            overhead: size_of_val(self) - self.buffer.len() + mask.0.len(),
             compressed,
             overalloc: self.buffer.len() - mask.0.len() - compressed,
         }
@@ -478,8 +506,7 @@ impl DerefMut for Mask {
 
 pub struct CompactFrameIter<'a> {
     frame: &'a CompactFrame,
-    // stores the temp row on the stack unless it's big
-    // up to 128 bytes, and aligned to u128
+    // Inline capacity is 128 bytes; both storage paths align the row to u128.
     buffer: StackVec<128, u128>,
     index: usize,
     compact_unit: usize,
@@ -491,7 +518,7 @@ impl<'a> CompactFrameIter<'a> {
         let compact_unit = frame.unit - frame.mask().constant_bytes();
         Self {
             frame,
-            buffer: StackVec::new(&frame.buffer[frame.unit..2 * frame.unit], None),
+            buffer: StackVec::new(&frame.buffer[frame.unit..2 * frame.unit]),
             index: 0,
             compact_unit,
             capacity: frame.unit * 2 + (frame.length - 1) * compact_unit,
@@ -525,50 +552,66 @@ impl<'a> StreamingIterator for CompactFrameIter<'a> {
     }
 }
 
-/// utility to store an buffer up to len S on the stack,
-/// falls back to the heap, if size or alignment requirements are exceeded
-/// different than smallvec crate because this isn't variable size: no .push()
-enum StackVec<const S: usize, A = usize> {
-    Inline([u8; S], usize, [A; 0]),
-    Heap(Box<[u8]>),
+/// Keep the byte array at offset zero in a value aligned for A. Raising the
+/// outer enum's alignment alone would not guarantee its byte field's offset.
+#[repr(C)]
+struct InlineBytes<const S: usize, A> {
+    // A zero-length array contributes A's alignment without storing any A values.
+    _alignment: [A; 0],
+    bytes: [u8; S],
 }
 
-impl<const S: usize, A> StackVec<S, A> {
-    fn new(data: &[u8], alignment: Option<usize>) -> Self {
-        let size = data.len();
-        let alignment = alignment.unwrap_or(mem::align_of::<A>());
-        let v = if size <= S && alignment <= align_of::<A>() {
-            let mut array: [u8; S] = unsafe { MaybeUninit::uninit().assume_init() };
-            array[..size].copy_from_slice(data);
-            Self::Inline(array, size, [])
-        } else {
-            let mut array = aligned_boxed_slice(size, alignment);
-            array.copy_from_slice(data);
-            Self::Heap(array)
-        };
+/// Store up to S bytes on stack, with fallback to heap. Unlike SmallVec the length is immutable.
+/// Use A for alignment.
+/// InlineBytes establishes inline alignment; Vec<A> establishes heap alignment.
+enum StackVec<const S: usize, A = usize> {
+    Inline(InlineBytes<S, A>, usize),
+    Heap(Vec<A>, usize),
+}
 
-        assert_eq!(align_of::<Self>(), align_of::<A>());
-        assert!(is_aligned_to(v.deref(), alignment));
+impl<const S: usize, A: Pod> StackVec<S, A> {
+    fn new(data: &[u8]) -> Self {
+        assert!(
+            size_of::<A>() > 0,
+            "alignment storage type must have nonzero size"
+        );
+        let size = data.len();
+        let mut v = if size <= S {
+            // Initialize the entire array, including its unused suffix; constructing
+            // an uninitialized [u8; S] would be undefined behavior.
+            Self::Inline(
+                InlineBytes {
+                    _alignment: [],
+                    bytes: [0u8; S],
+                },
+                size,
+            )
+        } else {
+            // Allocate whole A elements; slice views hide the unused tail bytes.
+            // Keeping Vec<A> as the owner also preserves the deallocation alignment.
+            Self::Heap(vec![A::zeroed(); size.div_ceil(size_of::<A>())], size)
+        };
+        v.copy_from_slice(data);
         v
     }
 }
 
-impl<const S: usize, A> Deref for StackVec<S, A> {
+impl<const S: usize, A: Pod> Deref for StackVec<S, A> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         match self {
-            StackVec::Inline(data, size, _) => &data[..*size],
-            StackVec::Heap(data) => &data[..],
+            StackVec::Inline(data, size) => &data.bytes[..*size],
+            StackVec::Heap(data, size) => &bytemuck::cast_slice::<A, u8>(data)[..*size],
         }
     }
 }
 
-impl<const S: usize, A> DerefMut for StackVec<S, A> {
+impl<const S: usize, A: Pod> DerefMut for StackVec<S, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            StackVec::Inline(data, size, _) => &mut data[..*size],
-            StackVec::Heap(data) => &mut data[..],
+            StackVec::Inline(data, size) => &mut data.bytes[..*size],
+            StackVec::Heap(data, size) => &mut bytemuck::cast_slice_mut::<A, u8>(data)[..*size],
         }
     }
 }
@@ -577,29 +620,6 @@ impl<const S: usize, A> DerefMut for StackVec<S, A> {
 pub fn is_aligned_to<T: ?Sized>(reference: &T, alignment: usize) -> bool {
     let ptr = reference as *const T as *const () as usize;
     ptr % alignment == 0
-}
-
-/// does not zero memory.
-pub fn aligned_boxed_slice(size: usize, align: usize) -> Box<[u8]> {
-    assert!(align.is_power_of_two(), "Alignment must be a power of two");
-    assert!(align >= mem::align_of::<u8>(), "Alignment too small");
-
-    let layout = Layout::from_size_align(size, 16).unwrap();
-
-    // Allocate raw memory
-    let ptr = unsafe { alloc::alloc(layout) };
-    assert!(!ptr.is_null());
-
-    // Cast the pointer
-    let v = unsafe {
-        let frame_ptr = ptr as *mut u8;
-        let frame_ptr: *mut [u8] = std::ptr::from_raw_parts_mut(frame_ptr, size);
-        Box::from_raw(frame_ptr)
-    };
-
-    assert!(is_aligned_to(&v.deref(), align));
-
-    v
 }
 
 // TODO implement StreamingIteratorMut
@@ -650,11 +670,106 @@ pub fn aligned_boxed_slice(size: usize, align: usize) -> Box<[u8]> {
 
 #[cfg(test)]
 mod test {
+    use std::{alloc::Layout, panic::catch_unwind};
+
     use streaming_iterator::StreamingIterator;
 
     use crate::data::dataframe::{CompactFrame, CompactFrameIter};
 
-    use super::Frame;
+    use super::{Frame, StackVec, frame_allocation_layout};
+
+    #[test]
+    fn frame_allocations_match_dynamic_box_layouts() {
+        // Vary sizes across padding boundaries and compare the allocation helper
+        // with Rust's independently computed DST layouts, including on 32-bit targets.
+        for unit in 1..=33 {
+            let mut frame = Frame::new(unit, 2);
+            frame.push(&vec![0; unit]);
+            frame.push(&vec![1; unit]);
+            let compact = CompactFrame::new_from(&frame);
+
+            let frame_layout = Layout::for_value(&*frame);
+            assert_eq!(frame_layout.align(), 16);
+            assert_eq!(frame_allocation_layout(frame.buffer.len()), frame_layout);
+            assert_eq!(frame.buffer.len(), 3 * unit);
+
+            // Statistics must cover the entire allocation, including padding, while
+            // overalloc counts only unused buffer capacity in both representations.
+            let frame_stats = frame.compression_ratio();
+            assert_eq!(
+                frame_stats.compressed + frame_stats.overhead + frame_stats.overalloc,
+                frame_layout.size()
+            );
+            assert_eq!(frame_stats.overalloc, 0);
+
+            let compact_layout = Layout::for_value(&*compact);
+            assert_eq!(compact_layout.align(), 16);
+            assert_eq!(
+                frame_allocation_layout(compact.buffer.len()),
+                compact_layout
+            );
+            assert_eq!(compact.buffer.len(), 4 * unit);
+            let compact_stats = compact.compression_ratio();
+            assert_eq!(
+                compact_stats.compressed + compact_stats.overhead + compact_stats.overalloc,
+                compact_layout.size()
+            );
+            assert_eq!(compact_stats.overalloc, unit);
+        }
+    }
+
+    #[test]
+    fn frame_allocations_reject_invalid_sizes() {
+        // These inputs must fail before allocation even when overflow checks are disabled.
+        assert!(catch_unwind(|| Frame::new(usize::MAX, 2)).is_err());
+        assert!(catch_unwind(|| Frame::new(usize::MAX, 1)).is_err());
+        assert!(catch_unwind(|| frame_allocation_layout(usize::MAX)).is_err());
+        assert!(catch_unwind(|| frame_allocation_layout(isize::MAX as usize)).is_err());
+        for (unit, length, const_bytes) in [
+            (1, 1, 2),
+            (usize::MAX, 0, usize::MAX),
+            (2, usize::MAX, 0),
+            (1, usize::MAX, 0),
+        ] {
+            assert!(
+                catch_unwind(|| CompactFrame::new_uninitialized(unit, length, const_bytes))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stack_vec_alignment_survives_storage_changes_and_moves() {
+        // Exercise an alignment greater than any built-in row primitive's.
+        #[repr(C, align(64))]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Alignment64([u8; 64]);
+
+        fn check<A: bytemuck::Pod>() {
+            // Include empty, full inline, and heap rows with partial final A elements.
+            for size in [0, 1, 127, 128, 129, 257] {
+                let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                let value = StackVec::<128, A>::new(&data);
+                assert_eq!(&*value, data.as_slice());
+                assert_eq!(value.as_ptr() as usize % align_of::<A>(), 0);
+
+                // Moving inline storage changes its address; its alignment must hold
+                // at the destination too. Heap storage must retain the same guarantee.
+                let mut moved = Box::new(value);
+                let bytes: &mut [u8] = &mut moved;
+                assert_eq!(bytes.as_ptr() as usize % align_of::<A>(), 0);
+                assert_eq!(bytes, data.as_slice());
+                bytes.fill(42);
+                assert!(bytes.iter().all(|byte| *byte == 42));
+            }
+        }
+
+        check::<u8>();
+        check::<usize>();
+        check::<u128>();
+        check::<Alignment64>();
+    }
+
     #[test]
     fn data_compact_and_restore() {
         let mut frame = Frame::new(8, 100);

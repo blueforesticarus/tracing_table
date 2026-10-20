@@ -50,6 +50,25 @@ fn table_hash(hash: u16) -> u64 {
     u64::from(hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+// NOTE: template storage
+// 1. we would like to support template storage in this file. as an option (opposed to archetyping on template+args)
+//    this gives nice flexibility since readers will just see a string, and not care that it is stored as template + args
+// 2. there is no point in doing this if the template is stored in the buffer. since LZ4 compression will do a good-enough job compressing in that case.
+//    however if the template is a static string we can avoid storing it here at all. meaning we don't have to store it per block
+//
+// Design:
+//  - the buffer should store the template by setting the MSB of the length to 1 to flag a template, the next 3 bytes are flags and then 4bits identify the number of args.
+//  - the first flag indicates whether the template is stored as a usize pointer to a static string, or a provided u16 index in an external template buffer
+//  - the second flag indicates whether the values are offsets (u32) or indices (u16)
+//  - the third flag is unused
+//  - this make that first byte sufficient to identify the length of the descriptor.
+//  - the index stores the offset of the first byte same as a non-template string. This means that index addressed references could survive reprocessing the whole block for templates.
+//  - template strings are dedupped same as regular strings. hash the bytes making up the descriptor described above.. hash the bytes making up the descriptor described above.
+//
+//  FUTURE WORK:
+//  - store template descriptors together in index and buffer to improve compaction of references in message chunk.
+//    could use negative offset/indices for templates.
+
 /// An append-only cache with stable insertion indexes and byte offsets.
 /// Strings are at most 16,383 UTF-8 bytes; buffers hold at most 16,384 strings.
 /// Entry offsets fit 20 bits. Limits are checked before appending.

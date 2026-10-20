@@ -385,8 +385,9 @@ impl Archetype {
     }
 }
 
-#[repr(align(8))]
-#[derive(Debug, Clone, Copy)]
+// Fix field order and verify that raw header writes cannot include padding.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, bytemuck::NoUninit)]
 pub struct SpanId {
     // starts at 1
     pub index: u64,
@@ -401,7 +402,7 @@ pub struct SpanId {
 /// Location of deferred span fields in the same callsite. Blocks are one-based;
 /// block zero means no update row. Completed block positions never move.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bytemuck::NoUninit)]
 pub struct SpanFieldsRef {
     pub archetype: u32,
     pub block: u32,
@@ -530,8 +531,8 @@ where
             arch.prepare_chunk();
             let (data, _index) = arch.data.allocate();
             let mut data = BytePacker::new(data);
-            // Fix the packed type here so a reference cannot silently become the row value.
-            data.write_any::<SpanId>(id, false); // end data points to start data
+            // Write the header by value through its verified NoUninit implementation.
+            data.write_any_value(id, false); // end data points to start data
             // most won't have end data, so this is good
             // Transfer values into the row, interning strings in this chunk's buffer.
             for (index, field) in fields.values.iter_mut().enumerate() {
@@ -561,10 +562,10 @@ where
                 let row = row.get_mut();
                 let mut packer = BytePacker::new(row);
                 packer.skip::<PackedTimestamp>(false);
-                packer.write_any::<PackedTimestamp>(time.value, false); // end timestamp;
-                packer.write_any::<SpanFieldsRef>(extra_fields, false);
+                packer.write_any_value(time.value, false); // end timestamp;
+                packer.write_any_value(extra_fields, false);
                 if let Some(f) = follow_from {
-                    packer.write_any::<SpanId>(f, false)
+                    packer.write_any_value(f, false)
                 }
             }
             data.compute_timestamp(time.value as usize, Some(id.index as usize));
@@ -641,12 +642,12 @@ where
         // probably should change this in the future.
         // NOTE: with compaction, probably could use serialization.
         let mut data = BytePacker::new(data);
-        data.write_any::<PackedTimestamp>(time.value, false);
-        data.write_any::<PackedTimestamp>(PackedTimestamp::default(), false); // space for end_timestamp
-        data.write_any::<SpanFieldsRef>(SpanFieldsRef::default(), false); // deferred fields are unknown until close
-        data.write_any::<SpanId>(PLACE_HOLDER, false); // space for follows_from
+        data.write_any_value(time.value, false);
+        data.write_any_value(PackedTimestamp::default(), false); // space for end_timestamp
+        data.write_any_value(SpanFieldsRef::default(), false); // deferred fields are unknown until close
+        data.write_any_value(PLACE_HOLDER, false); // space for follows_from
         if arch.archetype.parent {
-            data.write_any::<SpanId>(span_id.unwrap(), false);
+            data.write_any_value(span_id.unwrap(), false);
         }
         let fields = &mut callsite_data.field_value_scratchpad;
         for (index, field) in fields.values.iter_mut().enumerate() {
@@ -729,9 +730,9 @@ where
         // probably should change this in the future.
         // NOTE: with compaction, probably could use serialization.
         let mut data = BytePacker::new(data);
-        data.write_any::<PackedTimestamp>(time.value, false);
+        data.write_any_value(time.value, false);
         if arch.archetype.parent {
-            data.write_any::<SpanId>(span_id.unwrap(), false);
+            data.write_any_value(span_id.unwrap(), false);
         }
         let fields = &mut callsite_data.field_value_scratchpad;
         for (index, field) in fields.values.iter_mut().enumerate() {
