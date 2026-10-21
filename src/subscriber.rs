@@ -32,7 +32,7 @@ use crate::data::{
 };
 
 mod dump;
-// Optional embedded templates are loaded only when first queried.
+// Templates resolve once per callsite, with a source fallback during development.
 pub mod template;
 
 /// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
@@ -45,6 +45,8 @@ pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
 pub struct PerCallsiteData {
     pub id: u64,
     pub metadata: &'static Metadata<'static>,
+    /// Resolve once on registration; retain None so failed lookups don't repeat.
+    pub template: Option<template::CompiledTemplate>,
 
     // Reuse each field's string capacity across recordings.
     field_value_scratchpad: FieldValues,
@@ -56,9 +58,6 @@ pub struct PerCallsiteData {
     // Hopefully will be only one field
     pub cache: Vec<PerArchData>,
     lookup: HashMap<Archetype, usize>,
-    // added to executable symbols by post compile tool, or checked against filesystem in development
-    // compile_template:
-    // local_template:
 }
 
 impl PerCallsiteData {
@@ -314,11 +313,29 @@ impl RecordingLayer {
             .write()
             .entry(key)
             .or_insert_with(|| {
+                let template =
+                    // only event macros support format strings, which are stored as message field
+                    if metadata.is_event() && metadata.fields().field("message").is_some() {
+                        // Important this only runs once per callsite
+                        template::lookup(
+                            metadata.file().unwrap_or("<unknown>"),
+                            metadata.line().unwrap_or(0),
+                            // log_callsite_adapter assigns this name to log origins.
+                            metadata.name() == "compat:log",
+                            metadata.module_path(),
+                        )
+                    } else {
+                        None
+                    };
+
+                let acount = template.as_ref().map_or(0, |t| t.field_names.len());
+                let fields = FieldValues::new(vcount, acount);
                 Arc::new(
                     PerCallsiteData {
                         id,
                         metadata,
-                        field_value_scratchpad: FieldValues::new(vcount),
+                        template,
+                        field_value_scratchpad: fields,
                         cache: Default::default(),
                         lookup: Default::default(),
                         call_count: 0,
@@ -328,6 +345,7 @@ impl RecordingLayer {
                             parent: false,
                             follows_from: false,
                             field_types: vec![None; vcount],
+                            template: None,
                             extra_hash: 0,
                             is_span_end: false,
                             is_event: false,
@@ -367,6 +385,8 @@ impl RecordingLayer {
 
     /// After a frame allocation, enforce the allocating callsite's cap first,
     /// then the global cap. Active chunks and active string buffers are protected.
+    /// CODEX GENERATED
+    /// TODO cleanup
     fn drop_old_chunks(&self, callsite: u64) {
         // Copy handles, not lock guards. Each scan holds just one callsite read lock;
         // deletion takes only the selected callsite's write lock.
@@ -468,11 +488,14 @@ pub struct Archetype {
     pub is_span_end: bool,
     pub is_event: bool,
     pub field_types: Vec<Option<ValueKind>>,
+
+    /// Matched template argument count; Some(0) represents a matched literal message.
+    pub template: Option<usize>,
     extra_hash: usize,
 }
 
 impl Archetype {
-    /// bytes needed to store this archetype, argueably should be derived elsewhere
+    /// Full packed row width: header, metadata fields, then template argument offsets.
     pub fn unit(&self) -> usize {
         let mut bytes = 0;
         if !self.is_span_end {
@@ -495,7 +518,7 @@ impl Archetype {
                 bytes += k.unit()
             }
         }
-        bytes
+        bytes + self.template.unwrap_or(0) * size_of::<u32>()
     }
 }
 
@@ -592,7 +615,7 @@ where
         let mut v = match v {
             Some(v) => v,
             None => {
-                let v = FieldValues::new(ctx.fields().len());
+                let v = FieldValues::new(ctx.fields().len(), 0);
                 ext.insert(v);
                 ext.get_mut::<FieldValues>().unwrap()
             }
@@ -602,9 +625,11 @@ where
             _metadata: ctx.metadata(),
             data: &mut v,
             is_log_compat: false,
+            template: None, /* spans don't have template strings */
+            template_arg_count: None,
         };
 
-        // records fields directly into PerCallsiteData temp buffer.
+        // records fields into tracing context extensions
         values.record(&mut visitor as &mut dyn Visit);
     }
 
@@ -618,7 +643,7 @@ where
         let mut ext = ctx.extensions_mut();
         let follow_from = ext.get_mut::<FollowFrom>().map(|value| value.0);
         let id: SpanId = *ext.get_mut().unwrap();
-        let fields: Option<&mut FieldValues> = ext.get_mut();
+        let fields: Option<&mut FieldValues> = ext.get_mut(); // recorded by on_record
 
         let mut callsite_guard = self.register(ctx.metadata());
         let callsite_data = callsite_guard.deref_mut();
@@ -725,6 +750,8 @@ where
             _metadata: attrs.metadata(),
             data: &mut callsite_data.field_value_scratchpad,
             is_log_compat: false,
+            template: None,
+            template_arg_count: None,
         };
 
         // records fields directly into PerCallsiteData temp buffer.
@@ -819,10 +846,13 @@ where
             _metadata: metadata,
             data: &mut callsite_data.field_value_scratchpad,
             is_log_compat,
+            template: callsite_data.template.as_ref(),
+            template_arg_count: None,
         };
 
         // records fields directly into PerCallsiteData buffer.
         event.record(&mut visitor as &mut dyn Visit);
+        callsite_data.last_archetype.template = visitor.template_arg_count;
 
         // we use callsite data's copy so we can avoid allocating a vec
         callsite_data.last_archetype.field_types.clear();
@@ -872,6 +902,14 @@ where
                 data.write_any_value(field, false);
             }
         }
+        // store template args, if message was parsed
+        if let Some(arg_count) = arch.archetype.template {
+            // Pack exactly the argument tail described by the archetype's row width.
+            for argument in &fields.template_args[..arg_count] {
+                let offset = arch.strings.active.add_string(argument).1 as u32;
+                data.write_any_value(ValueData::BufferOffset(offset), false);
+            }
+        }
         arch.data.update_mask_after_append();
         arch.data.compute_timestamp(time.value as usize, None);
         drop(callsite_guard);
@@ -889,12 +927,16 @@ where
 struct FieldValues {
     values: Vec<Option<ValueData>>,
     strings: Vec<String>,
+    // Rendered captures are packed only when the selected archetype uses a template.
+    template_args: Vec<String>,
 }
 impl FieldValues {
-    fn new(count: usize) -> Self {
+    // Size both kinds of reusable scratch storage when the callsite is registered.
+    fn new(vcount: usize, arg_count: usize) -> Self {
         Self {
-            values: vec![None; count],
-            strings: vec![String::new(); count],
+            values: vec![None; vcount],
+            strings: vec![String::new(); vcount],
+            template_args: vec![String::new(); arg_count],
         }
     }
 }
@@ -903,6 +945,9 @@ struct ValueRecorder<'a> {
     _metadata: &'a Metadata<'a>,
     data: &'a mut FieldValues,
     is_log_compat: bool,
+    template: Option<&'a template::CompiledTemplate>,
+    // Preserve a successful zero-argument match without storing the message field index.
+    template_arg_count: Option<usize>,
 }
 
 impl ValueRecorder<'_> {
@@ -912,11 +957,22 @@ impl ValueRecorder<'_> {
             return; // tracing_log metadata is fields, but we already extracted it
         }
 
-        // we record the text to a temporary buffer, and put a dummy BufferOffset.
-        // after archetype is known, these strings are copied into the archetypes string buffer.
+        // Format once into reusable scratch, retaining captures or a raw string offset.
         let text = &mut self.data.strings[field.index()];
         text.clear();
         write!(text, "{value}").expect("writing to String");
+        if field.name() == "message"
+            && let Some(template) = self.template
+            && let Some(captures) = template.captures(text)
+        {
+            for (capture, argument) in captures.into_iter().zip(&mut self.data.template_args) {
+                argument.clear();
+                argument.push_str(capture);
+            }
+            self.data.values[field.index()] = None;
+            self.template_arg_count = Some(template.field_names.len());
+            return;
+        }
         self.data.values[field.index()] = Some(ValueData::BufferOffset(0));
     }
 }
@@ -982,6 +1038,117 @@ mod test {
     use tracing_subscriber::{Registry, layer::SubscriberExt};
 
     use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
+
+    #[test]
+    fn matched_messages_store_only_buffer_offset_args() {
+        fn emit(count: u64, message: &str) {
+            tracing::info!(count, message, tail = "tail");
+        }
+        for format in ["hello {name} {}!", "fixed"] {
+            let recorder = Arc::new(RecordingLayer::new());
+            let dispatch = tracing::Dispatch::new(
+                Registry::default().with(LocalRecordingLayer(recorder.clone())),
+            );
+            tracing::dispatcher::with_default(&dispatch, || emit(u64::MAX, "warmup"));
+            let site = recorder.callsites.read().values().next().unwrap().clone();
+            // A dynamic-message callsite lets this test alternate matches and raw rows.
+            {
+                let mut site = site.write();
+                let template = super::template::CompiledTemplate::compile(format).unwrap();
+                site.field_value_scratchpad =
+                    super::FieldValues::new(3, template.field_names.len());
+                site.template = Some(template);
+            }
+            tracing::dispatcher::with_default(&dispatch, || {
+                for n in 0..600u64 {
+                    let message = if n % 2 != 0 {
+                        format!("raw {n}")
+                    } else if format == "fixed" {
+                        "fixed".to_owned()
+                    } else if n == 0 {
+                        "hello  !".to_owned() // Empty captures are still stored strings.
+                    } else {
+                        format!("hello é {n}!")
+                    };
+                    emit(n, &message);
+                }
+            });
+            let (matched, arg_count) = {
+                let site = site.read();
+                assert_eq!(site.cache.len(), 2);
+                let arg_count = site.template.as_ref().unwrap().field_names.len();
+                let matched = site
+                    .cache
+                    .iter()
+                    .find(|a| a.archetype.template == Some(arg_count))
+                    .unwrap();
+                assert_eq!(site.field_value_scratchpad.values.len(), 3);
+                assert_eq!(site.field_value_scratchpad.strings.len(), 3);
+                assert_eq!(site.field_value_scratchpad.template_args.len(), arg_count);
+                let types = &matched.archetype.field_types;
+                assert_eq!(types.len(), 3);
+                assert_eq!(types[1], None); // No original message bytes or string offset.
+                assert_eq!(
+                    matched.archetype.unit(),
+                    size_of::<super::PackedTimestamp>() + 8 + 4 + arg_count * size_of::<u32>()
+                );
+                assert_eq!(matched.data.active.unit, matched.archetype.unit());
+                assert!(!matched.data.ring.is_empty()); // Exercise compressed chunks too.
+                (matched.id, arg_count)
+            };
+            // Dump resolves the actual packed offsets, so verify storage through that reader.
+            let mut output = Vec::new();
+            recorder.dump_all_data(&mut output).unwrap();
+            let mut cursor = std::io::Cursor::new(output);
+            let (mut matched_rows, mut raw_rows) = (0, 0);
+            while cursor.position() < cursor.get_ref().len() as u64 {
+                let row = rmpv::decode::read_value(&mut cursor).unwrap();
+                // Export the count too, including zero for matched literal templates.
+                if row["type"].as_str() == Some("archetype") {
+                    if row["id"].as_u64() == Some(matched as u64) {
+                        assert_eq!(row["template"].as_u64(), Some(arg_count as u64));
+                    } else {
+                        assert!(row["template"].is_nil());
+                    }
+                }
+                if row["type"].as_str() != Some("row") {
+                    continue;
+                }
+                assert_eq!(
+                    row["header"].as_slice().unwrap().len(),
+                    size_of::<super::PackedTimestamp>()
+                );
+                let fields = row["fields"].as_array().unwrap();
+                let args = row["template_args"].as_array().unwrap();
+                assert_eq!(fields.len(), 3);
+                let n = u64::from_ne_bytes(fields[0].as_slice().unwrap().try_into().unwrap());
+                assert_eq!(fields[2].as_str(), Some("tail"));
+                if row["archetype"].as_u64() == Some(matched as u64) {
+                    matched_rows += 1;
+                    assert_eq!(n % 2, 0);
+                    assert!(fields[1].is_nil());
+                    assert_eq!(args.len(), arg_count);
+                    if arg_count > 0 {
+                        assert_eq!(args[0].as_str(), Some(if n == 0 { "" } else { "é" }));
+                        assert_eq!(
+                            args[1].as_str().unwrap(),
+                            if n == 0 { String::new() } else { n.to_string() }
+                        );
+                    }
+                } else {
+                    raw_rows += 1;
+                    assert!(args.is_empty()); // No stale captures after a mismatch.
+                    let expected = if n == u64::MAX {
+                        "warmup".to_owned()
+                    } else {
+                        format!("raw {n}")
+                    };
+                    assert_eq!(fields[1].as_str(), Some(expected.as_str()));
+                }
+            }
+            assert_eq!((matched_rows, raw_rows), (300, 301));
+        }
+    }
 
     #[test]
     fn chunk_eviction_respects_caps_and_buffer_ownership() {

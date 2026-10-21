@@ -157,6 +157,7 @@ impl RecordingLayer {
             )?;
             for arch in &callsite.cache {
                 let a = &arch.archetype;
+                let arg_count = a.template.unwrap_or(0);
                 record(
                     &mut out,
                     [
@@ -167,6 +168,7 @@ impl RecordingLayer {
                         ("span_update", a.is_span_end.into()),
                         ("parent", a.parent.into()),
                         ("follows_from", a.follows_from.into()),
+                        ("template", a.template.map(MpValue::from).unwrap_or(MpValue::Nil)),
                         (
                             "fields",
                             MpValue::Array(
@@ -182,7 +184,9 @@ impl RecordingLayer {
                         ),
                     ],
                 )?;
+                // unit() includes the argument tail, which is decoded after metadata fields.
                 let header_len = a.unit()
+                    - arg_count * size_of::<u32>()
                     - a.field_types
                         .iter()
                         .flatten()
@@ -229,6 +233,12 @@ impl RecordingLayer {
                             }
                         })
                         .collect();
+                    // Template arguments are a separate tail of string offsets.
+                    let args = (0..arg_count).map(|_| {
+                        let part = &bytes[offset..offset + size_of::<u32>()];
+                        offset += size_of::<u32>();
+                        dump_field(&ValueKind::BufferOffset, part, strings)
+                    }).collect();
                     let block = block + arch.data.offset + 1;
                     record(
                         &mut out,
@@ -240,6 +250,7 @@ impl RecordingLayer {
                             ("block", block.into()),
                             ("header", bytes[..header_len].to_vec().into()),
                             ("fields", MpValue::Array(fields)),
+                            ("template_args", MpValue::Array(args)),
                         ],
                     )?;
                     index += 1;

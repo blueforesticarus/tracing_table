@@ -1,4 +1,5 @@
-/// unused b/c string_cache solves the problem
+/// UNUSED
+/// originally we used string_cache crate, and now we use our own stringbuffer which goes in a different direction
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 /// implements a string that either stores an Arc<String> or a small string packed into the word boundary
