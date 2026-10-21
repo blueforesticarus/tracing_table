@@ -8,13 +8,18 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 csv = "1.4"
 gimli = "0.34"
+# The CLI borrows only the pages it actually scans in large linked binaries.
+memmap2 = "0.9"
 object = { version = "0.39", features = ["write"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# Compilation units are independent; indexed collection preserves merge order.
+rayon = "1.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-# Only the end-to-end fixture needs tracing; the scanner never executes the input.
+# Only the end-to-end fixtures need logging crates; the scanner never runs input.
 tracing = "0.1"
+log = { version = "0.4", features = ["kv"] }

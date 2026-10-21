@@ -686,7 +686,7 @@ where
                 }
             }
             arch.data.update_mask_after_append();
-            arch.data.compute_timestamp(time.value as usize, None);
+            arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
             SpanFieldsRef {
                 archetype: arch.id,
@@ -713,7 +713,7 @@ where
                 false
             };
             if retained {
-                data.compute_timestamp(time.value as usize, Some(id.index as usize));
+                data.update_ts_range(time.value as usize, Some(id.index as usize));
             }
         }
         drop(callsite_guard);
@@ -811,7 +811,7 @@ where
             }
         }
         arch.data.update_mask_after_append();
-        arch.data.compute_timestamp(time.value as usize, None);
+        arch.data.update_ts_range(time.value as usize, None);
         drop(callsite_guard);
         if allocated {
             self.drop_old_chunks(callsite);
@@ -911,7 +911,7 @@ where
             }
         }
         arch.data.update_mask_after_append();
-        arch.data.compute_timestamp(time.value as usize, None);
+        arch.data.update_ts_range(time.value as usize, None);
         drop(callsite_guard);
         if allocated {
             self.drop_old_chunks(callsite);

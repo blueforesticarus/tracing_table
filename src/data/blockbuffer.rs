@@ -125,7 +125,7 @@ impl BlockCache {
     pub fn push(&mut self, data: &[u8], ts: usize) {
         self.allocate().0.copy_from_slice(data);
         self.update_mask_after_append();
-        self.compute_timestamp(ts, None);
+        self.update_ts_range(ts, None);
     }
 
     /// Drop the oldest completed chunk by its first row's absolute index.
@@ -174,7 +174,7 @@ impl BlockCache {
 
     // track earliest and latest ts for block
     // called when a span closes
-    pub fn compute_timestamp(&mut self, ts: usize, index: Option<usize>) {
+    pub fn update_ts_range(&mut self, ts: usize, index: Option<usize>) {
         let index = index.unwrap_or(self.count + self.active.length);
 
         let timestamp = if index >= self.count {
