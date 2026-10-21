@@ -50,7 +50,7 @@ fn table_hash(hash: u16) -> u64 {
     u64::from(hash).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-// NOTE: template storage
+// TODO: template storage
 // 1. we would like to support template storage in this file. as an option (opposed to archetyping on template+args)
 //    this gives nice flexibility since readers will just see a string, and not care that it is stored as template + args
 // 2. there is no point in doing this if the template is stored in the buffer. since LZ4 compression will do a good-enough job compressing in that case.
@@ -70,8 +70,8 @@ fn table_hash(hash: u16) -> u64 {
 //    could use negative offset/indices for templates.
 
 /// An append-only cache with stable insertion indexes and byte offsets.
-/// Strings are at most 16,383 UTF-8 bytes; buffers hold at most 16,384 strings.
-/// Entry offsets fit 20 bits. Limits are checked before appending.
+/// Ordinary strings use packed 8-byte lookup entries. Inputs outside those packed
+/// bounds use a linear overflow lookup without adding metadata to every buffer.
 #[derive(Clone, Debug, Default)]
 pub struct Buffer {
     storage: ExpandedBuffer,
@@ -83,7 +83,8 @@ pub struct Buffer {
 /// Immutable expanded strings, with index and offset reads but no dedup metadata.
 #[derive(Clone, Debug, Default)]
 pub struct ExpandedBuffer {
-    // Each entry is a u16 byte length followed by UTF-8, so offsets need no index.
+    // A u16 length precedes UTF-8. u16::MAX escapes to a following u32 length,
+    // allowing large shader diagnostics without widening ordinary string headers.
     data: Vec<u8>,
     index: Vec<u32>,
 }
@@ -98,7 +99,7 @@ impl Deref for Buffer {
 }
 
 impl Buffer {
-    /// Limits imposed by the lookup entry's packed fields.
+    /// Fast lookup bounds; oversized entries remain readable through their u32 offsets.
     pub const MAX_STRING_LENGTH: usize = (1 << 14) - 1;
     pub const MAX_STRINGS: usize = 1 << 14;
     pub const MAX_OFFSET: usize = (1 << 20) - 1;
@@ -106,10 +107,9 @@ impl Buffer {
     /// Add a string (deduplicated by default), returning (index, byte offset).
     pub fn add_string(&mut self, text: &str) -> (usize, usize) {
         let length = text.len();
-        assert!(
-            length <= Self::MAX_STRING_LENGTH,
-            "string exceeds 14-bit length"
-        );
+        if length > Self::MAX_STRING_LENGTH {
+            return self.add_overflow(text);
+        }
         let hash = self.hash_builder.hash_one(text) as u16;
         let entry = self.lookup.entry(
             table_hash(hash),
@@ -129,17 +129,32 @@ impl Buffer {
         };
         let index = self.storage.index.len();
         let offset = self.storage.data.len();
+        if offset > Self::MAX_OFFSET || index >= Self::MAX_STRINGS {
+            // Release the vacant table entry before borrowing the buffer again.
+            drop(vacant);
+            return self.add_overflow(text);
+        }
         let entry = StringEntry::new(hash, offset, length, index);
-        self.storage
-            .data
-            .extend_from_slice(&(length as u16).to_le_bytes());
-        self.storage.data.extend_from_slice(text.as_bytes());
-        self.storage.index.push(offset as u32); // Construction checked the narrower packed offset.
+        let address = self.storage.append(text);
         vacant.insert(entry);
-        (index, offset)
+        address
     }
 
-    /// Encoded unique strings (including u16 lengths) are data; the index and
+    // add a string too large for the hash table sizes, does not use hash table.
+    fn add_overflow(&mut self, text: &str) -> (usize, usize) {
+        if let Some((index, &offset)) = self
+            .storage
+            .index
+            .iter()
+            .enumerate()
+            .find(|(_, offset)| self.storage.get_offset(**offset as usize) == Some(text))
+        {
+            return (index, offset as usize);
+        }
+        self.storage.append(text)
+    }
+
+    /// Encoded unique strings (including encoded lengths) are data; the index and
     /// dedup table are overhead. Empty allocated slots are over-allocation.
     pub fn compression_ratio(&self) -> CompressionStats {
         let mut stats = self.storage.compression_ratio();
@@ -171,6 +186,43 @@ impl Buffer {
 }
 
 impl ExpandedBuffer {
+    // Keep writing and scanning the escaped length format in this module only.
+    fn append(&mut self, text: &str) -> (usize, usize) {
+        let offset = self.data.len();
+        let length = u32::try_from(text.len()).expect("string exceeds u32 length");
+        let prefix = if length < u16::MAX as u32 { 2 } else { 6 };
+        assert!(
+            offset
+                .checked_add(prefix + text.len())
+                .is_some_and(|end| end <= u32::MAX as usize),
+            "string buffer exceeds u32 offsets"
+        );
+        if prefix == 2 {
+            self.data.extend_from_slice(&(length as u16).to_le_bytes());
+        } else {
+            self.data.extend_from_slice(&u16::MAX.to_le_bytes());
+            self.data.extend_from_slice(&length.to_le_bytes());
+        }
+        self.data.extend_from_slice(text.as_bytes());
+        let index = self.index.len();
+        self.index.push(offset as u32);
+        (index, offset)
+    }
+
+    fn entry_range(&self, offset: usize) -> Option<std::ops::Range<usize>> {
+        let mut start = offset.checked_add(2)?;
+        let short = u16::from_le_bytes(self.data.get(offset..start)?.try_into().ok()?);
+        let length = if short == u16::MAX {
+            let end = start.checked_add(4)?;
+            let length = u32::from_le_bytes(self.data.get(start..end)?.try_into().ok()?) as usize;
+            start = end;
+            length
+        } else {
+            usize::from(short)
+        };
+        Some(start..start.checked_add(length)?)
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -200,9 +252,7 @@ impl ExpandedBuffer {
 
     /// Resolve an entry offset previously returned by `Buffer::add_string`.
     pub fn get_offset(&self, offset: usize) -> Option<&str> {
-        let start = offset.checked_add(2)?;
-        let length = u16::from_le_bytes(self.data.get(offset..start)?.try_into().ok()?) as usize;
-        std::str::from_utf8(self.data.get(start..start.checked_add(length)?)?).ok()
+        std::str::from_utf8(self.data.get(self.entry_range(offset)?)?).ok()
     }
 }
 
@@ -255,9 +305,10 @@ impl CompressedBuffer {
                 buffer
                     .index
                     .push(u32::try_from(offset).expect("stored u32 offset"));
-                let length =
-                    u16::from_le_bytes(buffer.data[offset..offset + 2].try_into().unwrap());
-                offset += 2 + usize::from(length);
+                offset = buffer
+                    .entry_range(offset)
+                    .expect("stored string length")
+                    .end;
             }
         }
         Ok(buffer)
@@ -285,19 +336,26 @@ impl BufferCollection {
 
     /// Aggregate all retained buffers and collection storage, counting the
     /// inline active buffer once and unused deque slots as over-allocation.
-    pub fn compression_ratio(&self) -> CompressionStats {
-        self.compressed
-            .iter()
-            .map(CompressedBuffer::compression_ratio)
-            .fold(self.active.compression_ratio(), |total, stats| {
-                total + stats
-            })
+    /// Collection state and spare deque slots are charged to active storage once.
+    pub fn compression_parts(&self) -> (CompressionStats, CompressionStats) {
+        let active = self.active.compression_ratio()
             + CompressionStats {
                 overhead: size_of::<Self>() - size_of::<Buffer>(),
                 overalloc: (self.compressed.capacity() - self.compressed.len())
                     * size_of::<CompressedBuffer>(),
                 ..Default::default()
-            }
+            };
+        let archived = self
+            .compressed
+            .iter()
+            .map(CompressedBuffer::compression_ratio)
+            .fold(CompressionStats::default(), |a, b| a + b);
+        (active, archived)
+    }
+
+    pub fn compression_ratio(&self) -> CompressionStats {
+        let (active, archived) = self.compression_parts();
+        active + archived
     }
 
     /// Freeze the active buffer and start an empty one, returning its ID.
@@ -397,32 +455,44 @@ mod tests {
     }
 
     #[test]
-    fn compact_metadata_limits() {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
+    fn packed_lookup_and_large_entries_share_stable_addresses() {
         assert_eq!(size_of::<StringEntry>(), 8);
         let mut buffer = Buffer::default();
-        let longest = "x".repeat(Buffer::MAX_STRING_LENGTH);
-        assert_eq!(buffer.add_string(&longest), (0, 0));
-        assert_eq!(buffer.byte_len(), longest.len() + 2);
-        assert!(catch_unwind(AssertUnwindSafe(|| buffer.add_string(&(longest + "x")))).is_err());
-        let mut buffer = Buffer::default();
-        for i in 0..Buffer::MAX_STRINGS {
-            buffer.add_string(&i.to_string());
+        let mut expected = Vec::new();
+        // Exercise the packed length bound, the extended prefix boundary, and
+        // enough payload to put subsequent entries beyond the packed offset.
+        for length in [
+            Buffer::MAX_STRING_LENGTH,
+            Buffer::MAX_STRING_LENGTH + 1,
+            u16::MAX as usize - 1,
+            u16::MAX as usize,
+            u16::MAX as usize + 1,
+            1_100_000,
+        ] {
+            let text = "x".repeat(length);
+            let address = buffer.add_string(&text);
+            assert_eq!(buffer.add_string(&text), address);
+            expected.push((text, address));
         }
-        // A full buffer still accepts duplicates; only another unique entry is rejected.
-        assert_eq!(buffer.add_string("16383").0, Buffer::MAX_STRINGS - 1);
-        assert!(catch_unwind(AssertUnwindSafe(|| buffer.add_string("new"))).is_err());
-        assert_eq!(buffer.len(), Buffer::MAX_STRINGS);
-        let mut buffer = Buffer::default();
-        // Large unique strings reach the offset limit before the index limit.
-        for i in 0..64 {
-            buffer.add_string(&format!(
-                "{i:02}{}",
-                "x".repeat(Buffer::MAX_STRING_LENGTH - 2)
-            ));
+        let short = buffer.add_string("short after large shader");
+        assert!(short.1 > Buffer::MAX_OFFSET);
+        assert_eq!(buffer.add_string("short after large shader"), short);
+        for keep_index in [false, true] {
+            let restored = buffer.clone().compress(keep_index).decompress().unwrap();
+            for (text, address) in &expected {
+                assert_eq!(restored.get_index(address.0), Some(text.as_str()));
+                assert_eq!(restored.get_offset(address.1), Some(text.as_str()));
+            }
+            assert_eq!(
+                restored.get_offset(short.1),
+                Some("short after large shader")
+            );
         }
-        assert!(buffer.byte_len() > Buffer::MAX_OFFSET);
-        assert!(catch_unwind(AssertUnwindSafe(|| buffer.add_string("new"))).is_err());
+        let mut many = Buffer::default();
+        for i in 0..=Buffer::MAX_STRINGS {
+            assert_eq!(many.add_string(&i.to_string()).0, i);
+        }
+        assert_eq!(many.add_string("16384").0, Buffer::MAX_STRINGS);
     }
 
     #[test]

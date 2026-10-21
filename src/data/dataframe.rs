@@ -374,6 +374,17 @@ pub struct CompactFrameLayout<'a> {
 }
 
 impl CompactFrame {
+    /// Common archived-frame metadata, also exposed by BitCompactFrame.
+    pub fn unit(&self) -> usize {
+        self.unit
+    }
+    pub fn len(&self) -> usize {
+        self.length
+    }
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
     pub fn new_uninitialized(unit: usize, length: usize, const_bytes: usize) -> Box<CompactFrame> {
         // Validate subtraction as well as multiplication/addition before allocating.
         let compact_unit = unit
@@ -612,7 +623,7 @@ pub struct CompactFrameIter<'a> {
     buffer: StackVec<128, u128>,
     index: usize,
     compact_unit: usize,
-    capacity: usize,
+    yielded: usize,
 }
 
 impl<'a> CompactFrameIter<'a> {
@@ -621,9 +632,9 @@ impl<'a> CompactFrameIter<'a> {
         Self {
             frame,
             buffer: StackVec::new(&frame.buffer[frame.unit..2 * frame.unit]),
-            index: 0,
+            index: frame.unit * 2,
             compact_unit,
-            capacity: frame.unit * 2 + (frame.length - 1) * compact_unit,
+            yielded: 0,
         }
     }
 }
@@ -632,25 +643,23 @@ impl<'a> StreamingIterator for CompactFrameIter<'a> {
     type Item = [u8];
 
     fn advance(&mut self) {
-        if self.index == 0 {
-            self.index = self.frame.unit * 2; // skip mask and first
+        // Count rows explicitly: a fully constant frame has zero packed bytes
+        // per row, so a byte-offset sentinel cannot detect its end.
+        if self.yielded >= self.frame.length {
+            self.yielded = self.frame.length + 1;
             return;
         }
-
-        if self.index < self.capacity {
+        if self.yielded > 0 {
             for (a, b) in MaskIter::new(self.frame.mask()) {
                 self.buffer[b].copy_from_slice(&self.frame.buffer[self.index..][a]);
             }
+            self.index += self.compact_unit;
         }
-        self.index += self.compact_unit;
+        self.yielded += 1;
     }
 
     fn get(&self) -> Option<&Self::Item> {
-        if self.index > self.capacity {
-            return None;
-        }
-
-        Some(self.buffer.as_ref())
+        (self.yielded > 0 && self.yielded <= self.frame.length).then(|| self.buffer.as_ref())
     }
 }
 

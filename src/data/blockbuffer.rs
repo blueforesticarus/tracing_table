@@ -9,7 +9,15 @@ use std::{
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
 use super::CompressionStats;
-use super::dataframe::{CompactFrame, CompactFrameIter, Frame, Row, RowBuffer};
+use super::dataframe::{AnyFrame, Frame, Row, RowBuffer};
+
+// Compile-time selection keeps both modes on the normal rollover/edit/read path.
+#[cfg(feature = "bit-compression")]
+pub use super::dataframe::{
+    BitCompactFrame as ArchivedFrame, BitCompactFrameIter as ArchivedFrameIter,
+};
+#[cfg(not(feature = "bit-compression"))]
+pub use super::dataframe::{CompactFrame as ArchivedFrame, CompactFrameIter as ArchivedFrameIter};
 
 /// a quasi ring buffer of dataframes.
 
@@ -51,7 +59,7 @@ pub struct BlockCache {
 }
 
 pub struct Data {
-    pub data: Box<CompactFrame>,
+    pub data: Box<ArchivedFrame>,
     pub index: usize,
     /// BufferCollection ID shared by every string field in this chunk.
     pub string_buffer: usize,
@@ -94,15 +102,13 @@ impl BlockCache {
             } else {
                 // active frame has reached max size, compact put in ring buffer.
                 // active frame cleared, retains allocated capacity
-                let frame = CompactFrame::new_from(&self.active);
+                let frame = ArchivedFrame::new_from(&self.active);
 
                 // mask and first element
-                assert_eq!(
-                    frame.buffer[..2 * frame.unit],
-                    self.active.buffer[..self.active.unit * 2]
-                );
+                assert_eq!(&frame.mask()[..], &self.active.buffer[..self.unit]);
+                assert_eq!(frame.first(), &self.active.buffer[self.unit..2 * self.unit]);
 
-                let length = frame.length;
+                let length = frame.len();
                 self.ring.push(Data {
                     data: frame,
                     timestamp: self.timestamp.clone(),
@@ -157,11 +163,15 @@ impl BlockCache {
                 return None;
             };
 
+            #[cfg(feature = "bit-compression")]
+            let frame = AnyFrame::BitCompact(&mut data.data);
+            #[cfg(not(feature = "bit-compression"))]
+            let frame = AnyFrame::Compact(&mut data.data);
             Row {
-                init: false, // we aren't copying the data, just providing the buffer
+                init: false, // Decode only if the caller accesses the archived row.
                 buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
                 index: index - data.index,
-                frame: crate::data::dataframe::AnyFrame::Compact(&mut data.data),
+                frame,
             }
             .into()
         }
@@ -201,13 +211,19 @@ impl BlockCache {
         self.ring
             .iter()
             .into_streaming_iter()
-            .flat_map(|frame| CompactFrameIter::new(&frame.data))
+            .flat_map(|frame| ArchivedFrameIter::new(&frame.data))
             .chain(self.active.iter().into_streaming_iter_ref())
     }
 
-    pub fn compression_ratio(&self) -> CompressionStats {
-        let r = self.active.compression_ratio();
-        let r = self
+    /// Split resident storage by lifetime; shared cache state belongs to active storage.
+    pub fn compression_parts(&self) -> (CompressionStats, CompressionStats) {
+        let active = self.active.compression_ratio()
+            + CompressionStats {
+                overhead: size_of::<Self>() + self.edit_buffer.len(),
+                overalloc: self.edit_buffer.capacity() - self.edit_buffer.len(),
+                ..Default::default()
+            };
+        let archived = self
             .ring
             .iter()
             .map(|v| {
@@ -217,11 +233,17 @@ impl BlockCache {
                         ..Default::default()
                     }
             })
-            .fold(r, |a, b| a + b);
-        r + CompressionStats {
-            overhead: size_of::<Self>(),
-            ..Default::default()
-        }
+            .fold(CompressionStats::default(), |a, b| a + b)
+            + CompressionStats {
+                overalloc: (self.ring.capacity() - self.ring.len()) * size_of::<Data>(),
+                ..Default::default()
+            };
+        (active, archived)
+    }
+
+    pub fn compression_ratio(&self) -> CompressionStats {
+        let (active, archived) = self.compression_parts();
+        active + archived
     }
 }
 
@@ -238,6 +260,32 @@ mod test {
     use crate::data::dataframe::Frame;
 
     use super::BlockCache;
+
+    #[test]
+    fn archived_edits_and_constant_blocks_preserve_the_complete_stream() {
+        let mut cache = BlockCache::new(2, 8, 8);
+        let mut expected: Vec<_> = (0..35).map(|i| [0xA0 | (i / 8) as u8, 0x55]).collect();
+        for row in &expected {
+            cache.push(row, 0);
+        }
+        assert_eq!(cache.ring.len(), 4);
+        // Patch an archived baseline, then another row with an already-varying
+        // bit. Other archived frames remain fully constant and must terminate.
+        for (index, bit) in [(1, 0x80), (2, 0x80), (17, 0)] {
+            cache.get_mut(index).unwrap().get_mut()[0] ^= bit;
+            expected[index - 1][0] ^= bit; // Absolute row indexes start at one.
+        }
+        let mut rows = cache.iter();
+        for expected in expected {
+            assert_eq!(rows.next(), Some(expected.as_slice()));
+        }
+        assert!(rows.next().is_none());
+        assert!(rows.next().is_none());
+        let (active, archived) = cache.compression_parts();
+        assert_eq!(active.data, 3 * 2);
+        assert_eq!(archived.data, 32 * 2);
+        assert!(archived.compressed < archived.data);
+    }
 
     #[test]
     fn block_cache_push_and_retrieve() {

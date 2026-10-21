@@ -28,12 +28,20 @@ use crate::data::{
     CompressionStats,
     blockbuffer::BlockCache,
     dyntuple::{BytePacker, ValueData, ValueKind},
-    stringbuffer::BufferCollection,
+    stringbuffer::{Buffer, BufferCollection, ExpandedBuffer},
 };
 
-mod dump;
+// Portable capture/loading is opt-in; live recording does not depend on its state.
+pub mod dump;
+pub mod read;
+mod value;
+pub use value::InputValue;
 // Templates resolve once per callsite, with a source fallback during development.
 pub mod template;
+
+/// Uncompressed bytes per archetype block; the reference comparison favors 4 KiB.
+/// Capacity rounds down to whole rows.
+pub const MESSAGE_BLOCK_TARGET_SIZE: usize = 4 * 1024;
 
 /// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
 #[rustfmt::skip]
@@ -41,12 +49,61 @@ pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
     AtomicUsize::new(std::env::var("STRING_BUFFER_TARGET_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 15))
 });
 
+/// Choose a string reference once per callsite. Both forms use u32 in raw rows;
+/// indices have smaller numeric ranges for the ordinary compaction algorithms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StringStorage {
+    #[default]
+    Offset,
+    Index,
+}
+impl StringStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Offset => "offset",
+            Self::Index => "index",
+        }
+    }
+
+    fn kind(self, value: &ValueData) -> ValueKind {
+        match value {
+            ValueData::BufferOffset(_) | ValueData::BufferIndex(_) => match self {
+                Self::Offset => ValueKind::BufferOffset,
+                Self::Index => ValueKind::BufferIndex,
+            },
+            _ => ValueKind::from(value),
+        }
+    }
+
+    fn intern(self, buffer: &mut Buffer, text: &str) -> ValueData {
+        let (index, offset) = buffer.add_string(text);
+        match self {
+            Self::Offset => {
+                ValueData::BufferOffset(u32::try_from(offset).expect("string offset exceeds u32"))
+            }
+            Self::Index => {
+                ValueData::BufferIndex(u32::try_from(index).expect("string index exceeds u32"))
+            }
+        }
+    }
+
+    fn read(self, buffer: &ExpandedBuffer, reference: u32) -> &str {
+        match self {
+            Self::Offset => buffer.get_offset(reference as usize),
+            Self::Index => buffer.get_index(reference as usize),
+        }
+        .expect("stored string reference")
+    }
+}
+
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
     pub id: u64,
     pub metadata: &'static Metadata<'static>,
     /// Resolve once on registration; retain None so failed lookups don't repeat.
     pub template: Option<template::CompiledTemplate>,
+    /// Fixed at registration so previously stored rows keep their interpretation.
+    pub string_storage: StringStorage,
 
     // Reuse each field's string capacity across recordings.
     field_value_scratchpad: FieldValues,
@@ -64,7 +121,7 @@ impl PerCallsiteData {
     fn get_arch(&mut self) -> usize {
         let archetype = &self.last_archetype; //aliased mutability issue with structs needs to be fixed. 
         let unit = archetype.unit();
-        let cap = 4096 / unit;
+        let cap = MESSAGE_BLOCK_TARGET_SIZE / unit;
 
         let i = match self.lookup.get(archetype) {
             Some(i) => *i,
@@ -123,7 +180,7 @@ impl PerArchData {
             // target within half a delta. Oversized chunks remain indivisible.
             let projected = size.saturating_add(delta).saturating_add(delta / 2);
             if size > 0 && projected >= STRING_BUFFER_TARGET_SIZE.load(Ordering::Relaxed) {
-                self.strings.rotate(false); // Rows address offsets, so omit the frozen index.
+                self.strings.rotate(false); // Expansion rebuilds the index from entry lengths.
             }
             self.chunk_string_start = self.strings.active.byte_len();
             self.data.string_buffer = self.strings.active_index();
@@ -264,6 +321,9 @@ pub struct RecordingLayer {
     /// TODO could be automatic based on time between messages.
     pub timestamp_bit_shift: u8,
 
+    /// Used for newly registered callsites; configure before recording.
+    pub string_storage: StringStorage,
+
     /// Retained chunk/string storage limits in bytes; active storage is protected.
     pub global_memory_cap: usize,
     pub callsite_memory_cap: usize,
@@ -283,6 +343,7 @@ impl RecordingLayer {
             span_id_counter: 1.into(),
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             timestamp_bit_shift: 3,
+            string_storage: StringStorage::Offset,
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
@@ -293,6 +354,26 @@ impl RecordingLayer {
     fn register(
         &self,
         metadata: &'static Metadata<'static>,
+    ) -> ArcRwLockWriteGuard<RawRwLock, PerCallsiteData> {
+        self.register_with_template(metadata, || {
+            if metadata.is_event() && metadata.fields().field("message").is_some() {
+                template::lookup(
+                    metadata.file().unwrap_or("<unknown>"),
+                    metadata.line().unwrap_or(0),
+                    metadata.name() == "compat:log",
+                    metadata.module_path(),
+                )
+            } else {
+                None
+            }
+        })
+    }
+
+    // seperated out so benchmark log replay can provide stored template.
+    fn register_with_template(
+        &self,
+        metadata: &'static Metadata<'static>,
+        resolve: impl FnOnce() -> Option<template::CompiledTemplate>,
     ) -> ArcRwLockWriteGuard<RawRwLock, PerCallsiteData> {
         let key = metadata as *const Metadata<'static> as usize;
         if let Some(v) = self.callsites.read().get(&key) {
@@ -313,21 +394,7 @@ impl RecordingLayer {
             .write()
             .entry(key)
             .or_insert_with(|| {
-                let template =
-                    // only event macros support format strings, which are stored as message field
-                    if metadata.is_event() && metadata.fields().field("message").is_some() {
-                        // Important this only runs once per callsite
-                        template::lookup(
-                            metadata.file().unwrap_or("<unknown>"),
-                            metadata.line().unwrap_or(0),
-                            // log_callsite_adapter assigns this name to log origins.
-                            metadata.name() == "compat:log",
-                            metadata.module_path(),
-                        )
-                    } else {
-                        None
-                    };
-
+                let template = resolve();
                 let acount = template.as_ref().map_or(0, |t| t.field_names.len());
                 let fields = FieldValues::new(vcount, acount);
                 Arc::new(
@@ -335,6 +402,7 @@ impl RecordingLayer {
                         id,
                         metadata,
                         template,
+                        string_storage: self.string_storage,
                         field_value_scratchpad: fields,
                         cache: Default::default(),
                         lookup: Default::default(),
@@ -374,7 +442,7 @@ impl RecordingLayer {
                 v.read()
                     .cache
                     .iter()
-                    .map(|v| v.data.compression_ratio())
+                    .map(|v| v.data.compression_ratio() + v.strings.compression_ratio())
                     .collect::<Vec<_>>()
             })
             .fold(
@@ -388,6 +456,11 @@ impl RecordingLayer {
     /// CODEX GENERATED
     /// TODO cleanup
     fn drop_old_chunks(&self, callsite: u64) {
+        // Unlimited retention needs no accounting or eviction candidates. Replay
+        // uses this mode so growing archives do not trigger repeated full scans.
+        if self.global_memory_cap == usize::MAX && self.callsite_memory_cap == usize::MAX {
+            return;
+        }
         // Copy handles, not lock guards. Each scan holds just one callsite read lock;
         // deletion takes only the selected callsite's write lock.
         let sites: Vec<_> = self.callsites.read().values().cloned().collect();
@@ -518,6 +591,7 @@ impl Archetype {
                 bytes += k.unit()
             }
         }
+        // Template references use u32 for either offset or index addressing.
         bytes + self.template.unwrap_or(0) * size_of::<u32>()
     }
 }
@@ -585,6 +659,8 @@ impl Deref for LocalRecordingLayer {
     }
 }
 
+// Layer callbacks resolve tracing context and sample the clock. The storage
+// methods below accept these inputs explicitly, also making deterministic import possible.
 impl<S> Layer<S> for LocalRecordingLayer
 where
     S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
@@ -604,33 +680,18 @@ where
 
     fn on_record(
         &self,
-        span: &tracing_core::span::Id,
+        id: &tracing_core::span::Id,
         values: &tracing_core::span::Record<'_>,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let ctx = ctx.span(span).unwrap();
-        let mut ext = ctx.extensions_mut();
-        let v = ext.get_mut::<FieldValues>();
-
-        let mut v = match v {
-            Some(v) => v,
-            None => {
-                let v = FieldValues::new(ctx.fields().len(), 0);
-                ext.insert(v);
-                ext.get_mut::<FieldValues>().unwrap()
-            }
-        };
-
-        let mut visitor = ValueRecorder {
-            _metadata: ctx.metadata(),
-            data: &mut v,
-            is_log_compat: false,
-            template: None, /* spans don't have template strings */
-            template_arg_count: None,
-        };
-
-        // records fields into tracing context extensions
-        values.record(&mut visitor as &mut dyn Visit);
+        let span = ctx.span(id).unwrap();
+        let mut ext = span.extensions_mut();
+        if ext.get_mut::<FieldValues>().is_none() {
+            ext.insert(FieldValues::new(span.fields().len(), 0));
+        }
+        ext.get_mut::<FieldValues>()
+            .unwrap()
+            .record(|visitor| values.record(visitor));
     }
 
     fn on_close(
@@ -639,13 +700,144 @@ where
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let time = self.timestamp();
-        let ctx = ctx.span(&tracing_id).unwrap();
-        let mut ext = ctx.extensions_mut();
-        let follow_from = ext.get_mut::<FollowFrom>().map(|value| value.0);
-        let id: SpanId = *ext.get_mut().unwrap();
-        let fields: Option<&mut FieldValues> = ext.get_mut(); // recorded by on_record
+        let span = ctx.span(&tracing_id).unwrap();
+        let mut ext = span.extensions_mut();
+        let follows = ext.get_mut::<FollowFrom>().map(|value| value.0);
+        let id = *ext.get_mut::<SpanId>().unwrap();
+        self.close_span(
+            span.metadata(),
+            id,
+            time,
+            follows,
+            ext.get_mut::<FieldValues>(),
+        );
+    }
 
-        let mut callsite_guard = self.register(ctx.metadata());
+    fn on_new_span(
+        &self,
+        attrs: &tracing_core::span::Attributes<'_>,
+        id: &tracing_core::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let time = self.timestamp();
+        let parent = if attrs.is_contextual() {
+            ctx.lookup_current()
+        } else {
+            attrs.parent().and_then(|id| ctx.span(id))
+        };
+        let parent = parent.map(|span| *span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
+        let stored = self.record_start(attrs.metadata(), time, parent, false, |visitor| {
+            attrs.record(visitor)
+        });
+        ctx.span(id).unwrap().extensions_mut().insert(stored);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let time = self.timestamp();
+        let parent = if event.is_contextual() {
+            ctx.lookup_current()
+        } else {
+            event.parent().and_then(|id| ctx.span(id))
+        };
+        let parent = parent.map(|span| *span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
+        self.record_start(
+            log_callsite_adapter(event),
+            time,
+            parent,
+            event.is_log(),
+            |visitor| event.record(visitor),
+        );
+    }
+}
+
+impl RecordingLayer {
+    // Events and span starts differ only in their headers and message matching.
+    // Both use this one path for archetyping, strings, rollover, and retention.
+    fn record_start(
+        &self,
+        metadata: &'static Metadata<'static>,
+        time: Time,
+        parent: Option<SpanId>,
+        is_log_compat: bool,
+        record: impl FnOnce(&mut dyn Visit),
+    ) -> SpanId {
+        let is_event = metadata.is_event();
+        let mut guard = self.register(metadata);
+        let site = guard.deref_mut();
+        site.call_count += 1;
+        site.field_value_scratchpad.values.fill(None);
+        let mut visitor = ValueRecorder {
+            data: &mut site.field_value_scratchpad,
+            is_log_compat,
+            template: if is_event {
+                site.template.as_ref()
+            } else {
+                None
+            },
+            template_arg_count: None,
+        };
+        record(&mut visitor);
+        site.last_archetype.template = visitor.template_arg_count;
+        site.last_archetype.field_types.clear();
+        site.last_archetype.field_types.extend(
+            site.field_value_scratchpad
+                .values
+                .iter()
+                .map(|value| value.as_ref().map(|v| site.string_storage.kind(v))),
+        );
+        site.last_archetype.extra_hash = 0;
+        site.last_archetype.follows_from = !is_event;
+        site.last_archetype.parent = parent.is_some();
+        site.last_archetype.is_span_end = false;
+        site.last_archetype.is_event = is_event;
+        let callsite = site.id;
+        let index = site.get_arch();
+        let arch = &mut site.cache[index];
+        let allocated = arch.prepare_chunk();
+        let (bytes, index) = arch.data.allocate();
+        let id = SpanId {
+            index: index as u64,
+            callsite: callsite as u32,
+            archetype: arch.id,
+        };
+        let mut packer = BytePacker::new(bytes);
+        packer.write_any_value(time.value, false);
+        if !is_event {
+            packer.write_any_value(PackedTimestamp::default(), false);
+            packer.write_any_value(SpanFieldsRef::default(), false);
+            packer.write_any_value(PLACE_HOLDER, false);
+        }
+        if let Some(parent) = parent {
+            packer.write_any_value(parent, false);
+        }
+        let fields = &mut site.field_value_scratchpad;
+        fields.write(&mut packer, &mut arch.strings.active, site.string_storage);
+        if let Some(count) = arch.archetype.template {
+            for argument in &fields.template_args[..count] {
+                packer.write_any_value(
+                    site.string_storage.intern(&mut arch.strings.active, argument),
+                    false,
+                );
+            }
+        }
+        arch.data.update_mask_after_append();
+        arch.data.update_ts_range(time.value as usize, None);
+        drop(guard);
+        if allocated {
+            self.drop_old_chunks(callsite);
+        }
+        id
+    }
+
+    fn close_span(
+        &self,
+        metadata: &'static Metadata<'static>,
+        id: SpanId,
+        time: Time,
+        follow_from: Option<SpanId>,
+        fields: Option<&mut FieldValues>,
+    ) {
+        let mut callsite_guard = self.register(metadata);
         let callsite_data = callsite_guard.deref_mut();
         let callsite = callsite_data.id;
         callsite_data.finished_count += 1;
@@ -657,7 +849,7 @@ where
                 fields
                     .values
                     .iter()
-                    .map(|opt| opt.as_ref().map(ValueKind::from)),
+                    .map(|opt| opt.as_ref().map(|v| callsite_data.string_storage.kind(v))),
             );
             callsite_data.last_archetype.extra_hash = 0;
             callsite_data.last_archetype.follows_from = false;
@@ -676,15 +868,11 @@ where
             data.write_any_value(id, false); // end data points to start data
             // most won't have end data, so this is good
             // Transfer values into the row, interning strings in this chunk's buffer.
-            for (index, field) in fields.values.iter_mut().enumerate() {
-                if let Some(mut field) = field.take() {
-                    if let ValueData::BufferOffset(offset) = &mut field {
-                        // Buffer checks its narrower 20-bit offset limit on insertion.
-                        *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
-                    }
-                    data.write_any_value(field, false);
-                }
-            }
+            fields.write(
+                &mut data,
+                &mut arch.strings.active,
+                callsite_data.string_storage,
+            );
             arch.data.update_mask_after_append();
             arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
@@ -721,209 +909,13 @@ where
             self.drop_old_chunks(callsite);
         }
     }
-
-    fn on_new_span(
-        &self,
-        attrs: &tracing_core::span::Attributes<'_>,
-        tracing_id: &tracing_core::span::Id,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let time = self.timestamp();
-
-        let mut span_id = None;
-        if attrs.is_contextual() {
-            if let Some(span) = ctx.lookup_current() {
-                span_id = Some(*span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
-            }
-        } else if let Some(span) = attrs.parent() {
-            if let Some(span) = ctx.span(span) {
-                span_id = Some(*span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
-            }
-        }
-
-        let mut callsite_guard = self.register(attrs.metadata());
-        let callsite_data = callsite_guard.deref_mut();
-        callsite_data.call_count += 1;
-
-        callsite_data.field_value_scratchpad.values.fill(None);
-        let mut visitor = ValueRecorder {
-            _metadata: attrs.metadata(),
-            data: &mut callsite_data.field_value_scratchpad,
-            is_log_compat: false,
-            template: None,
-            template_arg_count: None,
-        };
-
-        // records fields directly into PerCallsiteData temp buffer.
-        attrs.record(&mut visitor as &mut dyn Visit);
-
-        // we use callsite data's copy so we can avoid allocating a vec
-        callsite_data.last_archetype.field_types.clear();
-        callsite_data.last_archetype.field_types.extend(
-            callsite_data
-                .field_value_scratchpad
-                .values
-                .iter()
-                .map(|opt| opt.as_ref().map(ValueKind::from)),
-        );
-        callsite_data.last_archetype.extra_hash = 0;
-        callsite_data.last_archetype.follows_from = true; //only known later
-        callsite_data.last_archetype.is_span_end = false;
-        callsite_data.last_archetype.is_event = false;
-        callsite_data.last_archetype.parent = span_id.is_some();
-
-        let callsite = callsite_data.id;
-        let arch = callsite_data.get_arch();
-        let arch = &mut callsite_data.cache[arch];
-
-        // Id not used for events
-
-        // all that is left is to write to the store.
-        let allocated = arch.prepare_chunk();
-        let (data, index) = arch.data.allocate();
-
-        let id = SpanId {
-            index: index as u64,
-            callsite: callsite as u32,
-            archetype: arch.id as u32,
-        };
-
-        ctx.span(tracing_id).unwrap().extensions_mut().insert(id);
-
-        // NOTE for now I'm choosing to reduce overhead by writing the fields unaligned.
-        // probably should change this in the future.
-        // NOTE: with compaction, probably could use serialization.
-        let mut data = BytePacker::new(data);
-        data.write_any_value(time.value, false);
-        data.write_any_value(PackedTimestamp::default(), false); // space for end_timestamp
-        data.write_any_value(SpanFieldsRef::default(), false); // deferred fields are unknown until close
-        data.write_any_value(PLACE_HOLDER, false); // space for follows_from
-        if arch.archetype.parent {
-            data.write_any_value(span_id.unwrap(), false);
-        }
-        let fields = &mut callsite_data.field_value_scratchpad;
-        for (index, field) in fields.values.iter_mut().enumerate() {
-            if let Some(mut field) = field.take() {
-                if let ValueData::BufferOffset(offset) = &mut field {
-                    *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
-                }
-                data.write_any_value(field, false);
-            }
-        }
-        arch.data.update_mask_after_append();
-        arch.data.update_ts_range(time.value as usize, None);
-        drop(callsite_guard);
-        if allocated {
-            self.drop_old_chunks(callsite);
-        }
-    }
-
-    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let time = self.timestamp();
-
-        let mut span_id = None;
-
-        if event.is_contextual() {
-            if let Some(span) = ctx.lookup_current() {
-                span_id = Some(*span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
-            }
-        } else if let Some(span) = event.parent() {
-            if let Some(span) = ctx.span(span) {
-                span_id = Some(*span.extensions().get::<SpanId>().unwrap_or(&PLACE_HOLDER));
-            }
-        }
-
-        let is_log_compat = event.is_log();
-        let metadata = log_callsite_adapter(event);
-
-        let mut callsite_guard = self.register(metadata);
-        let callsite_data = callsite_guard.deref_mut();
-        callsite_data.call_count += 1;
-
-        // event id's currently not stored. since nothing refers to them
-        callsite_data.field_value_scratchpad.values.fill(None);
-        let mut visitor = ValueRecorder {
-            _metadata: metadata,
-            data: &mut callsite_data.field_value_scratchpad,
-            is_log_compat,
-            template: callsite_data.template.as_ref(),
-            template_arg_count: None,
-        };
-
-        // records fields directly into PerCallsiteData buffer.
-        event.record(&mut visitor as &mut dyn Visit);
-        callsite_data.last_archetype.template = visitor.template_arg_count;
-
-        // we use callsite data's copy so we can avoid allocating a vec
-        callsite_data.last_archetype.field_types.clear();
-        callsite_data.last_archetype.field_types.extend(
-            callsite_data
-                .field_value_scratchpad
-                .values
-                .iter()
-                .map(|opt| opt.as_ref().map(ValueKind::from)),
-        );
-        callsite_data.last_archetype.extra_hash = 0;
-        callsite_data.last_archetype.follows_from = false;
-        callsite_data.last_archetype.parent = span_id.is_some();
-        callsite_data.last_archetype.is_span_end = false;
-        callsite_data.last_archetype.is_event = true;
-
-        let callsite = callsite_data.id;
-        let arch = callsite_data.get_arch();
-        let arch = &mut callsite_data.cache[arch];
-
-        // Id not used for events
-
-        // all that is left is to write to the store.
-        let allocated = arch.prepare_chunk();
-        let (data, index) = arch.data.allocate();
-
-        let _id = SpanId {
-            index: index as u64,
-            callsite: callsite as u32,
-            archetype: arch.id as u32,
-        };
-
-        // NOTE for now I'm choosing to reduce overhead by writing the fields unaligned.
-        // probably should change this in the future.
-        // NOTE: with compaction, probably could use serialization.
-        let mut data = BytePacker::new(data);
-        data.write_any_value(time.value, false);
-        if arch.archetype.parent {
-            data.write_any_value(span_id.unwrap(), false);
-        }
-        let fields = &mut callsite_data.field_value_scratchpad;
-        for (index, field) in fields.values.iter_mut().enumerate() {
-            if let Some(mut field) = field.take() {
-                if let ValueData::BufferOffset(offset) = &mut field {
-                    *offset = arch.strings.active.add_string(&fields.strings[index]).1 as u32;
-                }
-                data.write_any_value(field, false);
-            }
-        }
-        // store template args, if message was parsed
-        if let Some(arg_count) = arch.archetype.template {
-            // Pack exactly the argument tail described by the archetype's row width.
-            for argument in &fields.template_args[..arg_count] {
-                let offset = arch.strings.active.add_string(argument).1 as u32;
-                data.write_any_value(ValueData::BufferOffset(offset), false);
-            }
-        }
-        arch.data.update_mask_after_append();
-        arch.data.update_ts_range(time.value as usize, None);
-        drop(callsite_guard);
-        if allocated {
-            self.drop_old_chunks(callsite);
-        }
-    }
 }
 
 // ----------------  CRUFT ------------------------
 
 // Text belongs to the subscriber until its archetype is known (or a span closes).
-// Strings retain capacity; BufferOffset(0) refers to the start of that field's text
-// and is replaced with its deduplicated chunk offset before packing.
+// Strings retain capacity; BufferOffset(0) is only a scratch placeholder for text
+// and is replaced with its deduplicated buffer offset/index before packing.
 struct FieldValues {
     values: Vec<Option<ValueData>>,
     strings: Vec<String>,
@@ -931,6 +923,30 @@ struct FieldValues {
     template_args: Vec<String>,
 }
 impl FieldValues {
+    /// Events, span starts and deferred updates share reference encoding.
+    /// Scratch strings stay textual until the destination buffer is selected.
+    fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer, storage: StringStorage) {
+        for (index, field) in self.values.iter_mut().enumerate() {
+            if let Some(value) = field.take() {
+                let value = match value {
+                    ValueData::BufferOffset(_) | ValueData::BufferIndex(_) => {
+                        storage.intern(buffer, &self.strings[index])
+                    }
+                    value => value,
+                };
+                packer.write_any_value(value, false);
+            }
+        }
+    }
+    fn record(&mut self, record: impl FnOnce(&mut dyn Visit)) {
+        record(&mut ValueRecorder {
+            data: self,
+            is_log_compat: false,
+            template: None,
+            template_arg_count: None,
+        });
+    }
+
     // Size both kinds of reusable scratch storage when the callsite is registered.
     fn new(vcount: usize, arg_count: usize) -> Self {
         Self {
@@ -942,7 +958,6 @@ impl FieldValues {
 }
 
 struct ValueRecorder<'a> {
-    _metadata: &'a Metadata<'a>,
     data: &'a mut FieldValues,
     is_log_compat: bool,
     template: Option<&'a template::CompiledTemplate>,
@@ -957,7 +972,7 @@ impl ValueRecorder<'_> {
             return; // tracing_log metadata is fields, but we already extracted it
         }
 
-        // Format once into reusable scratch, retaining captures or a raw string offset.
+        // Format once into scratch; physical offset/index references are assigned on write.
         let text = &mut self.data.strings[field.index()];
         text.clear();
         write!(text, "{value}").expect("writing to String");
@@ -1044,6 +1059,11 @@ mod test {
         fn emit(count: u64, message: &str) {
             tracing::info!(count, message, tail = "tail");
         }
+        // Fill an archived block even when the configured target grows. The
+        // fixed template has the smallest row: timestamp, count and tail offset.
+        let pairs = super::MESSAGE_BLOCK_TARGET_SIZE
+            / (size_of::<super::PackedTimestamp>() + 8 + 4)
+            + 1;
         for format in ["hello {name} {}!", "fixed"] {
             let recorder = Arc::new(RecordingLayer::new());
             let dispatch = tracing::Dispatch::new(
@@ -1060,7 +1080,7 @@ mod test {
                 site.template = Some(template);
             }
             tracing::dispatcher::with_default(&dispatch, || {
-                for n in 0..600u64 {
+                for n in 0..(2 * pairs) as u64 {
                     let message = if n % 2 != 0 {
                         format!("raw {n}")
                     } else if format == "fixed" {
@@ -1096,57 +1116,36 @@ mod test {
                 assert!(!matched.data.ring.is_empty()); // Exercise compressed chunks too.
                 (matched.id, arg_count)
             };
-            // Dump resolves the actual packed offsets, so verify storage through that reader.
-            let mut output = Vec::new();
-            recorder.dump_all_data(&mut output).unwrap();
-            let mut cursor = std::io::Cursor::new(output);
+            // Decode the actual offsets and reconstructed message through the production reader.
             let (mut matched_rows, mut raw_rows) = (0, 0);
-            while cursor.position() < cursor.get_ref().len() as u64 {
-                let row = rmpv::decode::read_value(&mut cursor).unwrap();
-                // Export the count too, including zero for matched literal templates.
-                if row["type"].as_str() == Some("archetype") {
-                    if row["id"].as_u64() == Some(matched as u64) {
-                        assert_eq!(row["template"].as_u64(), Some(arg_count as u64));
-                    } else {
-                        assert!(row["template"].is_nil());
-                    }
-                }
-                if row["type"].as_str() != Some("row") {
-                    continue;
-                }
-                assert_eq!(
-                    row["header"].as_slice().unwrap().len(),
-                    size_of::<super::PackedTimestamp>()
-                );
-                let fields = row["fields"].as_array().unwrap();
-                let args = row["template_args"].as_array().unwrap();
-                assert_eq!(fields.len(), 3);
-                let n = u64::from_ne_bytes(fields[0].as_slice().unwrap().try_into().unwrap());
-                assert_eq!(fields[2].as_str(), Some("tail"));
-                if row["archetype"].as_u64() == Some(matched as u64) {
+            site.read().visit_rows(|row| {
+                use super::InputValue;
+                let Some(InputValue::U64(n)) = row.fields[0] else {
+                    panic!("count type");
+                };
+                assert_eq!(row.fields[2], Some(InputValue::Text("tail".into())));
+                let expected = if row.archetype == matched {
                     matched_rows += 1;
                     assert_eq!(n % 2, 0);
-                    assert!(fields[1].is_nil());
-                    assert_eq!(args.len(), arg_count);
-                    if arg_count > 0 {
-                        assert_eq!(args[0].as_str(), Some(if n == 0 { "" } else { "é" }));
-                        assert_eq!(
-                            args[1].as_str().unwrap(),
-                            if n == 0 { String::new() } else { n.to_string() }
-                        );
+                    if format == "fixed" {
+                        "fixed".to_owned()
+                    } else if n == 0 {
+                        "hello  !".to_owned()
+                    } else {
+                        format!("hello é {n}!")
                     }
                 } else {
                     raw_rows += 1;
-                    assert!(args.is_empty()); // No stale captures after a mismatch.
-                    let expected = if n == u64::MAX {
+                    if n == u64::MAX {
                         "warmup".to_owned()
                     } else {
                         format!("raw {n}")
-                    };
-                    assert_eq!(fields[1].as_str(), Some(expected.as_str()));
-                }
-            }
-            assert_eq!((matched_rows, raw_rows), (300, 301));
+                    }
+                };
+                assert_eq!(row.fields[1], Some(InputValue::Text(expected)));
+                assert!(row.timestamp.is_some());
+            });
+            assert_eq!((matched_rows, raw_rows), (pairs, pairs + 1));
         }
     }
 

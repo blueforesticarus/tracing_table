@@ -10,6 +10,8 @@ pub enum ValueKind {
     U128,
     Bool,
     BufferOffset,
+    /// Insertion index into the row's string buffer.
+    BufferIndex,
 }
 
 impl From<ValueData> for ValueKind {
@@ -28,6 +30,7 @@ impl From<&ValueData> for ValueKind {
             ValueData::U128(_) => ValueKind::U128,
             ValueData::Bool(_) => ValueKind::Bool,
             ValueData::BufferOffset(_) => ValueKind::BufferOffset,
+            ValueData::BufferIndex(_) => ValueKind::BufferIndex,
         }
     }
 }
@@ -42,8 +45,8 @@ impl ValueKind {
             ValueKind::I128 => size_of::<i128>(),
             ValueKind::U128 => size_of::<u128>(),
             ValueKind::Bool => size_of::<bool>(),
-            // String offsets occupy four bytes regardless of the platform pointer width.
-            ValueKind::BufferOffset => size_of::<u32>(),
+            // Both string references occupy four bytes regardless of pointer width.
+            ValueKind::BufferOffset | ValueKind::BufferIndex => size_of::<u32>(),
         }
     }
 }
@@ -58,6 +61,8 @@ pub enum ValueData {
     Bool(bool),
     /// A resolved byte offset. The caller supplies the buffer and resolves reads.
     BufferOffset(u32),
+    /// Insertion index; resolves through ExpandedBuffer::get_index.
+    BufferIndex(u32),
 }
 
 /// A value that can write its representation through the safe packing API.
@@ -85,6 +90,7 @@ impl WriteValue for ValueData {
             ValueData::U128(v) => packer.write_any_value(v, aligned),
             ValueData::Bool(v) => packer.write_any_value(v, aligned),
             ValueData::BufferOffset(offset) => packer.write_any_value(offset, aligned),
+            ValueData::BufferIndex(index) => packer.write_any_value(index, aligned),
         }
     }
 }
@@ -271,7 +277,7 @@ impl<'a> BytePacker<'a> {
         value
     }
 
-    /// String fields return offsets; this layer does not resolve referenced storage.
+    /// String fields return unresolved offsets or indices; this layer does not resolve referenced storage.
     pub unsafe fn read_value(&mut self, kind: ValueKind, aligned: bool) -> ValueData {
         unsafe {
             match kind {
@@ -282,6 +288,7 @@ impl<'a> BytePacker<'a> {
                 ValueKind::U128 => ValueData::U128(*self.read_any(aligned)),
                 ValueKind::Bool => ValueData::Bool(*self.read_any(aligned)),
                 ValueKind::BufferOffset => ValueData::BufferOffset(*self.read_any(aligned)),
+                ValueKind::BufferIndex => ValueData::BufferIndex(*self.read_any(aligned)),
             }
         }
     }
@@ -345,21 +352,32 @@ mod tests {
     }
 
     #[test]
-    fn buffer_offsets_round_trip_unaligned() {
-        let mut bytes = vec![0; 1 + ValueKind::BufferOffset.unit()];
-        let mut packer = BytePacker::new(&mut bytes);
-        packer.write_any_value(ValueData::Bool(true), false);
-        packer.write_any_value(ValueData::BufferOffset(70_000), false);
-        assert_eq!(bytes.len(), 5);
-        assert_eq!(u32::from_ne_bytes(bytes[1..].try_into().unwrap()), 70_000);
-        // The bool forces the following offset to be unaligned in a packed row.
-        let mut packer = BytePacker::new(&mut bytes);
-        unsafe {
-            packer.skip::<bool>(false);
-            assert!(matches!(
-                packer.read_value(ValueKind::BufferOffset, false),
-                ValueData::BufferOffset(70_000)
-            ));
+    fn buffer_references_round_trip_unaligned() {
+        for value in [
+            ValueData::BufferOffset(70_000),
+            ValueData::BufferIndex(70_000),
+        ] {
+            let kind = ValueKind::from(value);
+            let mut bytes = vec![0; 1 + kind.unit()];
+            let mut packer = BytePacker::new(&mut bytes);
+            packer.write_any_value(ValueData::Bool(true), false);
+            packer.write_any_value(value, false);
+            assert_eq!(bytes.len(), 5);
+            assert_eq!(u32::from_ne_bytes(bytes[1..].try_into().unwrap()), 70_000);
+            // A leading bool forces the reference to be unaligned in a packed row.
+            let mut packer = BytePacker::new(&mut bytes);
+            unsafe {
+                packer.skip::<bool>(false);
+                let decoded = packer.read_value(kind, false);
+                assert_eq!(
+                    std::mem::discriminant(&decoded),
+                    std::mem::discriminant(&value)
+                );
+                assert!(matches!(
+                    decoded,
+                    ValueData::BufferOffset(70_000) | ValueData::BufferIndex(70_000)
+                ));
+            }
         }
     }
 }

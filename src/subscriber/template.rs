@@ -518,6 +518,17 @@ pub struct CompiledTemplate {
 }
 
 impl CompiledTemplate {
+    /// Captures already contain rendered formatting. Concatenate without formatting again.
+    pub fn render(&self, captures: &[&str]) -> String {
+        assert_eq!(captures.len(), self.field_names.len());
+        let mut output = self.literals[0].clone();
+        for (capture, literal) in captures.iter().zip(&self.literals[1..]) {
+            output.push_str(capture);
+            output.push_str(literal);
+        }
+        output
+    }
+
     /// Compile once per callsite. Adjacent placeholders cannot be separated, so
     /// `{a}{b}` becomes one anonymous field. Escaped braces remain literal text.
     pub fn compile(format: &str) -> Result<Self, &'static str> {
