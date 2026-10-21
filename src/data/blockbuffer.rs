@@ -34,6 +34,9 @@ pub struct BlockCache {
     // NOTE: this could be made contiguous, since frames don't change size after being compacted.
     pub ring: Vec<Data>,
 
+    /// Preserve absolute block references when eviction removes a prefix.
+    pub offset: usize,
+
     // starting index of active frame
     pub count: usize,
 
@@ -52,7 +55,14 @@ pub struct Data {
     pub index: usize,
     /// BufferCollection ID shared by every string field in this chunk.
     pub string_buffer: usize,
-    timestamp: Range<usize>,
+    pub(crate) timestamp: Range<usize>,
+}
+
+/// Dropping chunks must preserve the retained suffix and protect the active chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropChunkError {
+    AlreadyDropped,
+    NotOldest,
 }
 
 impl BlockCache {
@@ -62,6 +72,7 @@ impl BlockCache {
             frame_size_max: max_cap,
             active: Frame::new(unit, start_cap),
             ring: Vec::new(),
+            offset: 0,
             timestamp: Range { start: 0, end: 0 },
             count: 1,
             string_buffer: 0,
@@ -115,6 +126,21 @@ impl BlockCache {
         self.allocate().0.copy_from_slice(data);
         self.update_mask_after_append();
         self.compute_timestamp(ts, None);
+    }
+
+    /// Drop the oldest completed chunk by its first row's absolute index.
+    /// Reject stale indexes and later/active chunks without changing the cache.
+    pub fn drop_chunk(&mut self, index: usize) -> Result<(), DropChunkError> {
+        let oldest = self.ring.first().map_or(self.count, |chunk| chunk.index);
+        if index < oldest {
+            return Err(DropChunkError::AlreadyDropped);
+        }
+        if self.ring.is_empty() || index != oldest {
+            return Err(DropChunkError::NotOldest);
+        }
+        self.ring.remove(0);
+        self.offset += 1;
+        Ok(())
     }
 
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<Row<'a>> {

@@ -201,6 +201,8 @@ impl RecordingLayer {
                 let mut strings = None;
                 let mut string_id = None;
                 let mut rows = arch.data.iter();
+                // Eviction removes prefixes; exported IDs must still match span references.
+                let first_index = arch.data.ring.first().map_or(arch.data.count, |b| b.index);
                 let mut index = 0;
                 while let Some(bytes) = rows.next() {
                     let block = ends.partition_point(|&end| end <= index);
@@ -227,14 +229,14 @@ impl RecordingLayer {
                             }
                         })
                         .collect();
-                    let block = block + 1;
+                    let block = block + arch.data.offset + 1;
                     record(
                         &mut out,
                         [
                             ("type", "row".into()),
                             ("callsite", callsite.id.into()),
                             ("archetype", arch.id.into()),
-                            ("index", (index + 1).into()),
+                            ("index", (index + first_index).into()),
                             ("block", block.into()),
                             ("header", bytes[..header_len].to_vec().into()),
                             ("fields", MpValue::Array(fields)),

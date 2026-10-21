@@ -269,7 +269,8 @@ impl CompressedBuffer {
 #[derive(Debug, Default)]
 pub struct BufferCollection {
     pub active: Buffer,
-    compressed: VecDeque<CompressedBuffer>,
+    // Eviction inspects stored sizes without expanding the buffers.
+    pub(crate) compressed: VecDeque<CompressedBuffer>,
     offset: usize,
 }
 

@@ -32,6 +32,8 @@ use crate::data::{
 };
 
 mod dump;
+// Optional embedded templates are loaded only when first queried.
+pub mod template;
 
 /// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
 #[rustfmt::skip]
@@ -54,6 +56,9 @@ pub struct PerCallsiteData {
     // Hopefully will be only one field
     pub cache: Vec<PerArchData>,
     lookup: HashMap<Archetype, usize>,
+    // added to executable symbols by post compile tool, or checked against filesystem in development
+    // compile_template:
+    // local_template:
 }
 
 impl PerCallsiteData {
@@ -98,8 +103,18 @@ pub struct PerArchData {
 
 // TODO this and cycle_if_needed ought to be next to each other.
 impl PerArchData {
+    /// Stored bytes for all active/compressed chunks and string buffers, counted
+    /// once each. Keep sizing here so it can be precomputed later without changing eviction.
+    fn storage_size(&self) -> usize {
+        let stats = self.data.compression_ratio() + self.strings.compression_ratio();
+        stats.compressed + stats.overhead + stats.overalloc
+    }
+
     /// Keep message-chunk policy here; BufferCollection only knows how to rotate.
-    fn prepare_chunk(&mut self) {
+    fn prepare_chunk(&mut self) -> bool {
+        // Check caps only on initial allocation, frame growth, or chunk rollover.
+        let allocated = self.data.active.length == self.data.active.capacity()
+            || (self.data.count == 1 && self.data.active.length == 0);
         self.data.cycle_if_needed();
         // Only an empty chunk can change buffers, regardless of who cycled it.
         if self.data.active.length == 0 {
@@ -114,6 +129,7 @@ impl PerArchData {
             self.chunk_string_start = self.strings.active.byte_len();
             self.data.string_buffer = self.strings.active_index();
         }
+        allocated
     }
 }
 
@@ -249,6 +265,10 @@ pub struct RecordingLayer {
     /// TODO could be automatic based on time between messages.
     pub timestamp_bit_shift: u8,
 
+    /// Retained chunk/string storage limits in bytes; active storage is protected.
+    pub global_memory_cap: usize,
+    pub callsite_memory_cap: usize,
+
     /// XXX an actual problem with our system is that accurate log ordering cannot be recreated at the moment. Timestamps can be equal and we dont have ordering info across across archetypes
     /// we probably also want thread number in the log somewhere
     // pub last_ts: usize,
@@ -264,6 +284,8 @@ impl RecordingLayer {
             span_id_counter: 1.into(),
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             timestamp_bit_shift: 3,
+            global_memory_cap: 20 * 1024 * 1024,
+            callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
             system_time: SystemTime::now(),
         }
@@ -341,6 +363,98 @@ impl RecordingLayer {
                 CompressionStats::default(), /*TODO better estimate overhead */
                 Add::add,
             )
+    }
+
+    /// After a frame allocation, enforce the allocating callsite's cap first,
+    /// then the global cap. Active chunks and active string buffers are protected.
+    fn drop_old_chunks(&self, callsite: u64) {
+        // Copy handles, not lock guards. Each scan holds just one callsite read lock;
+        // deletion takes only the selected callsite's write lock.
+        let sites: Vec<_> = self.callsites.read().values().cloned().collect();
+        let bytes = |s: CompressionStats| s.compressed + s.overhead + s.overalloc;
+        loop {
+            let mut total = 0;
+            let mut local = None;
+            let mut global = None;
+            let mut oldest = usize::MAX;
+            let mut best_score = -1.0;
+            for (site_index, shared) in sites.iter().enumerate() {
+                let site = shared.read();
+                let size: usize = site.cache.iter().map(PerArchData::storage_size).sum();
+                total += size;
+                for (arch_index, arch) in site.cache.iter().enumerate() {
+                    let Some(chunk) = arch.data.ring.first() else {
+                        continue;
+                    };
+                    let candidate = (site_index, arch_index, chunk.index);
+                    // The per-callsite cap chooses the oldest chunk across its archetypes.
+                    if site.id == callsite
+                        && size > self.callsite_memory_cap
+                        && (local.is_none() || chunk.timestamp.start < oldest)
+                    {
+                        oldest = chunk.timestamp.start;
+                        local = Some(candidate);
+                    }
+                    // Global candidates are each archetype's oldest chunk. Buffer IDs
+                    // increase with chunk age, so users of this buffer form a prefix.
+                    let buffer_id = chunk.string_buffer;
+                    let users = arch
+                        .data
+                        .ring
+                        .partition_point(|c| c.string_buffer == buffer_id)
+                        + usize::from(arch.data.string_buffer == buffer_id);
+                    let buffer_bytes = if buffer_id == arch.strings.active_index() {
+                        bytes(arch.strings.active.compression_ratio())
+                    } else {
+                        bytes(
+                            arch.strings.compressed[buffer_id - arch.strings.offset()]
+                                .compression_ratio(),
+                        )
+                    };
+                    let duration = chunk
+                        .timestamp
+                        .end
+                        .saturating_sub(chunk.timestamp.start)
+                        .max(1);
+                    // Prefer more stored bytes per timestamp tick, charging only this
+                    // chunk's share of its buffer. Zero-duration chunks use one tick.
+                    let score = (size_of_val(chunk.data.as_ref()) as f64
+                        + size_of_val(chunk) as f64
+                        + buffer_bytes as f64 / users as f64)
+                        / duration as f64;
+                    if score > best_score {
+                        best_score = score;
+                        global = Some(candidate);
+                    }
+                }
+            }
+            let candidate = local.or_else(|| {
+                if total > self.global_memory_cap {
+                    global
+                } else {
+                    None
+                }
+            });
+            // Active storage alone may exceed a cap; stop when no completed chunks remain.
+            let Some((site_index, arch_index, index)) = candidate else {
+                break;
+            };
+
+            // Aquire write lock so we can delete it.
+            let mut site = sites[site_index].write();
+            let arch = &mut site.cache[arch_index];
+            // Another sweep may have removed the candidate; the cache validates it.
+            if arch.data.drop_chunk(index).is_err() {
+                continue;
+            }
+            // Release frozen buffers only after their last chunk is gone. With no
+            // completed chunks left, discard_before(active_index) still keeps the active buffer.
+            let new_oldest = arch.data.ring.first();
+            let first_buffer = new_oldest
+                .map(|chunk| chunk.string_buffer)
+                .unwrap_or(arch.strings.active_index());
+            arch.strings.discard_before(first_buffer);
+        }
     }
 }
 
@@ -506,10 +620,12 @@ where
         let id: SpanId = *ext.get_mut().unwrap();
         let fields: Option<&mut FieldValues> = ext.get_mut();
 
-        let mut callsite_data = self.register(ctx.metadata());
-        let callsite_data = callsite_data.deref_mut();
+        let mut callsite_guard = self.register(ctx.metadata());
+        let callsite_data = callsite_guard.deref_mut();
+        let callsite = callsite_data.id;
         callsite_data.finished_count += 1;
 
+        let mut allocated = false;
         let extra_fields = if let Some(fields) = fields {
             callsite_data.last_archetype.field_types.clear();
             callsite_data.last_archetype.field_types.extend(
@@ -528,7 +644,7 @@ where
             let arch = callsite_data.get_arch();
             let arch = &mut callsite_data.cache[arch];
 
-            arch.prepare_chunk();
+            allocated = arch.prepare_chunk();
             let (data, _index) = arch.data.allocate();
             let mut data = BytePacker::new(data);
             // Write the header by value through its verified NoUninit implementation.
@@ -549,7 +665,7 @@ where
             // allocate() can roll over the active block, so capture its ordinal afterward.
             SpanFieldsRef {
                 archetype: arch.id,
-                block: u32::try_from(arch.data.ring.len() + 1)
+                block: u32::try_from(arch.data.offset + arch.data.ring.len() + 1)
                     .expect("span update block exceeds u32"),
             }
         } else {
@@ -557,8 +673,8 @@ where
         };
         {
             let data = &mut callsite_data.cache[id.archetype as usize].data;
-            {
-                let mut row = data.get_mut(id.index as usize).unwrap();
+            // A long-lived span may close after its start chunk has been evicted.
+            let retained = if let Some(mut row) = data.get_mut(id.index as usize) {
                 let row = row.get_mut();
                 let mut packer = BytePacker::new(row);
                 packer.skip::<PackedTimestamp>(false);
@@ -567,8 +683,17 @@ where
                 if let Some(f) = follow_from {
                     packer.write_any_value(f, false)
                 }
+                true
+            } else {
+                false
+            };
+            if retained {
+                data.compute_timestamp(time.value as usize, Some(id.index as usize));
             }
-            data.compute_timestamp(time.value as usize, Some(id.index as usize));
+        }
+        drop(callsite_guard);
+        if allocated {
+            self.drop_old_chunks(callsite);
         }
     }
 
@@ -591,8 +716,8 @@ where
             }
         }
 
-        let mut callsite_data = self.register(attrs.metadata());
-        let callsite_data = callsite_data.deref_mut();
+        let mut callsite_guard = self.register(attrs.metadata());
+        let callsite_data = callsite_guard.deref_mut();
         callsite_data.call_count += 1;
 
         callsite_data.field_value_scratchpad.values.fill(None);
@@ -627,7 +752,7 @@ where
         // Id not used for events
 
         // all that is left is to write to the store.
-        arch.prepare_chunk();
+        let allocated = arch.prepare_chunk();
         let (data, index) = arch.data.allocate();
 
         let id = SpanId {
@@ -660,6 +785,10 @@ where
         }
         arch.data.update_mask_after_append();
         arch.data.compute_timestamp(time.value as usize, None);
+        drop(callsite_guard);
+        if allocated {
+            self.drop_old_chunks(callsite);
+        }
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
@@ -680,8 +809,8 @@ where
         let is_log_compat = event.is_log();
         let metadata = log_callsite_adapter(event);
 
-        let mut callsite_data = self.register(metadata);
-        let callsite_data = callsite_data.deref_mut();
+        let mut callsite_guard = self.register(metadata);
+        let callsite_data = callsite_guard.deref_mut();
         callsite_data.call_count += 1;
 
         // event id's currently not stored. since nothing refers to them
@@ -717,7 +846,7 @@ where
         // Id not used for events
 
         // all that is left is to write to the store.
-        arch.prepare_chunk();
+        let allocated = arch.prepare_chunk();
         let (data, index) = arch.data.allocate();
 
         let _id = SpanId {
@@ -745,6 +874,10 @@ where
         }
         arch.data.update_mask_after_append();
         arch.data.compute_timestamp(time.value as usize, None);
+        drop(callsite_guard);
+        if allocated {
+            self.drop_old_chunks(callsite);
+        }
     }
 }
 
@@ -849,6 +982,89 @@ mod test {
     use tracing_subscriber::{Registry, layer::SubscriberExt};
 
     use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
+
+    #[test]
+    fn chunk_eviction_respects_caps_and_buffer_ownership() {
+        use crate::data::blockbuffer::{BlockCache, DropChunkError};
+
+        // Exercise rejection paths alongside the eviction coverage below.
+        let mut cache = BlockCache::new(8, 2, 2);
+        for ts in 1..=5 {
+            cache.push(&[0; 8], ts);
+        }
+        assert_eq!(cache.drop_chunk(3), Err(DropChunkError::NotOldest));
+        assert_eq!(cache.drop_chunk(1), Ok(()));
+        assert_eq!(cache.drop_chunk(1), Err(DropChunkError::AlreadyDropped));
+        assert_eq!(cache.offset, 1);
+        assert_eq!(cache.drop_chunk(5), Err(DropChunkError::NotOldest));
+
+        for global in [false, true] {
+            let recorder = Arc::new(RecordingLayer::new());
+            tracing::subscriber::with_default(
+                Registry::default().with(LocalRecordingLayer(recorder.clone())),
+                || {
+                    // Two archetypes belonging to the same callsite.
+                    for value in [Some(1u64), None] {
+                        tracing::info!(value);
+                    }
+                },
+            );
+            let mut recorder = Arc::try_unwrap(recorder).ok().unwrap();
+            let shared = recorder.callsites.read().values().next().unwrap().clone();
+            let id = shared.read().id;
+            {
+                let mut site = shared.write();
+                for (i, arch) in site.cache.iter_mut().enumerate() {
+                    let unit = arch.archetype.unit();
+                    arch.data = BlockCache::new(unit, 2, 2);
+                    arch.strings
+                        .active
+                        .add_string(&"shared payload".repeat(100));
+                    // The older archetype shares one buffer across two longer chunks.
+                    for chunk in 0..if i == 0 { 2 } else { 1 } {
+                        let start = 1 + i * 2000 + chunk * 100;
+                        arch.data.push(&vec![0; unit], start);
+                        arch.data
+                            .push(&vec![255; unit], start + if i == 0 { 100 } else { 1 });
+                        arch.data.cycle_if_needed();
+                    }
+                    arch.strings.rotate(false);
+                    arch.data.string_buffer = arch.strings.active_index();
+                    arch.strings.active.add_string("protected");
+                    arch.data.push(&vec![0; unit], 4000);
+                }
+            }
+            let total: usize = shared
+                .read()
+                .cache
+                .iter()
+                .map(super::PerArchData::storage_size)
+                .sum();
+            if global {
+                recorder.global_memory_cap = total - 1;
+            } else {
+                recorder.callsite_memory_cap = total - 1;
+            }
+            recorder.drop_old_chunks(id);
+            {
+                let site = shared.read();
+                let lengths: Vec<_> = site.cache.iter().map(|arch| arch.data.ring.len()).collect();
+                // Local eviction chooses oldest; global eviction chooses size / duration.
+                assert_eq!(lengths, if global { vec![2, 0] } else { vec![1, 1] });
+                assert!(site.cache[0].strings.get(0).is_some());
+                assert_eq!(site.cache[1].strings.get(0).is_none(), global);
+            }
+            recorder.callsite_memory_cap = 0;
+            recorder.global_memory_cap = 0;
+            recorder.drop_old_chunks(id);
+            for arch in &shared.read().cache {
+                assert!(arch.data.ring.is_empty());
+                assert!(arch.strings.get(0).is_none());
+                assert_eq!(arch.data.active.length, 1);
+                assert_eq!(arch.strings.active.get_index(0), Some("protected"));
+            }
+        }
+    }
 
     #[test]
     fn log_and_query() {
