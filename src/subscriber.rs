@@ -179,7 +179,7 @@ impl PerArchData {
                     .rotate_with_level(false, string_compression_level);
             }
             self.chunk_string_start = self.strings.active.byte_len();
-            self.data.active_descriptor.string_buffer = self.strings.active_index();
+            self.data.active_metadata.string_buffer = self.strings.active_index();
         }
         allocated
     }
@@ -280,7 +280,7 @@ pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static>
     })
 }
 
-/// Row-header time: zigzag offset from the block's immutable timestamp.start,
+/// Row-header time: unsigned offset from the block's immutable timestamp.start,
 /// in ticks of 1 << RecordingLayer::timestamp_bit_shift nanoseconds.
 /// Span end slots store duration + 1 instead; zero marks a still-open span.
 pub type PackedTimestamp = u64;
@@ -318,10 +318,6 @@ pub struct RecordingLayer {
     /// TODO could be automatic based on time between messages.
     pub timestamp_bit_shift: u8,
 
-    /// Permit row timestamps earlier than their block's fixed origin. Defaults
-    /// to false (panic); signed offsets always use the same zigzag wire layout.
-    pub allow_negative_timestamp_offsets: bool,
-
     /// Used for newly registered callsites; configure before recording.
     pub string_storage: StringStorage,
 
@@ -352,7 +348,6 @@ impl RecordingLayer {
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             last_event: Mutex::new(None),
             timestamp_bit_shift: 10,
-            allow_negative_timestamp_offsets: false,
             string_storage: StringStorage::Offset,
             // Preserve the explicit flex override while defaulting to HC3.
             string_compression_level: match std::env::var("STRING_COMPRESSION_LEVEL").as_deref() {
@@ -503,7 +498,7 @@ impl RecordingLayer {
                 let size: usize = site.cache.iter().map(PerArchData::storage_size).sum();
                 total += size;
                 for (arch_index, arch) in site.cache.iter().enumerate() {
-                    let Some(chunk) = arch.data.ring.first() else {
+                    let Some(chunk) = arch.data.ring.front() else {
                         continue;
                     };
                     let candidate = (site_index, arch_index, chunk.descriptor.index);
@@ -517,17 +512,18 @@ impl RecordingLayer {
                     }
                     // Global candidates are each archetype's oldest chunk. Buffer IDs
                     // increase with chunk age, so users of this buffer form a prefix.
-                    let buffer_id = chunk.descriptor.string_buffer;
+                    let buffer_id = chunk.data.metadata.string_buffer;
                     let users = arch
                         .data
                         .ring
-                        .partition_point(|c| c.descriptor.string_buffer == buffer_id)
-                        + usize::from(arch.data.active_descriptor.string_buffer == buffer_id);
+                        .partition_point(|c| c.data.metadata.string_buffer == buffer_id)
+                        + usize::from(arch.data.active_metadata.string_buffer == buffer_id);
                     let buffer_bytes = if buffer_id == arch.strings.active_index() {
                         bytes(arch.strings.active.compression_ratio())
                     } else {
                         bytes(
-                            arch.strings.compressed[buffer_id - arch.strings.offset()]
+                            arch.strings.compressed
+                                [(buffer_id.0 - arch.strings.offset().0) as usize]
                                 .compression_ratio(),
                         )
                     };
@@ -539,7 +535,7 @@ impl RecordingLayer {
                         .max(1);
                     // Prefer more stored bytes per timestamp tick, charging only this
                     // chunk's share of its buffer. Zero-duration chunks use one tick.
-                    let score = (size_of_val(chunk.data.as_ref()) as f64
+                    let score = (chunk.data.allocation_size() as f64
                         + size_of_val(chunk) as f64
                         + buffer_bytes as f64 / users as f64)
                         / duration as f64;
@@ -570,9 +566,9 @@ impl RecordingLayer {
             }
             // Release frozen buffers only after their last chunk is gone. With no
             // completed chunks left, discard_before(active_index) still keeps the active buffer.
-            let new_oldest = arch.data.ring.first();
+            let new_oldest = arch.data.ring.front();
             let first_buffer = new_oldest
-                .map(|chunk| chunk.descriptor.string_buffer)
+                .map(|chunk| chunk.data.metadata.string_buffer)
                 .unwrap_or(arch.strings.active_index());
             arch.strings.discard_before(first_buffer);
         }
@@ -821,9 +817,7 @@ impl RecordingLayer {
         let index = site.get_arch(self.message_block_min_rows);
         let arch = &mut site.cache[index];
         let allocated = arch.prepare_chunk(self.string_compression_level);
-        let (bytes, index, timestamp_offset) = arch
-            .data
-            .allocate(time.value, self.allow_negative_timestamp_offsets);
+        let (bytes, index, timestamp_offset) = arch.data.allocate(time.value);
         let id = SpanId {
             index: index as u64,
             callsite: callsite as u32,
@@ -911,8 +905,7 @@ impl RecordingLayer {
             let arch = &mut callsite_data.cache[arch];
 
             allocated = arch.prepare_chunk(self.string_compression_level);
-            // Update rows carry no timestamp offset, so arrival order is unrestricted.
-            let (data, _index, _) = arch.data.allocate(time.value, true);
+            let (data, _index, _) = arch.data.allocate(time.value);
             let mut data = BytePacker::new(data);
             // Write the header by value through its verified NoUninit implementation.
             data.write_any_value(id, false); // end data points to start data
@@ -1114,6 +1107,7 @@ mod test {
     use tracing::{Level, Metadata, debug, info, span};
     use tracing_subscriber::{Registry, layer::SubscriberExt};
 
+    use crate::data::stringbuffer::StringBufferId;
     use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
 
     // Shared static metadata exercises both row headers without a seed subscriber.
@@ -1136,7 +1130,6 @@ mod test {
         use crate::data::blockbuffer::BlockCache;
         for metadata in timestamp_metadata() {
             let mut recorder = RecordingLayer::new();
-            recorder.allow_negative_timestamp_offsets = true;
             recorder.global_memory_cap = usize::MAX;
             recorder.callsite_memory_cap = usize::MAX;
             recorder.record_start(metadata, timestamp(0), None, false, |_| {});
@@ -1147,7 +1140,7 @@ mod test {
                 // Tiny fixed-capacity blocks force two archives and an active tail.
                 arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
             }
-            let times = [1_000, 999, 1_005, 5_000, 4_990];
+            let times = [1_000, 1_001, 1_005, 5_000, 4_990];
             let spans: Vec<_> = times
                 .into_iter()
                 .map(|ts| recorder.record_start(metadata, timestamp(ts), None, false, |_| {}))
@@ -1177,7 +1170,7 @@ mod test {
                 offsets.push(u64::from_ne_bytes(row[..8].try_into().unwrap()));
             }
             drop(raw);
-            assert_eq!(offsets, [0, 1, 0, 7_990, 0]);
+            assert_eq!(offsets, [0, 1, 0, 3_995, 0]);
             assert_eq!(data.ring[0].descriptor.timestamp.start, 1_000);
             assert_eq!(data.ring[1].descriptor.timestamp.start, 1_005);
             assert_eq!(data.active_descriptor.timestamp.start, 4_990);
@@ -1193,10 +1186,9 @@ mod test {
     }
 
     #[test]
-    fn earlier_block_timestamp_panics_by_default_without_allocating_a_row() {
+    fn earlier_block_timestamp_panics_without_allocating_a_row() {
         let metadata = timestamp_metadata()[0];
         let recorder = RecordingLayer::new();
-        assert!(!recorder.allow_negative_timestamp_offsets);
         recorder.record_start(metadata, timestamp(1_000), None, false, |_| {});
         let shared = recorder.callsites.read().values().next().unwrap().clone();
         // Rejection must leave the existing origin and row count intact.
@@ -1402,7 +1394,7 @@ mod test {
                         arch.data.cycle_if_needed();
                     }
                     arch.strings.rotate(false);
-                    arch.data.active_descriptor.string_buffer = arch.strings.active_index();
+                    arch.data.active_metadata.string_buffer = arch.strings.active_index();
                     arch.strings.active.add_string("protected");
                     arch.data.push(&vec![0; unit], 4000);
                 }
@@ -1424,15 +1416,18 @@ mod test {
                 let lengths: Vec<_> = site.cache.iter().map(|arch| arch.data.ring.len()).collect();
                 // Local eviction chooses oldest; global eviction chooses size / duration.
                 assert_eq!(lengths, if global { vec![2, 0] } else { vec![1, 1] });
-                assert!(site.cache[0].strings.get(0).is_some());
-                assert_eq!(site.cache[1].strings.get(0).is_none(), global);
+                assert!(site.cache[0].strings.get(StringBufferId(0)).is_some());
+                assert_eq!(
+                    site.cache[1].strings.get(StringBufferId(0)).is_none(),
+                    global
+                );
             }
             recorder.callsite_memory_cap = 0;
             recorder.global_memory_cap = 0;
             recorder.drop_old_chunks(id);
             for arch in &shared.read().cache {
                 assert!(arch.data.ring.is_empty());
-                assert!(arch.strings.get(0).is_none());
+                assert!(arch.strings.get(StringBufferId(0)).is_none());
                 assert_eq!(arch.data.active.length, 1);
                 assert_eq!(arch.strings.active.get_index(0), Some("protected"));
             }
@@ -1492,15 +1487,18 @@ mod test {
         arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.prepare_chunk(recorder.string_compression_level);
-        assert_eq!(arch.data.active_descriptor.string_buffer, 0);
+        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(0));
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.data.cycle_if_needed();
         assert_eq!(arch.data.active.length, 0);
         arch.prepare_chunk(recorder.string_compression_level);
         arch.prepare_chunk(recorder.string_compression_level); // Repeated preparation must not rotate again.
-        assert_eq!(arch.data.ring[0].descriptor.string_buffer, 0);
-        assert_eq!(arch.data.active_descriptor.string_buffer, 1);
-        let old = arch.strings.get(0).unwrap();
+        assert_eq!(
+            arch.data.ring[0].data.metadata.string_buffer,
+            StringBufferId(0)
+        );
+        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(1));
+        let old = arch.strings.get(StringBufferId(0)).unwrap();
         assert_eq!(old.get_index(0), Some(text.as_str()));
     }
 }

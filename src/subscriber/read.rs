@@ -97,7 +97,7 @@ impl PerCallsiteData {
                 (id.callsite, id.archetype, id.index) == (span.callsite, span.archetype, span.index)
             };
             if let Some(frame) = update.data.ring.get(block) {
-                let mut rows = ArchivedFrameIter::new(&frame.data);
+                let mut rows = ArchivedFrameIter::new(&frame.data.frame);
                 while let Some(row) = rows.next() {
                     if matches(row) {
                         return Some(reference);
@@ -133,23 +133,29 @@ impl PerCallsiteData {
             let mut index = arch
                 .data
                 .ring
-                .first()
+                .front()
                 .map_or(arch.data.active_descriptor.index, |b| b.descriptor.index)
                 as u64;
             let frames = arch
                 .data
                 .ring
                 .iter()
-                .map(|b| (b.data.len(), &b.descriptor))
+                .map(|b| {
+                    (
+                        b.data.frame.len(),
+                        &b.descriptor,
+                        b.data.metadata.string_buffer,
+                    )
+                })
                 .chain(std::iter::once((
                     arch.data.active.length,
                     &arch.data.active_descriptor,
+                    arch.data.active_metadata.string_buffer,
                 )));
             let mut rows = arch.data.iter();
             let mut strings = None;
             let mut string_id = None;
-            for (count, descriptor) in frames {
-                let buffer_id = descriptor.string_buffer;
+            for (count, descriptor, buffer_id) in frames {
                 if count == 0 {
                     continue;
                 }

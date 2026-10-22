@@ -4,6 +4,7 @@ pub mod dataframe;
 pub mod dyntuple;
 
 // Strings live in per-archetype buffers, shared by consecutive message chunks.
+pub mod smallbox;
 pub mod stringbuffer;
 
 // The experimental smartstring implementation remains disabled.

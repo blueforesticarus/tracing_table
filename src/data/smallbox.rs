@@ -1,0 +1,242 @@
+//! CODEX GENERATED: reviewed
+//! Thin ownership for slice-tailed values: a u32 length lives before the value.
+use std::{
+    alloc::{self, Layout},
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    ptr::{self, NonNull, Pointee},
+};
+
+/// One-pointer owner for DSTs whose metadata is a slice length fitting in u32.
+#[repr(C, packed(4))]
+pub struct SmallBox<T: ?Sized + Pointee<Metadata = usize>> {
+    pointer: NonNull<u8>,
+    owner: PhantomData<T>,
+}
+
+// SAFETY: Ownership, borrowing and mutation follow Box<T>; only the stored
+// pointer representation differs. No shared mutation is exposed.
+unsafe impl<T: ?Sized + Pointee<Metadata = usize> + Send> Send for SmallBox<T> {}
+unsafe impl<T: ?Sized + Pointee<Metadata = usize> + Sync> Sync for SmallBox<T> {}
+
+impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
+    /// Collocate an owning header with a boxed DST tail.
+    ///
+    /// SAFETY: T must have plain repr(C), with no extra packing/alignment, and
+    /// exactly two fields, H followed by U. Its metadata is the tail's slice length.
+    pub(crate) unsafe fn with_header<H, U: ?Sized + Pointee<Metadata = usize>>(
+        header: H,
+        tail: Box<U>,
+    ) -> Self {
+        let length = ptr::metadata(tail.as_ref());
+        u32::try_from(length).expect("SmallBox length exceeds u32");
+        let tail_layout = Layout::for_value(tail.as_ref());
+        let (value_layout, tail_offset) = Layout::new::<H>().extend(tail_layout).unwrap();
+        let (layout, offset) = Self::layout(value_layout.pad_to_align());
+        let allocation = Allocation::new(layout);
+        // SAFETY: The caller guarantees the field layout. Move both owners into
+        // the new allocation; free the old tail storage without dropping its
+        // moved fields. The guard frees storage if construction unwinds.
+        unsafe {
+            let value = allocation.0.add(offset);
+            let source = Box::into_raw(tail);
+            value.cast::<H>().write(header);
+            ptr::copy_nonoverlapping(
+                source.cast::<u8>(),
+                value.add(tail_offset),
+                tail_layout.size(),
+            );
+            if tail_layout.size() != 0 {
+                alloc::dealloc(source.cast(), tail_layout);
+            }
+            let owner = Self::from_raw(ptr::from_raw_parts_mut(value, length));
+            std::mem::forget(allocation);
+            owner
+        }
+    }
+
+    /// Full retained allocation, including length prefix and alignment padding.
+    pub fn allocation_size(&self) -> usize {
+        Self::layout(Layout::for_value(&**self)).0.size()
+    }
+
+    pub(crate) fn layout(value: Layout) -> (Layout, usize) {
+        let (layout, offset) = Layout::new::<u32>().extend(value).unwrap();
+        (layout.pad_to_align(), offset)
+    }
+
+    /// Adopt an initialized value allocated using Self::layout. The four bytes
+    /// immediately before the value must be writable; its slice length must fit u32.
+    /// The caller transfers sole ownership of both value and allocation.
+    unsafe fn from_raw(value: *mut T) -> Self {
+        let length = u32::try_from(ptr::metadata(value)).expect("SmallBox length exceeds u32");
+        let pointer = value.cast::<u8>();
+        // SAFETY: The caller reserved the prefix in this same allocation.
+        unsafe {
+            pointer
+                .sub(size_of::<u32>())
+                .cast::<u32>()
+                .write_unaligned(length);
+        }
+        Self {
+            pointer: unsafe { NonNull::new_unchecked(pointer) },
+            owner: PhantomData,
+        }
+    }
+
+    /// Move a boxed slice-tailed value into a thin allocation without cloning T.
+    pub fn from_box(value: Box<T>) -> Self {
+        let length = ptr::metadata(value.as_ref());
+        u32::try_from(length).expect("SmallBox length exceeds u32");
+        let value_layout = Layout::for_value(value.as_ref());
+        let (layout, offset) = Self::layout(value_layout);
+        let allocation = Allocation::new(layout);
+        // SAFETY: The layout aligns T and reserves its full storage plus prefix.
+        // Raw copying moves ownership; the source allocation is freed without
+        // dropping its moved value. Zero-sized Box values have no allocation.
+        unsafe {
+            let source = Box::into_raw(value);
+            let destination = allocation.0.add(offset);
+            ptr::copy_nonoverlapping(source.cast::<u8>(), destination, value_layout.size());
+            if value_layout.size() != 0 {
+                alloc::dealloc(source.cast(), value_layout);
+            }
+            let owner = Self::from_raw(ptr::from_raw_parts_mut(destination, length));
+            std::mem::forget(allocation);
+            owner
+        }
+    }
+
+    fn raw(&self) -> *mut T {
+        // SAFETY: Every constructor stores the immutable length immediately
+        // before the aligned value. Prefix padding accommodates higher alignments.
+        let length = unsafe {
+            self.pointer
+                .as_ptr()
+                .sub(size_of::<u32>())
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        ptr::from_raw_parts_mut(self.pointer.as_ptr(), length as usize)
+    }
+}
+
+impl<T: ?Sized + Pointee<Metadata = usize>> Deref for SmallBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: This owner keeps T alive; &self allows shared access only.
+        unsafe { &*self.raw() }
+    }
+}
+
+impl<T: ?Sized + Pointee<Metadata = usize>> DerefMut for SmallBox<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: The owner is not Clone/Copy, and &mut self ensures exclusivity.
+        unsafe { &mut *self.raw() }
+    }
+}
+
+impl<T: ?Sized + Pointee<Metadata = usize>> AsRef<T> for SmallBox<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+// Free even if the owned value's destructor unwinds.
+struct Allocation(*mut u8, Layout);
+impl Allocation {
+    fn new(layout: Layout) -> Self {
+        assert!(
+            layout.size() != 0,
+            "container allocation must include a header"
+        );
+        // SAFETY: Every caller reserves a nonempty, checked Layout.
+        let pointer = unsafe { alloc::alloc(layout) };
+        if pointer.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
+        Self(pointer, layout)
+    }
+}
+
+/// Allocate a conventional boxed DST while keeping raw ownership logic here.
+/// SAFETY: layout must match T with this length; initialize must leave T valid.
+/// If initialization panics, it must clean up any fields it already initialized.
+pub(crate) unsafe fn boxed_with<T: ?Sized + Pointee<Metadata = usize>>(
+    layout: Layout,
+    length: usize,
+    initialize: impl FnOnce(*mut T),
+) -> Box<T> {
+    let allocation = Allocation::new(layout);
+    let raw = ptr::from_raw_parts_mut(allocation.0, length);
+    initialize(raw);
+    // SAFETY: The caller's initializer has established the complete value.
+    let owner = unsafe { Box::from_raw(raw) };
+    std::mem::forget(allocation);
+    owner
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: This guard owns the allocation with its original layout.
+        unsafe {
+            alloc::dealloc(self.0, self.1);
+        }
+    }
+}
+
+impl<T: ?Sized + Pointee<Metadata = usize>> Drop for SmallBox<T> {
+    fn drop(&mut self) {
+        let raw = self.raw();
+        let (layout, offset) = Self::layout(Layout::for_value(&**self));
+        // SAFETY: Constructors allocate the prefix and T together. Drop T once,
+        // then release the whole allocation, including during destructor unwinding.
+        unsafe {
+            let _allocation = Allocation(self.pointer.as_ptr().sub(offset), layout);
+            ptr::drop_in_place(raw);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn thin_slices_preserve_alignment_mutation_and_owned_drops() {
+        #[repr(align(16))]
+        struct Tracked(Rc<Cell<usize>>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        for length in [0, 1, 7] {
+            let source: Box<[_]> = (0..length).map(|_| Tracked(drops.clone())).collect();
+            let mut value = SmallBox::from_box(source);
+            assert_eq!(value.len(), length);
+            assert_eq!(value.as_ptr() as usize % 16, 0);
+            if length != 0 {
+                value.swap(0, length - 1);
+            }
+        }
+        assert_eq!(drops.get(), 8);
+        assert_eq!(size_of::<SmallBox<[Tracked]>>(), size_of::<usize>());
+
+        #[repr(C)]
+        struct Combined {
+            header: Tracked,
+            tail: [Tracked],
+        }
+        let source: Box<[_]> = (0..7).map(|_| Tracked(drops.clone())).collect();
+        // SAFETY: Combined's repr(C) fields exactly match the header and tail.
+        let value: SmallBox<Combined> =
+            unsafe { SmallBox::with_header(Tracked(drops.clone()), source) };
+        assert_eq!(value.tail.len(), 7);
+        assert_eq!(&value.header as *const Tracked as usize % 16, 0);
+        drop(value);
+        assert_eq!(drops.get(), 16); // Both header and all moved tail owners drop once.
+    }
+}

@@ -391,6 +391,11 @@ impl CompressedBuffer {
     }
 }
 
+/// Absolute, zero-based ID within one BufferCollection; stable across eviction.
+#[repr(transparent)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StringBufferId(pub u32);
+
 /// Buffer IDs are absolute indexes: removing old buffers does not renumber survivors.
 /// The owner decides when to rotate and when no retained data refers to old buffers.
 #[derive(Debug, Default)]
@@ -402,12 +407,20 @@ pub struct BufferCollection {
 }
 
 impl BufferCollection {
-    pub fn active_index(&self) -> usize {
-        self.offset + self.compressed.len()
+    pub fn active_index(&self) -> StringBufferId {
+        StringBufferId(
+            u32::try_from(self.offset + self.compressed.len())
+                .expect("string buffer ID exceeds u32"),
+        )
     }
 
-    pub fn offset(&self) -> usize {
-        self.offset
+    pub fn offset(&self) -> StringBufferId {
+        StringBufferId(self.offset as u32)
+    }
+
+    /// Iterate retained frozen IDs without exposing deque-relative indexes.
+    pub fn archived_ids(&self) -> impl ExactSizeIterator<Item = StringBufferId> {
+        (self.offset as u32..self.active_index().0).map(StringBufferId)
     }
 
     /// Aggregate all retained buffers and collection storage, counting the
@@ -435,23 +448,23 @@ impl BufferCollection {
     }
 
     /// Freeze the active buffer and start an empty one, returning its ID.
-    pub fn rotate(&mut self, keep_index: bool) -> usize {
+    pub fn rotate(&mut self, keep_index: bool) -> StringBufferId {
         self.rotate_with_level(keep_index, None)
     }
 
     /// The recording layer chooses the encoder; buffer IDs and readers stay the same.
-    pub fn rotate_with_level(&mut self, keep_index: bool, level: Option<u32>) -> usize {
+    pub fn rotate_with_level(&mut self, keep_index: bool, level: Option<u32>) -> StringBufferId {
         self.compressed
             .push_back(std::mem::take(&mut self.active).compress_with_level(keep_index, level));
         self.active_index()
     }
 
     /// Decompress once per read batch; the active cache can be borrowed directly.
-    pub fn get(&self, index: usize) -> Option<Cow<'_, ExpandedBuffer>> {
+    pub fn get(&self, index: StringBufferId) -> Option<Cow<'_, ExpandedBuffer>> {
         if index == self.active_index() {
             return Some(Cow::Borrowed(&self.active));
         }
-        let Some(buffer) = index
+        let Some(buffer) = (index.0 as usize)
             .checked_sub(self.offset)
             .and_then(|i| self.compressed.get(i))
         else {
@@ -464,8 +477,10 @@ impl BufferCollection {
     }
 
     /// Drop completed buffers before this ID. The active buffer is always retained.
-    pub fn discard_before(&mut self, index: usize) {
-        let count = index.saturating_sub(self.offset).min(self.compressed.len());
+    pub fn discard_before(&mut self, index: StringBufferId) {
+        let count = (index.0 as usize)
+            .saturating_sub(self.offset)
+            .min(self.compressed.len());
         self.compressed.drain(..count);
         self.offset += count;
     }
@@ -512,9 +527,12 @@ mod tests {
             let site = site.read();
             let arch = &site.cache[0];
             assert_eq!(arch.data.ring.len(), 1);
-            assert_eq!(arch.data.ring[0].data.len(), 2);
-            assert_eq!(arch.data.ring[0].descriptor.string_buffer, 0);
-            assert_eq!(arch.data.active_descriptor.string_buffer, 1);
+            assert_eq!(arch.data.ring[0].data.frame.len(), 2);
+            assert_eq!(
+                arch.data.ring[0].data.metadata.string_buffer,
+                StringBufferId(0)
+            );
+            assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(1));
             assert_eq!(arch.strings.active.len(), 2);
             let mut rows = Vec::new();
             site.visit_rows(|row| rows.push(row.fields));
@@ -663,25 +681,38 @@ mod tests {
             buffers.active.add_string(text);
             buffers.rotate(false);
         }
+        // Typed iteration exposes absolute IDs, including after prefix eviction.
+        assert_eq!(
+            buffers.archived_ids().collect::<Vec<_>>(),
+            vec![StringBufferId(0), StringBufferId(1)]
+        );
         let before = buffers.compression_ratio();
         let removed = buffers.compressed[0].compression_ratio();
         let freed_bytes = buffers.compressed[0].byte_len();
-        buffers.discard_before(1);
+        buffers.discard_before(StringBufferId(1));
         let after = buffers.compression_ratio();
         assert_eq!(before.data - after.data, removed.data);
         // The removed deque slot becomes spare; only its boxed payload is freed.
         let allocated = |s: CompressionStats| s.compressed + s.overhead + s.overalloc;
         assert_eq!(allocated(before) - allocated(after), freed_bytes);
-        assert_eq!(buffers.offset(), 1);
-        assert!(buffers.get(0).is_none());
-        let retained = buffers.get(1).unwrap();
+        assert_eq!(buffers.offset(), StringBufferId(1));
+        assert_eq!(
+            buffers.archived_ids().collect::<Vec<_>>(),
+            vec![StringBufferId(1)]
+        );
+        assert!(buffers.get(StringBufferId(0)).is_none());
+        let retained = buffers.get(StringBufferId(1)).unwrap();
         assert_eq!(retained.get_index(0), Some("second"));
         drop(retained);
         // Even deleting all completed buffers must preserve the active ID.
-        buffers.discard_before(usize::MAX);
-        assert_eq!(buffers.active_index(), 2);
-        assert_eq!(buffers.rotate(true), 3);
-        assert!(buffers.get(2).unwrap().is_empty());
-        assert!(matches!(buffers.get(3), Some(Cow::Borrowed(_))));
+        buffers.discard_before(StringBufferId(u32::MAX));
+        assert_eq!(buffers.archived_ids().len(), 0);
+        assert_eq!(buffers.active_index(), StringBufferId(2));
+        assert_eq!(buffers.rotate(true), StringBufferId(3));
+        assert!(buffers.get(StringBufferId(2)).unwrap().is_empty());
+        assert!(matches!(
+            buffers.get(StringBufferId(3)),
+            Some(Cow::Borrowed(_))
+        ));
     }
 }

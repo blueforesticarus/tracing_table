@@ -1,5 +1,5 @@
 use std::{
-    alloc::{self, Layout},
+    alloc::Layout,
     clone,
     collections::{HashMap, HashSet},
     default,
@@ -18,6 +18,8 @@ use tracing::{
 };
 
 use super::CompressionStats;
+use super::blockbuffer::{ArchivedBlock, ArchivedFrame};
+use super::smallbox::{SmallBox, boxed_with};
 
 mod bitcompact;
 pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
@@ -26,6 +28,7 @@ pub enum AnyFrame<'a> {
     Frame(&'a mut Box<Frame>),
     Compact(&'a mut Box<CompactFrame>),
     BitCompact(&'a mut Box<BitCompactFrame>),
+    Archived(&'a mut SmallBox<ArchivedBlock>),
 }
 
 /// The edit changes omitted data and requires rebuilding; the frame is unchanged.
@@ -59,6 +62,18 @@ impl AnyFrame<'_> {
                 frame.uncompact(&mut unpacked);
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
                 **frame = BitCompactFrame::new_from(&unpacked);
+            }
+            Self::Archived(block) => {
+                if block.frame.try_write_row(index, row).is_ok() {
+                    return;
+                }
+                let mut unpacked = Frame::new(block.frame.unit(), block.frame.len());
+                block.frame.uncompact(&mut unpacked);
+                AnyFrame::Frame(&mut unpacked).write_row(index, row);
+                // Rebuilding replaces only the archive; Data's descriptor stays put.
+                let frame = ArchivedFrame::new_from(&unpacked);
+                let metadata = std::mem::take(&mut block.metadata);
+                **block = ArchivedBlock::new(frame, metadata);
             }
         }
     }
@@ -130,6 +145,14 @@ impl<'a> Row<'a> {
                 let slice = self.buffer.get_or_init(compact_frame.unit());
                 if !self.init {
                     compact_frame.read_row(self.index, slice);
+                    self.init = true;
+                }
+                slice
+            }
+            AnyFrame::Archived(block) => {
+                let slice = self.buffer.get_or_init(block.frame.unit());
+                if !self.init {
+                    block.frame.read_row(self.index, slice);
                     self.init = true;
                 }
                 slice
@@ -206,19 +229,14 @@ impl Frame {
             .expect("frame buffer size overflow");
         let layout = frame_allocation_layout(buffer_size);
 
-        // Allocate raw memory
-        let ptr = unsafe { alloc::alloc(layout) };
-        assert!(!ptr.is_null());
-
-        // Initialize the header
+        // SAFETY: The layout matches Frame's counters and trailing buffer.
+        // Only field initialization belongs here; allocation and ownership stay in smallbox.
         let mut v = unsafe {
-            let frame_ptr = ptr as *mut u8;
-            let frame_ptr: *mut Frame = std::ptr::from_raw_parts_mut(frame_ptr, buffer_size);
-            Box::from_raw(frame_ptr)
+            boxed_with(layout, buffer_size, |frame_ptr: *mut Frame| {
+                ptr::addr_of_mut!((*frame_ptr).unit).write(unit);
+                ptr::addr_of_mut!((*frame_ptr).length).write(0);
+            })
         };
-
-        v.length = 0;
-        v.unit = unit;
         v.buffer[..unit].fill(0); // Mask
         v
     }
@@ -414,18 +432,13 @@ impl CompactFrame {
             .expect("compact frame buffer size overflow");
         let layout = compact_frame_allocation_layout(buffer_size);
 
-        // Allocate raw memory
-        let ptr = unsafe { alloc::alloc(layout) };
-        assert!(!ptr.is_null());
-
-        // Cast the pointer
+        // SAFETY: The layout matches the narrow counters and trailing bytes.
         let v = unsafe {
-            let frame_ptr = ptr as *mut u8;
-            let frame_ptr: *mut CompactFrame = std::ptr::from_raw_parts_mut(frame_ptr, buffer_size);
-            // Initialize the narrow counters before exposing the typed owner.
-            ptr::addr_of_mut!((*frame_ptr).unit).write(stored_unit);
-            ptr::addr_of_mut!((*frame_ptr).length).write(stored_length);
-            Box::from_raw(frame_ptr)
+            boxed_with(layout, buffer_size, |frame_ptr: *mut CompactFrame| {
+                // Initialize the narrow counters before exposing the typed owner.
+                ptr::addr_of_mut!((*frame_ptr).unit).write(stored_unit);
+                ptr::addr_of_mut!((*frame_ptr).length).write(stored_length);
+            })
         };
 
         // TODO(soundness): Prevent safe reads of payload bytes until initialized.

@@ -1,3 +1,5 @@
+THIS FILE UNFORTIONATELY MIXES CODEX GENERATED DOCS AND HUMAN DOCS
+
 This crate implements an memory-efficient cache for tracing logs, with support for per-callsite rollover. 
 
 Archived frames use bit compaction by default. Build with `--no-default-features`
@@ -597,3 +599,45 @@ TODO: stride
 |---|---:|---:|
 | Frame headers/alignment | 298,443 B | 57,405 B |
 | Archive total | 8,600,133 B | 8,359,095 B |
+
+---
+
+descriptors are still 40B, data overhead 54B
+- spare slots (in block vecs) are 174K
+- we could move descriptor data to the heap, but this might fuck up alignment and slow indexing
+- we could remove the end ts, and use next block start ts. but this means no bounded span info
+
+- We move some data to the blocks heap allocation (for padding reasons and to save on spare vec slots.)
+- we define a SmallBox which takes up 8 bytes keeping size on the heap allocation as a u32. This saves 4 bytes nominally and another 8 bytes when null.
+
+> Descriptor: 24 B, down from 40 B. Keeps the row index and timestamp range.
+> Deque entries shrink from 56 B to 32 B.
+> CollocatedMetadata: 12 bytes moved from Descriptor
+> 4 bytes saved by SmallBox for frame, 8 bytes saved on null SpanFieldsRef
+> Heap padding increases by 12,554 B
+
+| Storage | Before | After | Reduction |
+|---|---:|---:|---:|
+| Archive metadata | 814,936 B | 680,722 B | 16.47% |
+| Archive including payload | 8,360,799 B | 8,226,585 B | 1.61% |
+| Measured resident containers | 12,609,931 B | 12,475,717 B | 1.06% |
+
+*this might be overoptimizing. we are talking on the order of ~50kb of data.*
+*it is possible I optimized the storage to the point the (small) overhead is now more relevant to the benchmark data than it would be in-situ*
+
+
+# Thu Oct 22 01:28:17 PM EDT 2026
+I am deleting the original unfinished smartstring file
+
+preserving this interesting comment
+
+```
+/// Either an Arc<T> or an inline string of up to 7 bytes.
+/// uses the least signifigant bit as the discriminator
+/// works because Arc is a pointer that must be aligned
+///
+/// unfortionately there is good reason not to use a custom allocator
+/// https://github.com/rust-lang/rfcs/issues/3540
+///
+/// although we could setup a custom global allocator, because that could be Size 0
+```

@@ -1,12 +1,9 @@
-use std::{
-    alloc::{self, Layout},
-    mem::MaybeUninit,
-    ptr, slice,
-};
+use std::{alloc::Layout, mem::MaybeUninit, ptr, slice};
 
 use streaming_iterator::StreamingIterator;
 
 use super::{CompressionStats, Frame, Mask, NeedsRebuild, StackVec};
+use crate::data::smallbox::boxed_with;
 
 /// Stores the mask and first row once, then only varying bits for later rows.
 /// Each packed row starts on a byte boundary and occupies ceil(varying_bits / 8)
@@ -57,18 +54,14 @@ impl BitCompactFrame {
             u16::try_from(compact_unit).expect("bit compact frame compact unit exceeds u16");
         let layout = allocation_layout(buffer_size);
 
-        // SAFETY: Header fields are written before Box creation. The tail is
-        // MaybeUninit, and Box's DST drop layout matches allocation_layout exactly.
+        // SAFETY: The layout matches the counters and MaybeUninit tail. Ownership
+        // is established by boxed_with after the counters have been initialized.
         let mut compact = unsafe {
-            let allocation = alloc::alloc(layout);
-            if allocation.is_null() {
-                alloc::handle_alloc_error(layout);
-            }
-            let raw: *mut Self = ptr::from_raw_parts_mut(allocation, buffer_size);
-            ptr::addr_of_mut!((*raw).unit).write(unit);
-            ptr::addr_of_mut!((*raw).length).write(length);
-            ptr::addr_of_mut!((*raw).compact_unit).write(stored_compact_unit);
-            Box::from_raw(raw)
+            boxed_with(layout, buffer_size, |raw: *mut Self| {
+                ptr::addr_of_mut!((*raw).unit).write(unit);
+                ptr::addr_of_mut!((*raw).length).write(length);
+                ptr::addr_of_mut!((*raw).compact_unit).write(stored_compact_unit);
+            })
         };
         copy_bytes(&mut compact.buffer[..header_size], &source[..header_size]);
 
