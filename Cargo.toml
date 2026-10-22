@@ -3,21 +3,40 @@ name = "tracing_table"
 version = "0.1.0"
 edition = "2024"
 
+# Build the library and scanner together; keep the Bevy app independent.
+[workspace]
+members = ["tracing_scan_elf"]
+default-members = [".", "tracing_scan_elf"]
+exclude = ["examples/bevy_viewer"]
+resolver = "3"
+
+[features]
+# Archive varying bits by default; --no-default-features retains byte compaction.
+default = ["bit-compression"]
+# Choose archived message layout at compile time; active rows and string LZ4 stay identical.
+bit-compression = []
+
 [dependencies]
+# Import the scanner's public types and artifact readers from root code.
+tracing_scan_elf = { path = "tracing_scan_elf" }
 bytemuck = { version = "1.23.0", features = ["derive"] }
 parking_lot = { version = "0.12.3", features = ["arc_lock"] }
 smallvec = { version = "1.15.0", features = ["const_generics"] }
 streaming-iterator = "0.1.9"
-string_cache = "0.11.0"
 tracing = "0.1.41"
 tracing-core = "0.1.33"
 tracing-subscriber = { version = "0.3.19", features = ["std"] }
 tracing-log = "0.2.0"
 rmpv = "1.3.1"
+lz4_flex = "0.11"
+# HC levels produce the same LZ4 blocks read by lz4_flex.
+lz4 = "1"
+# Buffer hashes are transient and byte equality resolves collisions.
+foldhash = "0.2"
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
 
 [dev-dependencies]
 libloading = "0.8.9"
-lz4_flex = "0.11"
 # Shared semantic preextraction and template-related regex helpers.
 regex = "1.12"
 
@@ -30,3 +49,13 @@ path = "examples/dump_messsage_compression/main.rs"
 [[example]]
 name = "print_strings_mdl"
 path = "examples/dump_messsage_compression/print_strings_mdl.rs"
+
+# Keep the focused dedup benchmark independent of the retired viewer readers.
+[[bench]]
+name = "string_dedup"
+harness = false
+
+# Replay complete captured inputs; disk IO and semantic validation are untimed.
+[[bench]]
+name = "replay"
+harness = false

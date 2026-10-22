@@ -25,6 +25,10 @@ use super::smallbox::{Initializer, SmallBox, boxed_with};
 mod bitcompact;
 pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
 
+/// Pack varying bits across row boundaries in archived bit frames. Set false and
+/// rebuild to retain byte-aligned packed rows; byte-compaction builds are unchanged.
+pub const CONTINUOUS_BIT_PACKING: bool = true;
+
 pub enum AnyFrame<'a> {
     Frame(&'a mut Box<Frame>),
     Compact(&'a mut Box<CompactFrame>),

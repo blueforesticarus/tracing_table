@@ -4,6 +4,17 @@ This crate implements an memory-efficient cache for tracing logs, with support f
 
 Archived frames use bit compaction by default. Build with `--no-default-features`
 to use byte compaction, or set `default-features = false` on the dependency.
+Bit frames pack varying bits continuously across row boundaries by default.
+Set `CONTINUOUS_BIT_PACKING` in `src/data/dataframe.rs` to `false` and rebuild
+to restore byte-aligned packed rows. The constant does not affect byte compaction.
+[Measured continuous-packing results](doc/continuous_packing_2026-10-22.md).
+
+Bit-compacted frames store the packed-row stride as `u16`: at most **65,535
+varying bits per row** with continuous packing, or **65,528 bits** with
+byte-aligned packing. The effective maximum for a fully varying uncompacted row
+is therefore **8,191 bytes** in either mode. Wider raw rows can fit when enough
+bits remain constant; the raw row-width field still permits up to 65,535 bytes.
+An oversized packed stride is rejected before archive allocation.
 
 # Rollover
 Every callsite (instance of trace!, info!, span! etc.) get's it's own cache of logs, with it's own rollover. This means that quick spamming logs (such as is common for level=trace) will not push uncommon logs (an important error, for example) off the queue. 
@@ -424,6 +435,11 @@ codex test implementation gives 3% overall reduction. defer for now
    
 # lz4 sanity check
 
+Updated comparison with the current pie settings: [bit/byte compaction, with and without LZ4 HC3](doc/frame_compression_2026-10-22.md).
+Bit + HC3 saves 344,213 bytes (4.18% of the current archive); continuous bit packing
+would save 506,197 bytes (6.15%, size model only). The pie now shows row padding
+separately. The historical measurements below use an older baseline.
+
 | Form | Bytes | MiB |
 |---|---:|---:|
 | Uncompacted baseline | 50,947,723 | 48.588 |
@@ -641,3 +657,21 @@ preserving this interesting comment
 ///
 /// although we could setup a custom global allocator, because that could be Size 0
 ```
+
+# Row Padding
+we pad bitcompacted rows to a whole byte
+- row padding is 6.2% of the archive
+
+removing padding, continuously bit packing, likely means we cannot do lz4 compression.
+
+| Encoding | Block payload | vs. bit-compacted |
+|---|---:|---:|
+| Bit-compacted | 6,322,773 B | baseline |
+| Byte-compacted | 7,947,824 B | +25.70% |
+| Bit-compacted + HC3 | 5,978,560 B | −5.44% |
+| Byte-compacted + HC3 | 7,082,762 B | +12.02% |
+
+removing padding is slightly better.
+
+- archive shrank 6.0%, from 8,226,585 to 7,732,597 bytes
+- new max row width is 2^16 bits or 8192 bytes since we need to store row width in bits in a u16
