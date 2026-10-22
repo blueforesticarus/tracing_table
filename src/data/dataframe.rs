@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     default,
     hash::{DefaultHasher, Hash, Hasher},
+    mem::MaybeUninit,
     ops::{Add, Deref, DerefMut, Range},
     ptr, slice,
     sync::{Arc, Weak},
@@ -18,8 +19,8 @@ use tracing::{
 };
 
 use super::CompressionStats;
-use super::blockbuffer::{ArchivedBlock, ArchivedFrame};
-use super::smallbox::{SmallBox, boxed_with};
+use super::blockbuffer::ArchivedBlock;
+use super::smallbox::{Initializer, SmallBox, boxed_with};
 
 mod bitcompact;
 pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
@@ -71,9 +72,8 @@ impl AnyFrame<'_> {
                 block.frame.uncompact(&mut unpacked);
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
                 // Rebuilding replaces only the archive; Data's descriptor stays put.
-                let frame = ArchivedFrame::new_from(&unpacked);
                 let metadata = std::mem::take(&mut block.metadata);
-                **block = ArchivedBlock::new(frame, metadata);
+                **block = ArchivedBlock::new(&unpacked, metadata);
             }
         }
     }
@@ -333,42 +333,6 @@ impl Frame {
         size / self.unit - 1
     }
 
-    // This is possible if we add an extra row to the beginning of the buffer.
-    // Why would we want to do this thought?
-    // pub fn compact_in_place(&mut self) {
-
-    pub fn compact_size_needed(&self) -> usize {
-        let cbytes = self.mask().constant_bytes();
-        (self.unit - cbytes) * (self.length - 1) + self.unit * 2 + size_of::<[u16; 2]>()
-    }
-
-    pub fn compact(&self, new: &mut CompactFrame) {
-        // Check both counters before changing the destination; never truncate a
-        // wide active frame when publishing its narrower archived metadata.
-        let unit = u16::try_from(self.unit).expect("compact frame unit exceeds u16");
-        let length = u16::try_from(self.length).expect("compact frame length exceeds u16");
-        new.unit = unit;
-        new.length = length;
-
-        // copy mask and first row
-        let offset = self.unit * 2;
-        new.buffer[..offset].copy_from_slice(&self.buffer[..offset]);
-
-        let mut write_ptr = &mut new.buffer[offset..];
-        let mut read_ptr = &self.buffer[offset..];
-        let mask = Mask::get(&self.buffer[..self.unit]);
-        let inc = self.unit - mask.constant_bytes();
-
-        // TODO perhaps copy the mask iterable to a stack allocated buffer.
-        for _row in 1..self.length {
-            for (a, b) in MaskIter::new(mask) {
-                write_ptr[a].copy_from_slice(&read_ptr[b]);
-            }
-            write_ptr = &mut write_ptr[inc..];
-            read_ptr = &read_ptr[self.unit..];
-        }
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         // if the data we cast to needs alignment and unit is not even mult, then this also needs to use a buffer.
         self.buffer[self.unit..].chunks(self.unit).take(self.length)
@@ -416,46 +380,47 @@ impl CompactFrame {
         self.len() == 0
     }
 
-    pub fn new_uninitialized(unit: usize, length: usize, const_bytes: usize) -> Box<CompactFrame> {
-        // Reject narrowing overflow before allocating; keep buffer arithmetic in usize.
-        let stored_unit = u16::try_from(unit).expect("compact frame unit exceeds u16");
-        let stored_length = u16::try_from(length).expect("compact frame length exceeds u16");
-        let compact_unit = unit
-            .checked_sub(const_bytes)
-            .expect("constant byte count exceeds frame unit");
-        let header_size = unit
-            .checked_mul(2)
-            .expect("compact frame header size overflow");
-        let buffer_size = length
+    pub fn new_from(frame: &Frame) -> Box<Self> {
+        Self::initializer(frame).into_box()
+    }
+
+    /// Size the byte archive once and let its eventual owner allocate storage.
+    pub(crate) fn initializer(frame: &Frame) -> Initializer<Self, impl FnOnce(*mut Self) + '_> {
+        assert!(frame.unit > 0, "frame unit must be nonzero");
+        let unit = u16::try_from(frame.unit).expect("compact frame unit exceeds u16");
+        let length = u16::try_from(frame.length).expect("compact frame length exceeds u16");
+        // The checked u16 counters bound source arithmetic on 32-bit targets too.
+        let source = &frame.buffer[..(frame.length + 1) * frame.unit];
+        let mask = frame.mask();
+        let compact_unit = mask.compact_unit();
+        // Store only the mask, first row (if any), and subsequent packed rows.
+        let header_size = frame.unit * if length == 0 { 1 } else { 2 };
+        let buffer_size = frame
+            .length
+            .saturating_sub(1)
             .checked_mul(compact_unit)
             .and_then(|size| size.checked_add(header_size))
             .expect("compact frame buffer size overflow");
         let layout = compact_frame_allocation_layout(buffer_size);
-
-        // SAFETY: The layout matches the narrow counters and trailing bytes.
-        let v = unsafe {
-            boxed_with(layout, buffer_size, |frame_ptr: *mut CompactFrame| {
-                // Initialize the narrow counters before exposing the typed owner.
-                ptr::addr_of_mut!((*frame_ptr).unit).write(stored_unit);
-                ptr::addr_of_mut!((*frame_ptr).length).write(stored_length);
+        // SAFETY: The checked layout matches the counters and tail. Borrow the
+        // payload as MaybeUninit until packing has initialized every byte.
+        unsafe {
+            Initializer::new(layout, buffer_size, move |raw: *mut Self| {
+                ptr::addr_of_mut!((*raw).unit).write(unit);
+                ptr::addr_of_mut!((*raw).length).write(length);
+                let buffer = slice::from_raw_parts_mut(
+                    ptr::addr_of_mut!((*raw).buffer).cast::<MaybeUninit<u8>>(),
+                    buffer_size,
+                );
+                copy_bytes(&mut buffer[..header_size], &source[..header_size]);
+                for (index, row) in source[header_size..].chunks_exact(frame.unit).enumerate() {
+                    let offset = header_size + index * compact_unit;
+                    for (packed, unpacked) in MaskIter::new(mask) {
+                        copy_bytes(&mut buffer[offset..][packed], &row[unpacked]);
+                    }
+                }
             })
-        };
-
-        // TODO(soundness): Prevent safe reads of payload bytes until initialized.
-        v
-    }
-
-    pub fn new_from(frame: &Frame) -> Box<Self> {
-        // allocate space for packed frame and move
-        // TODO special handling of uncompactible frames
-        let mut new = CompactFrame::new_uninitialized(
-            frame.unit,
-            frame.length,
-            frame.mask().constant_bytes(),
-        );
-
-        frame.compact(&mut new);
-        new
+        }
     }
 
     pub fn mask(&self) -> &Mask {
@@ -463,7 +428,12 @@ impl CompactFrame {
     }
 
     pub fn first(&self) -> &[u8] {
-        &self.buffer[self.unit()..2 * self.unit()]
+        let end = if self.is_empty() {
+            self.unit()
+        } else {
+            2 * self.unit()
+        };
+        &self.buffer[self.unit()..end]
     }
 
     /// Decode into caller-provided storage; Row handles writing edits back on drop.
@@ -507,12 +477,9 @@ impl CompactFrame {
     }
 
     pub fn buffer(&mut self) -> CompactFrameLayout {
-        // TODO: Before restoring unchecked splits, encapsulate unit and ensure every
-        // constructor/mutation preserves unit <= buffer.len() / 2, including on panic.
-        // let (header, data) = unsafe { self.buffer.split_at_mut_unchecked(self.unit() * 2) };
-        // let (mask, first) = unsafe { header.split_at_mut_unchecked(self.unit()) };
         let unit = self.unit();
-        let (header, data) = self.buffer.split_at_mut(unit * 2);
+        let header_size = unit + self.first().len();
+        let (header, data) = self.buffer.split_at_mut(header_size);
         let (mask, first) = header.split_at_mut(unit);
         CompactFrameLayout {
             mask: Mask::get_mut(mask),
@@ -526,8 +493,8 @@ impl CompactFrame {
         new.unit = self.unit();
         new.length = self.len();
 
-        // copy mask and first value
-        let offset = self.unit() * 2;
+        // Empty frames contain only the mask.
+        let offset = self.unit() + self.first().len();
         new.buffer[..offset].copy_from_slice(&self.buffer[..offset]);
 
         let mut write_ptr = &mut new.buffer[offset..];
@@ -548,15 +515,26 @@ impl CompactFrame {
     }
 
     pub fn compression_ratio(&self) -> CompressionStats {
-        let mask = self.mask();
-        let compressed = (self.len() - 1) * (self.unit() - mask.constant_bytes()) + self.unit();
         CompressionStats {
             data: self.len() * self.unit(),
-            // Count header and alignment padding as overhead, separate from spare bytes.
-            overhead: size_of_val(self) - self.buffer.len() + mask.0.len(),
-            compressed,
-            overalloc: self.buffer.len() - mask.0.len() - compressed,
+            // Every payload byte after the mask belongs to a stored row.
+            compressed: self.buffer.len() - self.unit(),
+            overhead: size_of_val(self) - self.buffer.len() + self.unit(),
+            overalloc: 0,
         }
+    }
+}
+
+// Raw copying initializes fresh payload storage without reading or zeroing it first.
+fn copy_bytes(destination: &mut [MaybeUninit<u8>], source: &[u8]) {
+    assert_eq!(destination.len(), source.len());
+    // SAFETY: Both slices cover the checked byte count and cannot overlap.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            source.as_ptr(),
+            destination.as_mut_ptr().cast(),
+            source.len(),
+        );
     }
 }
 
@@ -661,7 +639,7 @@ impl<'a> CompactFrameIter<'a> {
         let compact_unit = frame.unit() - frame.mask().constant_bytes();
         Self {
             frame,
-            buffer: StackVec::new(&frame.buffer[frame.unit()..2 * frame.unit()]),
+            buffer: StackVec::new(frame.first()),
             index: frame.unit() * 2,
             compact_unit,
             yielded: 0,
@@ -852,13 +830,40 @@ mod test {
                 compact_frame_allocation_layout(compact.buffer.len()),
                 compact_layout
             );
-            assert_eq!(compact.buffer.len(), 4 * unit);
+            assert_eq!(compact.buffer.len(), 3 * unit);
             let compact_stats = compact.compression_ratio();
             assert_eq!(
                 compact_stats.compressed + compact_stats.overhead + compact_stats.overalloc,
                 compact_layout.size()
             );
-            assert_eq!(compact_stats.overalloc, unit);
+            assert_eq!(compact_stats.overalloc, 0);
+        }
+    }
+
+    #[test]
+    fn compact_empty_single_and_constant_rows() {
+        // Removing spare storage must preserve empty frames and zero-byte packed rows.
+        for length in [0, 1, 4] {
+            let mut frame = Frame::new(3, length);
+            for _ in 0..length {
+                frame.push(&[7, 8, 9]);
+            }
+            let mut compact = CompactFrame::new_from(&frame);
+            assert_eq!(compact.buffer.len(), if length == 0 { 3 } else { 6 });
+            assert!(compact.buffer().data.is_empty());
+            let stats = compact.compression_ratio();
+            assert_eq!(stats.compressed, if length == 0 { 0 } else { 3 });
+            assert_eq!(stats.overalloc, 0);
+            assert_eq!(stats.compressed + stats.overhead, size_of_val(&*compact));
+            let mut rows = CompactFrameIter::new(&compact);
+            for _ in 0..length {
+                assert_eq!(rows.next(), Some(&[7, 8, 9][..]));
+            }
+            assert!(rows.next().is_none());
+            let mut restored = Frame::new(3, length);
+            compact.uncompact(&mut restored);
+            assert_eq!(restored.length, length);
+            assert_eq!(restored.buffer, frame.buffer);
         }
     }
 
@@ -869,15 +874,20 @@ mod test {
         assert!(catch_unwind(|| Frame::new(usize::MAX, 1)).is_err());
         assert!(catch_unwind(|| frame_allocation_layout(usize::MAX)).is_err());
         assert!(catch_unwind(|| frame_allocation_layout(isize::MAX as usize)).is_err());
-        for (unit, length, const_bytes) in [
-            (1, 1, 2),
-            (usize::MAX, 0, usize::MAX),
-            (2, usize::MAX, 0),
-            (1, usize::MAX, 0),
+        for (unit, length) in [
+            (0, 0),
+            (u16::MAX as usize + 1, 0),
+            (1, u16::MAX as usize + 1),
         ] {
+            // Invalid counters must be rejected before accessing the source rows.
             assert!(
-                catch_unwind(|| CompactFrame::new_uninitialized(unit, length, const_bytes))
-                    .is_err()
+                catch_unwind(|| {
+                    let mut frame = Frame::new(1, 0);
+                    frame.unit = unit;
+                    frame.length = length;
+                    CompactFrame::new_from(&frame)
+                })
+                .is_err()
             );
         }
     }
@@ -994,7 +1004,7 @@ mod test {
         assert_eq!(compact.mask().constant_bytes(), 6);
         assert_eq!(compact.buffer().first.len(), 8);
         assert_eq!(compact.buffer().mask.len(), 8);
-        // assert_eq!(compact.buffer().data.len(), 2 * 3); //alignment!
+        assert_eq!(compact.buffer().data.len(), 2 * 3);
     }
 
     #[test]

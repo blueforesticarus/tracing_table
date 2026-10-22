@@ -10,8 +10,9 @@ use super::{CompressionStats, dyntuple::ValueData};
 /// Choose a string reference once per callsite: u32 offsets or u16 indexes in raw rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum StringStorage {
-    #[default]
     Offset,
+    // Prefer narrower references; byte offsets remain an explicit option.
+    #[default]
     Index,
 }
 impl StringStorage {

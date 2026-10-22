@@ -10,6 +10,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use tracing_scan_elf::{
     Callsite, LookupError, Template, load_embedded_section, parse_source_templates,
 };
@@ -521,7 +522,11 @@ impl CompiledTemplate {
     /// Captures already contain rendered formatting. Concatenate without formatting again.
     pub fn render(&self, captures: &[&str]) -> String {
         assert_eq!(captures.len(), self.field_names.len());
-        let mut output = self.literals[0].clone();
+        // Reserve the complete rendered size to avoid growing once per capture.
+        let length = self.literals.iter().map(String::len).sum::<usize>()
+            + captures.iter().map(|capture| capture.len()).sum::<usize>();
+        let mut output = String::with_capacity(length);
+        output.push_str(&self.literals[0]);
         for (capture, literal) in captures.iter().zip(&self.literals[1..]) {
             output.push_str(capture);
             output.push_str(literal);
@@ -621,15 +626,24 @@ impl CompiledTemplate {
     /// text to later fields: `hello {} {}` on `hello a b c` gives ["a", "b c"].
     /// The final literal is anchored to the message end. No backtracking is needed.
     pub fn captures<'message>(&self, message: &'message str) -> Option<Vec<&'message str>> {
+        self.captures_inline(message).map(SmallVec::into_vec)
+    }
+
+    // Internal recording keeps common capture lists inline without changing the public API.
+    pub(crate) fn captures_inline<'message>(
+        &self,
+        message: &'message str,
+    ) -> Option<SmallVec<[&'message str; 4]>> {
         if self.field_names.is_empty() {
-            return (message == self.literals[0]).then(Vec::new);
+            return (message == self.literals[0]).then(SmallVec::new);
         }
         message.strip_prefix(&self.literals[0])?;
         let suffix = self.literals.last().unwrap();
         message.strip_suffix(suffix)?;
         let end = message.len().checked_sub(suffix.len())?;
         let mut start = self.literals[0].len();
-        let mut captures = Vec::with_capacity(self.field_names.len());
+        // Most messages have few captures; larger templates spill to the heap.
+        let mut captures = SmallVec::with_capacity(self.field_names.len());
         for literal in &self.literals[1..self.literals.len() - 1] {
             let next = start + message.get(start..end)?.find(literal)?;
             captures.push(&message[start..next]);
@@ -649,6 +663,8 @@ mod matcher_tests {
         assert_eq!(compiled.field_names, names);
         let captures = compiled.captures(message).unwrap();
         assert_eq!(captures, values);
+        // Exercise production rendering for the same UTF-8 and empty captures.
+        assert_eq!(compiled.render(&captures), message);
         // Reconstruct by concatenating rendered captures, never formatting them again.
         let mut restored = compiled.literals[0].clone();
         for (capture, literal) in captures.iter().zip(&compiled.literals[1..]) {
@@ -660,6 +676,13 @@ mod matcher_tests {
 
     #[test]
     fn retains_named_positional_and_repeated_argument_names() {
+        // More than four captures exercises the inline buffer's heap fallback.
+        check(
+            "{} / {} / {} / {} / {}",
+            "a / b / c / d / e",
+            &["0", "1", "2", "3", "4"],
+            &["a", "b", "c", "d", "e"],
+        );
         check(
             "file {file} took {:.2}ms ({file:?})",
             "file cache took 12.30ms (\"cache\")",

@@ -20,35 +20,35 @@ unsafe impl<T: ?Sized + Pointee<Metadata = usize> + Send> Send for SmallBox<T> {
 unsafe impl<T: ?Sized + Pointee<Metadata = usize> + Sync> Sync for SmallBox<T> {}
 
 impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
-    /// Collocate an owning header with a boxed DST tail.
+    /// Initialize a DST tail directly beside its owning header.
     ///
     /// SAFETY: T must have plain repr(C), with no extra packing/alignment, and
     /// exactly two fields, H followed by U. Its metadata is the tail's slice length.
-    pub(crate) unsafe fn with_header<H, U: ?Sized + Pointee<Metadata = usize>>(
+    pub(crate) unsafe fn with_header<
+        H,
+        U: ?Sized + Pointee<Metadata = usize>,
+        F: FnOnce(*mut U),
+    >(
         header: H,
-        tail: Box<U>,
+        tail: Initializer<U, F>,
     ) -> Self {
-        let length = ptr::metadata(tail.as_ref());
+        let Initializer {
+            layout: tail_layout,
+            length,
+            initialize,
+            ..
+        } = tail;
         u32::try_from(length).expect("SmallBox length exceeds u32");
-        let tail_layout = Layout::for_value(tail.as_ref());
         let (value_layout, tail_offset) = Layout::new::<H>().extend(tail_layout).unwrap();
         let (layout, offset) = Self::layout(value_layout.pad_to_align());
         let allocation = Allocation::new(layout);
-        // SAFETY: The caller guarantees the field layout. Move both owners into
-        // the new allocation; free the old tail storage without dropping its
-        // moved fields. The guard frees storage if construction unwinds.
+        // SAFETY: The caller guarantees the field layout, and Initializer guarantees
+        // the tail's layout and initialization. Keep the header on the stack until
+        // initialization succeeds so both it and the allocation are freed on panic.
         unsafe {
             let value = allocation.0.add(offset);
-            let source = Box::into_raw(tail);
+            initialize(ptr::from_raw_parts_mut(value.add(tail_offset), length));
             value.cast::<H>().write(header);
-            ptr::copy_nonoverlapping(
-                source.cast::<u8>(),
-                value.add(tail_offset),
-                tail_layout.size(),
-            );
-            if tail_layout.size() != 0 {
-                alloc::dealloc(source.cast(), tail_layout);
-            }
             let owner = Self::from_raw(ptr::from_raw_parts_mut(value, length));
             std::mem::forget(allocation);
             owner
@@ -118,6 +118,34 @@ impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
                 .read_unaligned()
         };
         ptr::from_raw_parts_mut(self.pointer.as_ptr(), length as usize)
+    }
+}
+
+/// A checked layout and one-shot writer, independent of the destination owner.
+/// Frame code can share packing between standalone boxes and collocated archives.
+pub(crate) struct Initializer<T: ?Sized + Pointee<Metadata = usize>, F: FnOnce(*mut T)> {
+    layout: Layout,
+    length: usize,
+    initialize: F,
+    value: PhantomData<T>,
+}
+
+impl<T: ?Sized + Pointee<Metadata = usize>, F: FnOnce(*mut T)> Initializer<T, F> {
+    /// SAFETY: layout must match T with this length. Given fresh, aligned storage,
+    /// initialize must leave every field valid before returning, and clean up any
+    /// partially initialized owners if it panics. It must not free the storage.
+    pub(crate) unsafe fn new(layout: Layout, length: usize, initialize: F) -> Self {
+        Self {
+            layout,
+            length,
+            initialize,
+            value: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_box(self) -> Box<T> {
+        // SAFETY: Construction established the layout and initializer contract.
+        unsafe { boxed_with(self.layout, self.length, self.initialize) }
     }
 }
 
@@ -224,19 +252,94 @@ mod tests {
         }
         assert_eq!(drops.get(), 8);
         assert_eq!(size_of::<SmallBox<[Tracked]>>(), size_of::<usize>());
+    }
 
+    #[test]
+    fn direct_initialization_preserves_tail_address_layout_and_owned_drops() {
+        struct Header(Rc<Cell<usize>>);
+        impl Drop for Header {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        #[repr(align(32))]
+        struct Tracked(Header);
         #[repr(C)]
         struct Combined {
-            header: Tracked,
+            header: Header,
             tail: [Tracked],
         }
-        let source: Box<[_]> = (0..7).map(|_| Tracked(drops.clone())).collect();
-        // SAFETY: Combined's repr(C) fields exactly match the header and tail.
-        let value: SmallBox<Combined> =
-            unsafe { SmallBox::with_header(Tracked(drops.clone()), source) };
-        assert_eq!(value.tail.len(), 7);
-        assert_eq!(&value.header as *const Tracked as usize % 16, 0);
-        drop(value);
-        assert_eq!(drops.get(), 16); // Both header and all moved tail owners drop once.
+        let drops = Rc::new(Cell::new(0));
+        for length in [0, 1, 7] {
+            let destination = Cell::new(ptr::null_mut());
+            let tail_layout = Layout::array::<Tracked>(length).unwrap();
+            // SAFETY: The array layout matches the tail; every element is written
+            // into supplied storage, with no intermediate payload allocation.
+            let tail = unsafe {
+                Initializer::new(tail_layout, length, |raw: *mut [Tracked]| {
+                    let raw = raw.cast::<Tracked>();
+                    destination.set(raw);
+                    for index in 0..length {
+                        raw.add(index).write(Tracked(Header(drops.clone())));
+                    }
+                })
+            };
+            // SAFETY: Combined is repr(C) with exactly this header and slice tail.
+            let value: SmallBox<Combined> =
+                unsafe { SmallBox::with_header(Header(drops.clone()), tail) };
+            assert_eq!(value.tail.len(), length);
+            assert_eq!(value.tail.as_ptr().cast_mut(), destination.get());
+            assert_eq!(value.tail.as_ptr() as usize % 32, 0);
+            let expected = Layout::new::<Header>()
+                .extend(tail_layout)
+                .unwrap()
+                .0
+                .pad_to_align();
+            assert_eq!(Layout::for_value(&*value), expected);
+            assert_eq!(
+                value.allocation_size(),
+                SmallBox::<Combined>::layout(expected).0.size()
+            );
+            // Read both owners through their final location before destruction.
+            assert!(Rc::ptr_eq(&value.header.0, &drops));
+            assert!(value.tail.iter().all(|item| Rc::ptr_eq(&item.0.0, &drops)));
+            let before = drops.get();
+            drop(value);
+            assert_eq!(drops.get() - before, length + 1);
+        }
+        assert_eq!(drops.get(), 11);
+    }
+
+    #[test]
+    fn failed_tail_initialization_drops_the_uncommitted_header() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct Header(Rc<Cell<usize>>);
+        impl Drop for Header {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        #[repr(C)]
+        struct Combined {
+            header: Header,
+            tail: [u8],
+        }
+        let drops = Rc::new(Cell::new(0));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: The layout matches [u8]; no owned tail fields need cleanup
+            // when initialization deliberately unwinds after writing one byte.
+            let tail = unsafe {
+                Initializer::new(Layout::array::<u8>(4).unwrap(), 4, |raw: *mut [u8]| {
+                    raw.cast::<u8>().write(42);
+                    panic!("tail initialization failed");
+                })
+            };
+            // SAFETY: The combined fields match the header and tail exactly.
+            let _: SmallBox<Combined> =
+                unsafe { SmallBox::with_header(Header(drops.clone()), tail) };
+        }));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 1);
     }
 }

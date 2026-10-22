@@ -2,6 +2,7 @@
 //! Full row decoding, shared by verification, benchmarks, and future viewers.
 use super::{InputValue, PerCallsiteData, SpanFieldsRef, SpanId, StringStorage};
 use crate::data::{CompressionStats, blockbuffer::ArchivedFrameIter, dyntuple::ValueKind};
+use smallvec::SmallVec;
 use streaming_iterator::StreamingIterator;
 
 /// Storage categories retain active tails instead of silently dropping partial blocks.
@@ -79,7 +80,17 @@ impl PerCallsiteData {
             return None;
         }
         let start = self.cache.get(span.archetype as usize)?;
-        for &reference in start.data.span_fields_refs(span.index as usize) {
+        self.span_fields_ref_from_candidates(span, start.data.span_fields_refs(span.index as usize))
+    }
+
+    // Sequential decoding already knows the start block; reuse its candidates
+    // instead of searching the archive again for every span.
+    fn span_fields_ref_from_candidates(
+        &self,
+        span: SpanId,
+        candidates: &[SpanFieldsRef],
+    ) -> Option<SpanFieldsRef> {
+        for &reference in candidates {
             let Some(update) = self.cache.get(reference.archetype as usize) else {
                 continue;
             };
@@ -140,25 +151,20 @@ impl PerCallsiteData {
                 .data
                 .ring
                 .iter()
-                .map(|b| {
-                    (
-                        b.data.frame.len(),
-                        &b.descriptor,
-                        b.data.metadata.string_buffer,
-                    )
-                })
+                .map(|b| (b.data.frame.len(), &b.descriptor, &b.data.metadata))
                 .chain(std::iter::once((
                     arch.data.active.length,
                     &arch.data.active_descriptor,
-                    arch.data.active_metadata.string_buffer,
+                    &arch.data.active_metadata,
                 )));
             let mut rows = arch.data.iter();
             let mut strings = None;
             let mut string_id = None;
-            for (count, descriptor, buffer_id) in frames {
+            for (count, descriptor, metadata) in frames {
                 if count == 0 {
                     continue;
                 }
+                let buffer_id = metadata.string_buffer;
                 if string_id != Some(buffer_id) {
                     strings = arch.strings.get(buffer_id);
                     string_id = Some(buffer_id);
@@ -200,7 +206,10 @@ impl PerCallsiteData {
                             } else {
                                 row.timestamp.unwrap() + (offset - 1)
                             });
-                            row.extra_fields = self.span_fields_ref(row.span.unwrap());
+                            row.extra_fields = self.span_fields_ref_from_candidates(
+                                row.span.unwrap(),
+                                metadata.span_fields().unwrap_or_default(),
+                            );
                         }
                         if a.parent {
                             row.parent = Some(reader.span());
@@ -236,7 +245,8 @@ impl PerCallsiteData {
                         }));
                     }
                     if let Some(count) = a.template {
-                        let captures: Vec<_> = (0..count)
+                        // Common templates fit inline, matching the ingestion path.
+                        let captures: SmallVec<[&str; 4]> = (0..count)
                             .map(|_| {
                                 // Template captures follow the callsite's packed string mode.
                                 let reference = match self.string_storage {

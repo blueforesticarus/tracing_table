@@ -191,14 +191,7 @@ impl BlockCache {
         if self.active.length == 0 {
             return;
         }
-        // Compact the populated frame and retain its allocated capacity for reuse.
-        let frame = ArchivedFrame::new_from(&self.active);
-
-        // mask and first element
-        assert_eq!(&frame.mask()[..], &self.active.buffer[..self.unit]);
-        assert_eq!(frame.first(), &self.active.buffer[self.unit..2 * self.unit]);
-
-        let length = frame.len();
+        let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
         // timestamp range and deferred references start fresh for the new frame.
         let next = Descriptor {
@@ -207,11 +200,18 @@ impl BlockCache {
         };
         let mut next_metadata = CollocatedMetadata::default();
         next_metadata.string_buffer = self.active_metadata.string_buffer;
+        // Pack directly into the final archive and retain the active capacity for reuse.
+        let data = ArchivedBlock::new(
+            &self.active,
+            std::mem::replace(&mut self.active_metadata, next_metadata),
+        );
+        debug_assert_eq!(&data.frame.mask()[..], &self.active.buffer[..self.unit]);
+        debug_assert_eq!(
+            data.frame.first(),
+            &self.active.buffer[self.unit..2 * self.unit]
+        );
         self.ring.push_back(Data {
-            data: ArchivedBlock::new(
-                frame,
-                std::mem::replace(&mut self.active_metadata, next_metadata),
-            ),
+            data,
             descriptor: std::mem::replace(&mut self.active_descriptor, next),
         });
         self.active.clear();

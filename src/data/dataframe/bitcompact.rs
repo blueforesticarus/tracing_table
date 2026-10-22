@@ -2,8 +2,8 @@ use std::{alloc::Layout, mem::MaybeUninit, ptr, slice};
 
 use streaming_iterator::StreamingIterator;
 
-use super::{CompressionStats, Frame, Mask, NeedsRebuild, StackVec};
-use crate::data::smallbox::boxed_with;
+use super::{CompressionStats, Frame, Mask, NeedsRebuild, StackVec, copy_bytes};
+use crate::data::smallbox::Initializer;
 
 /// Stores the mask and first row once, then only varying bits for later rows.
 /// Each packed row starts on a byte boundary and occupies ceil(varying_bits / 8)
@@ -15,12 +15,17 @@ pub struct BitCompactFrame {
     length: u16,
     compact_unit: u16,
     // Private spare storage permits construction without zeroing the allocation.
-    // new_from initializes every payload byte before exposing the completed frame.
+    // initializer writes every payload byte before exposing the completed frame.
     buffer: [MaybeUninit<u8>],
 }
 
 impl BitCompactFrame {
     pub fn new_from(frame: &Frame) -> Box<Self> {
+        Self::initializer(frame).into_box()
+    }
+
+    /// Prepare packing without allocating; SmallBox can supply the final archive storage.
+    pub(crate) fn initializer(frame: &Frame) -> Initializer<Self, impl FnOnce(*mut Self) + '_> {
         assert!(frame.unit > 0, "frame unit must be nonzero");
         // Validate active-frame metadata before allocating the narrower archive.
         let unit = u16::try_from(frame.unit).expect("bit compact frame unit exceeds u16");
@@ -54,26 +59,27 @@ impl BitCompactFrame {
             u16::try_from(compact_unit).expect("bit compact frame compact unit exceeds u16");
         let layout = allocation_layout(buffer_size);
 
-        // SAFETY: The layout matches the counters and MaybeUninit tail. Ownership
-        // is established by boxed_with after the counters have been initialized.
-        let mut compact = unsafe {
-            boxed_with(layout, buffer_size, |raw: *mut Self| {
+        // SAFETY: The layout matches the counters and MaybeUninit tail. Initialize
+        // all counters before borrowing the tail, and all payload bytes before
+        // returning to whichever owner provided the storage.
+        unsafe {
+            Initializer::new(layout, buffer_size, move |raw: *mut Self| {
                 ptr::addr_of_mut!((*raw).unit).write(unit);
                 ptr::addr_of_mut!((*raw).length).write(length);
                 ptr::addr_of_mut!((*raw).compact_unit).write(stored_compact_unit);
-            })
-        };
-        copy_bytes(&mut compact.buffer[..header_size], &source[..header_size]);
+                let compact = &mut *raw;
+                copy_bytes(&mut compact.buffer[..header_size], &source[..header_size]);
 
-        for (index, row) in source[header_size..].chunks_exact(frame.unit).enumerate() {
-            let offset = header_size + index * compact_unit;
-            pack_row(
-                row,
-                mask,
-                &mut compact.buffer[offset..offset + compact_unit],
-            );
+                for (index, row) in source[header_size..].chunks_exact(frame.unit).enumerate() {
+                    let offset = header_size + index * compact_unit;
+                    pack_row(
+                        row,
+                        mask,
+                        &mut compact.buffer[offset..offset + compact_unit],
+                    );
+                }
+            })
         }
-        compact
     }
 
     pub fn unit(&self) -> usize {
@@ -240,19 +246,6 @@ fn allocation_layout(buffer_size: usize) -> Layout {
     Layout::from_size_align(size, align_of::<u16>())
         .expect("bit compact frame allocation exceeds layout limits")
         .pad_to_align()
-}
-
-fn copy_bytes(destination: &mut [MaybeUninit<u8>], source: &[u8]) {
-    assert_eq!(destination.len(), source.len());
-    // SAFETY: Both slices cover the checked byte count and cannot overlap.
-    // A raw copy initializes the destination without reading its previous bytes.
-    unsafe {
-        ptr::copy_nonoverlapping(
-            source.as_ptr(),
-            destination.as_mut_ptr().cast(),
-            source.len(),
-        );
-    }
 }
 
 pub struct BitCompactFrameIter<'a> {

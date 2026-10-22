@@ -685,7 +685,8 @@ impl Fixture {
     ///
     /// Actual source locations and/or embedded section are not used in replay mode
     pub fn replay_with_templates(&self, extract_templates: bool) -> RecordingLayer {
-        self.replay_with_options(extract_templates, super::StringStorage::Offset)
+        // Keep replay's implicit addressing aligned with live recording.
+        self.replay_with_options(extract_templates, super::StringStorage::default())
     }
 
     /// Replay selects physical string addressing without changing captured inputs.

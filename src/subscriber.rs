@@ -87,6 +87,18 @@ impl PerCallsiteData {
         let i = match self.lookup.get(archetype) {
             Some(i) => *i,
             None => {
+                // The schema is fixed: reserve its worst-case string entries once.
+                let strings_per_row = archetype
+                    .field_types
+                    .iter()
+                    .flatten()
+                    .filter(|kind| matches!(kind, ValueKind::BufferOffset | ValueKind::BufferIndex))
+                    .count()
+                    + archetype.template.unwrap_or(0);
+                assert!(
+                    strings_per_row <= Buffer::MAX_ENTRIES,
+                    "row exceeds string buffer capacity"
+                );
                 // A row floor takes precedence over the target for wide schemas.
                 let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit).max(min_rows).max(1);
                 let i = self.cache.len();
@@ -96,6 +108,7 @@ impl PerCallsiteData {
                         data: BlockCache::new(unit, 1, cap),
                         strings: BufferCollection::default(),
                         chunk_string_start: 0,
+                        strings_per_row,
                         // id_counter: 1.into(),
                         archetype: archetype.clone(),
                         id: i as u32,
@@ -115,6 +128,8 @@ pub struct PerArchData {
     pub strings: BufferCollection,
     // Uncompressed bytes when the active message chunk began. (used to decide when to replace buffer)
     chunk_string_start: usize,
+    // Includes ordinary string fields and extracted template arguments.
+    strings_per_row: usize,
     // id_counter: AtomicU64,
     pub archetype: Archetype,
     pub id: u32,
@@ -131,20 +146,7 @@ impl PerArchData {
 
     /// Keep message-chunk policy here; BufferCollection only knows how to rotate.
     fn prepare_chunk(&mut self, string_compression_level: Option<u32>) -> bool {
-        // Reserve worst-case entries for the entire row, including template captures.
-        // TODO this seems like something to be computed earlier and passed here.
-        let strings = self
-            .archetype
-            .field_types
-            .iter()
-            .flatten()
-            .filter(|kind| matches!(kind, ValueKind::BufferOffset | ValueKind::BufferIndex))
-            .count()
-            + self.archetype.template.unwrap_or(0);
-        assert!(
-            strings <= Buffer::MAX_ENTRIES,
-            "row exceeds string buffer capacity"
-        );
+        let strings = self.strings_per_row;
         let strings_full = self.strings.active.len() + strings > Buffer::MAX_ENTRIES
             || self.strings.active.len() == Buffer::MAX_ENTRIES;
         // Check caps only on initial allocation, frame growth, or chunk rollover.
@@ -348,7 +350,7 @@ impl RecordingLayer {
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             last_event: Mutex::new(None),
             timestamp_bit_shift: 10,
-            string_storage: StringStorage::Offset,
+            string_storage: StringStorage::default(),
             // Preserve the explicit flex override while defaulting to HC3.
             string_compression_level: match std::env::var("STRING_COMPRESSION_LEVEL").as_deref() {
                 Ok("flex") => None,
@@ -1029,7 +1031,7 @@ impl ValueRecorder<'_> {
         write!(text, "{value}").expect("writing to String");
         if field.name() == "message"
             && let Some(template) = self.template
-            && let Some(captures) = template.captures(text)
+            && let Some(captures) = template.captures_inline(text)
         {
             for (capture, argument) in captures.into_iter().zip(&mut self.data.template_args) {
                 argument.clear();
@@ -1260,7 +1262,10 @@ mod test {
             / (size_of::<super::PackedTimestamp>() + size_of::<u16>() + 8 + 4)
             + 1;
         for format in ["hello {name} {}!", "fixed"] {
-            let recorder = Arc::new(RecordingLayer::new());
+            // Keep this offset-specific contract explicit as the default is indexed.
+            let mut layer = RecordingLayer::new();
+            layer.string_storage = super::StringStorage::Offset;
+            let recorder = Arc::new(layer);
             let dispatch = tracing::Dispatch::new(
                 Registry::default().with(LocalRecordingLayer(recorder.clone())),
             );

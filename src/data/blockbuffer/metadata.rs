@@ -1,11 +1,12 @@
 use super::{
     ArchivedBlock, ArchivedFrame, CompressionStats, SmallBox, SpanFieldsRef, StringBufferId,
 };
+use crate::data::dataframe::Frame;
 
 impl ArchivedBlock {
-    pub fn new(frame: Box<ArchivedFrame>, metadata: CollocatedMetadata) -> SmallBox<Self> {
+    pub fn new(frame: &Frame, metadata: CollocatedMetadata) -> SmallBox<Self> {
         // SAFETY: ArchivedBlock is repr(C), with metadata followed by its DST frame.
-        unsafe { SmallBox::with_header(metadata, frame) }
+        unsafe { SmallBox::with_header(metadata, ArchivedFrame::initializer(frame)) }
     }
 }
 
