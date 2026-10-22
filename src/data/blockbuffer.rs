@@ -16,6 +16,8 @@ use super::stringbuffer::StringBufferId;
 
 mod metadata;
 pub use metadata::CollocatedMetadata;
+mod parent_offsets;
+pub use parent_offsets::{ParentOffsetEntry, ParentOffsets};
 
 // Compile-time selection keeps both modes on the normal rollover/edit/read path.
 #[cfg(feature = "bit-compression")]
@@ -55,6 +57,9 @@ pub struct BlockCache {
 
     // used for get_mut
     edit_buffer: Vec<u8>,
+
+    // Writable dictionary scratch is reused after its entries move into an archive.
+    active_parent_offsets: Vec<u8>,
 }
 
 pub struct Data {
@@ -166,7 +171,55 @@ impl BlockCache {
             },
             active_metadata: CollocatedMetadata::default(),
             edit_buffer: vec![0; unit],
+            active_parent_offsets: Vec::new(),
         }
+    }
+
+    pub fn active_parent_offsets(&self) -> ParentOffsets<'_> {
+        ParentOffsets::new(
+            &self.active_parent_offsets,
+            self.active_metadata.parent_offset_count,
+        )
+    }
+
+    /// Active dictionary heap belongs to writable storage, including spare capacity.
+    pub fn active_parent_offsets_heap_bytes(&self) -> usize {
+        self.active_parent_offsets.capacity()
+    }
+
+    /// Call after cycle_if_needed/prepare_chunk and immediately before allocate,
+    /// so the dictionary and the new row always belong to the same block.
+    pub fn encode_parent(&mut self, index: u64, callsite: u32, archetype: u32) -> (u64, u16) {
+        assert!(
+            self.active.length < self.active.capacity(),
+            "prepare chunk before encoding parent"
+        );
+        let table_index = match self.active_parent_offsets().find(callsite, archetype) {
+            Some(index) => index,
+            None => {
+                let count = self.active_metadata.parent_offset_count;
+                let next = count
+                    .checked_add(1)
+                    .expect("parent identity count exceeds u16");
+                self.active_parent_offsets
+                    .extend_from_slice(&callsite.to_le_bytes());
+                self.active_parent_offsets
+                    .extend_from_slice(&archetype.to_le_bytes());
+                // Store a two-byte predictor scaled by FloatU16::UNIT; every row uses
+                // its decoded value, so rounding never changes the original ID.
+                let offset = super::float_u16::FloatU16::from_u64_lossy(index);
+                self.active_parent_offsets
+                    .extend_from_slice(&offset.to_bits().to_le_bytes());
+                self.active_metadata.parent_offset_count = next;
+                count
+            }
+        };
+        (
+            self.active_parent_offsets()
+                .entry(table_index)
+                .encode(index),
+            table_index,
+        )
     }
 
     pub fn cycle_if_needed(&mut self) {
@@ -201,20 +254,15 @@ impl BlockCache {
         let mut next_metadata = CollocatedMetadata::default();
         next_metadata.string_buffer = self.active_metadata.string_buffer;
         // Pack directly into the final archive and retain the active capacity for reuse.
-        let data = ArchivedBlock::new(
-            &self.active,
-            std::mem::replace(&mut self.active_metadata, next_metadata),
-        );
-        debug_assert_eq!(&data.frame.mask()[..], &self.active.buffer[..self.unit]);
-        debug_assert_eq!(
-            data.frame.first(),
-            &self.active.buffer[self.unit..2 * self.unit]
-        );
+        let metadata = std::mem::replace(&mut self.active_metadata, next_metadata);
+        let data =
+            ArchivedBlock::new_with_trailer(&self.active, metadata, &self.active_parent_offsets);
         self.ring.push_back(Data {
             data,
             descriptor: std::mem::replace(&mut self.active_descriptor, next),
         });
         self.active.clear();
+        self.active_parent_offsets.clear();
     }
 
     /// Initialize the origin after rollover and validate before committing a row.
@@ -389,8 +437,11 @@ impl BlockCache {
                 overhead: size_of::<Self>()
                     - size_of::<Descriptor>()
                     - size_of::<CollocatedMetadata>()
-                    + self.edit_buffer.len(),
-                overalloc: self.edit_buffer.capacity() - self.edit_buffer.len(),
+                    + self.edit_buffer.len()
+                    + self.active_parent_offsets.len(),
+                overalloc: self.edit_buffer.capacity() - self.edit_buffer.len()
+                    + self.active_parent_offsets.capacity()
+                    - self.active_parent_offsets.len(),
                 ..Default::default()
             }
     }

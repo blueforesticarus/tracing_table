@@ -9,6 +9,15 @@ Set `CONTINUOUS_BIT_PACKING` in `src/data/dataframe.rs` to `false` and rebuild
 to restore byte-aligned packed rows. The constant does not affect byte compaction.
 [Measured continuous-packing results](doc/continuous_packing_2026-10-22.md).
 
+Parent references store a u64 ZigZag index delta and a u16 dictionary index.
+Each block's collocated metadata stores a u16 entry count; its compacted frame
+ends with that many `(u32 callsite, u32 archetype, u64 offset)` entries.
+All entries retain their identity, including singletons. The offset is the exact
+first parent index for that identity in the block; row deltas preserve exact IDs.
+The frame's existing allocation length and row layout imply the trailer's size.
+Both compaction formats preserve trailers through archived edits. Readers return
+ordinary `SpanId` values. [Measured storage comparison and pies](doc/parent_dictionary_2026-10-22.md).
+
 Bit-compacted frames store the packed-row stride as `u16`: at most **65,535
 varying bits per row** with continuous packing, or **65,528 bits** with
 byte-aligned packing. The effective maximum for a fully varying uncompacted row
@@ -675,3 +684,49 @@ removing padding is slightly better.
 
 - archive shrank 6.0%, from 8,226,585 to 7,732,597 bytes
 - new max row width is 2^16 bits or 8192 bytes since we need to store row width in bits in a u16
+
+# span offset
+
+Storing parent spanid as offset from first does not help much because the blocks were it would help most are the ones with multiple arch/callsite parent ids and hence unrelated indices.
+
+We add a variable length table after frame payload. which stores (callsite, arch, offset)
+- collocated metadata stores the count of this table
+- payload parent span id callsite/arch stored as index in this table
+- payload parent span id index stored as zigzag offset from said entry's offset 
+  - *this was is an added benefit -- helps justify the extra metadata*
+- offset stored as custom 16bit floating point integer (5 exp, 11 mantisa)
+
+> The uncompressed row width shrank by 6 bytes per parent reference:
+> 
+> Before: index u64 + callsite u32 + archetype u32 = 16 B
+> Now: ZigZag residual u64 + table index u16 = 10 B
+
+For default settings—shift 10, minimum rows 0, extraction on:
+| Metric | Before offsets | After | Change |
+|---|---:|---:|---:|
+| Span payload, B/span | 5.268 | 5.036 | −4.41% |
+| Event/log payload, B/row | 6.889 | 6.665 | −3.25% |
+| End buffers | 0 B | 112,690 B | New |
+| Other container overhead | 680,339 B | 613,239 B | −9.86% |
+| Overall archive | 7,720,005 B | 7,376,010 B | **−4.46%** |
+
+parent spanid payload breakdown:
+| Component | Span B/span: previous → current | Change | Event/log B/row: previous → current | Change |
+|---|---:|---:|---:|---:|
+| Parent index → residual | 1.074 → 0.888 | −17.3% | 0.886 → 0.739 | −16.5% |
+| Parent identity → table index | 0.266 → 0.095 | −64.2% | 0.226 → 0.057 | −74.8% |
+| End buffer: parent table | 0 → 0.115 | +0.115 | 0 → 0.079 | +0.079 |
+| **Combined parent cost** | **1.340 → 1.099** | **−18.0%** | **1.112 → 0.876** | **−21.2%** |
+
+NEXT:
+
+reconsider floating point offset 
+   - offset can be really big while variance is really small, fixed precision might be better.
+   - testing with exact u64 offset (6 extra metadata bytes): payload saves only 4K while end buffers grow 60K.
+     - *TODO: this is on sample data, it would become more appealing as spanid's grew over running length of application.*
+   - perhaps a unit larger than 1. current data this is slightly worse overall 0.14%. it is now a constant that can be set. Still defaulting to 1.
+
+add stride ie. linear prediction with encoding
+   - stride to be stored as same custom float, with unit 1, representing diff across whole buffer.
+   - this requires rebuilding values at compact time. which complicates implementation
+

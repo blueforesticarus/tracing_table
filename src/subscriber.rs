@@ -610,7 +610,7 @@ impl Archetype {
             bytes += std::mem::size_of::<SpanId>();
         }
         if self.parent {
-            bytes += std::mem::size_of::<SpanId>();
+            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
         }
         if self.follows_from {
             bytes += std::mem::size_of::<SpanId>();
@@ -819,6 +819,8 @@ impl RecordingLayer {
         let index = site.get_arch(self.message_block_min_rows);
         let arch = &mut site.cache[index];
         let allocated = arch.prepare_chunk(self.string_compression_level);
+        // Rollover has finished; intern into the dictionary for this exact row.
+        let parent = parent.map(|p| arch.data.encode_parent(p.index, p.callsite, p.archetype));
         let (bytes, index, timestamp_offset) = arch.data.allocate(time.value);
         let id = SpanId {
             index: index as u64,
@@ -844,8 +846,9 @@ impl RecordingLayer {
         } else {
             packer.write_any_value(PackedTimestamp::default(), false);
         }
-        if let Some(parent) = parent {
-            packer.write_any_value(parent, false);
+        if let Some((residual, table_index)) = parent {
+            packer.write_any_value(residual, false);
+            packer.write_any_value(table_index, false);
         }
         let fields = &mut site.field_value_scratchpad;
         fields.write(&mut packer, &mut arch.strings.active);

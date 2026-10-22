@@ -28,16 +28,36 @@ impl BitCompactFrame {
         Self::initializer(frame).into_box()
     }
 
+    /// Append initialized opaque bytes without adding a stored trailer length.
+    pub fn new_from_with_trailer(frame: &Frame, trailer: &[u8]) -> Box<Self> {
+        Self::initializer_with_trailer(frame, trailer).into_box()
+    }
+
     /// Prepare packing without allocating; SmallBox can supply the final archive storage.
     pub(crate) fn initializer(frame: &Frame) -> Initializer<Self, impl FnOnce(*mut Self) + '_> {
-        Self::initializer_with_packing::<CONTINUOUS_BIT_PACKING>(frame)
+        Self::initializer_with_trailer(frame, &[])
+    }
+
+    pub(crate) fn initializer_with_trailer<'a>(
+        frame: &'a Frame,
+        trailer: &'a [u8],
+    ) -> Initializer<Self, impl FnOnce(*mut Self) + 'a> {
+        Self::initializer_with_packing_and_trailer::<CONTINUOUS_BIT_PACKING>(frame, trailer)
     }
 
     // Keep both layouts testable in one build; production specializes this using
     // the public constant, without a runtime policy branch or per-block mode tag.
+    #[cfg(test)]
     fn initializer_with_packing<const CONTINUOUS: bool>(
         frame: &Frame,
     ) -> Initializer<Self, impl FnOnce(*mut Self) + '_> {
+        Self::initializer_with_packing_and_trailer::<CONTINUOUS>(frame, &[])
+    }
+
+    fn initializer_with_packing_and_trailer<'a, const CONTINUOUS: bool>(
+        frame: &'a Frame,
+        trailer: &'a [u8],
+    ) -> Initializer<Self, impl FnOnce(*mut Self) + 'a> {
         assert!(frame.unit > 0, "frame unit must be nonzero");
         // Validate active-frame metadata before allocating the narrower archive.
         let unit = u16::try_from(frame.unit).expect("bit compact frame unit exceeds u16");
@@ -75,21 +95,25 @@ impl BitCompactFrame {
             .checked_mul(packed_row_bits)
             .and_then(|bits| bits.div_ceil(8).checked_add(header_size))
             .expect("bit compact frame size overflow");
-        let layout = allocation_layout(buffer_size);
+        let allocation_bytes = buffer_size
+            .checked_add(trailer.len())
+            .expect("frame trailer overflow");
+        let layout = allocation_layout(allocation_bytes);
 
         // SAFETY: The layout matches the counters and MaybeUninit tail. Initialize
         // all counters before borrowing the tail, and all payload bytes before
         // returning to whichever owner provided the storage.
         unsafe {
-            Initializer::new(layout, buffer_size, move |raw: *mut Self| {
+            Initializer::new(layout, allocation_bytes, move |raw: *mut Self| {
                 ptr::addr_of_mut!((*raw).unit).write(unit);
                 ptr::addr_of_mut!((*raw).length).write(length);
                 ptr::addr_of_mut!((*raw).packed_row_bits).write(stored_row_bits);
                 let compact = &mut *raw;
+                copy_bytes(&mut compact.buffer[buffer_size..], trailer);
                 copy_bytes(&mut compact.buffer[..header_size], &source[..header_size]);
                 // Initialize shared boundary bytes before preserving their bits.
                 // Only the final block byte can retain unused high zero bits.
-                let packed = &mut compact.buffer[header_size..];
+                let packed = &mut compact.buffer[header_size..buffer_size];
                 packed.fill(MaybeUninit::new(0));
                 // SAFETY: Every byte in this disjoint packed tail was initialized.
                 let packed = slice::from_raw_parts_mut(packed.as_mut_ptr().cast(), packed.len());
@@ -119,11 +143,30 @@ impl BitCompactFrame {
         usize::from(self.packed_row_bits)
     }
 
-    /// Initialized mask, first row (if any), and packed rows; there is no spare tail.
+    /// Initialized row payload, excluding the opaque trailer and allocation padding.
     pub fn buffer(&self) -> &[u8] {
         // SAFETY: new_from writes the entire payload before returning it, and
         // private fields prevent callers from changing its initialization bounds.
-        unsafe { slice::from_raw_parts(self.buffer.as_ptr().cast(), self.buffer.len()) }
+        unsafe { slice::from_raw_parts(self.buffer.as_ptr().cast(), self.row_payload_len()) }
+    }
+
+    /// The DST slice length gives the exact allocation tail, excluding heap padding.
+    /// Subtract the row payload implied by the header; no length field is needed.
+    pub fn trailer(&self) -> &[u8] {
+        let start = self.row_payload_len();
+        // SAFETY: Every constructor initializes the entire DST tail, and the
+        // checked payload length partitions that same allocation before padding.
+        unsafe {
+            slice::from_raw_parts(
+                self.buffer.as_ptr().cast::<u8>().add(start),
+                self.buffer.len() - start,
+            )
+        }
+    }
+
+    fn row_payload_len(&self) -> usize {
+        self.unit() * if self.is_empty() { 1 } else { 2 }
+            + (self.len().saturating_sub(1) * self.packed_row_bits()).div_ceil(8)
     }
 
     pub fn mask(&self) -> &Mask {
@@ -163,7 +206,8 @@ impl BitCompactFrame {
 
         let unit = self.unit();
         let packed_row_bits = self.packed_row_bits();
-        let (header, packed) = self.buffer.split_at_mut(2 * unit);
+        let payload_len = self.row_payload_len();
+        let (header, packed) = self.buffer[..payload_len].split_at_mut(2 * unit);
         if index == 0 {
             copy_bytes(&mut header[unit..], row);
         } else {
@@ -228,8 +272,8 @@ impl BitCompactFrame {
     pub fn compression_ratio(&self) -> CompressionStats {
         CompressionStats {
             data: self.len() * self.unit(),
-            compressed: self.buffer.len() - self.unit(),
-            overhead: size_of_val(self) - self.buffer.len() + self.unit(),
+            compressed: self.buffer().len() - self.unit(),
+            overhead: size_of_val(self) - self.buffer().len() + self.unit(),
             overalloc: 0,
         }
     }

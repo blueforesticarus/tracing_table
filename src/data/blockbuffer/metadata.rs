@@ -5,8 +5,27 @@ use crate::data::dataframe::Frame;
 
 impl ArchivedBlock {
     pub fn new(frame: &Frame, metadata: CollocatedMetadata) -> SmallBox<Self> {
+        Self::new_with_trailer(frame, metadata, &[])
+    }
+
+    /// Row rebuilds retain the exact trailer and count; do not re-encode residuals.
+    pub fn new_with_trailer(
+        frame: &Frame,
+        metadata: CollocatedMetadata,
+        trailer: &[u8],
+    ) -> SmallBox<Self> {
+        super::ParentOffsets::new(trailer, metadata.parent_offset_count);
         // SAFETY: ArchivedBlock is repr(C), with metadata followed by its DST frame.
-        unsafe { SmallBox::with_header(metadata, ArchivedFrame::initializer(frame)) }
+        unsafe {
+            SmallBox::with_header(
+                metadata,
+                ArchivedFrame::initializer_with_trailer(frame, trailer),
+            )
+        }
+    }
+
+    pub fn parent_offsets(&self) -> super::ParentOffsets<'_> {
+        super::ParentOffsets::new(self.frame.trailer(), self.metadata.parent_offset_count)
     }
 }
 
@@ -15,6 +34,8 @@ impl ArchivedBlock {
 #[derive(Default)]
 pub struct CollocatedMetadata {
     pub string_buffer: StringBufferId,
+    /// Per-block dictionary count; all entries retain their complete identity.
+    pub parent_offset_count: u16,
     span_fields: Option<SmallBox<[SpanFieldsRef]>>,
 }
 
@@ -22,7 +43,7 @@ const _: () = assert!(align_of::<CollocatedMetadata>() == 4);
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<Option<SmallBox<[SpanFieldsRef]>>>() == 8);
-    assert!(size_of::<CollocatedMetadata>() == 12);
+    assert!(size_of::<CollocatedMetadata>() == 16);
 };
 
 impl CollocatedMetadata {

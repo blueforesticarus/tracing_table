@@ -3,6 +3,9 @@ pub mod blockbuffer;
 pub mod dataframe;
 pub mod dyntuple;
 
+// Lossy block predictors are paired with exact residuals by their callers.
+pub mod float_u16;
+
 // Strings live in per-archetype buffers, shared by consecutive message chunks.
 pub mod smallbox;
 pub mod stringbuffer;

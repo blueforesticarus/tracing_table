@@ -57,7 +57,7 @@ impl AnyFrame<'_> {
                 let mut unpacked = Frame::new(frame.unit(), frame.len());
                 frame.uncompact(&mut unpacked);
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
-                **frame = CompactFrame::new_from(&unpacked);
+                **frame = CompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
             Self::BitCompact(frame) => {
                 if frame.try_write_row(index, row).is_ok() {
@@ -66,7 +66,7 @@ impl AnyFrame<'_> {
                 let mut unpacked = Frame::new(frame.unit(), frame.len());
                 frame.uncompact(&mut unpacked);
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
-                **frame = BitCompactFrame::new_from(&unpacked);
+                **frame = BitCompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
             Self::Archived(block) => {
                 if block.frame.try_write_row(index, row).is_ok() {
@@ -77,7 +77,8 @@ impl AnyFrame<'_> {
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
                 // Rebuilding replaces only the archive; Data's descriptor stays put.
                 let metadata = std::mem::take(&mut block.metadata);
-                **block = ArchivedBlock::new(&unpacked, metadata);
+                **block =
+                    ArchivedBlock::new_with_trailer(&unpacked, metadata, block.frame.trailer());
             }
         }
     }
@@ -388,8 +389,20 @@ impl CompactFrame {
         Self::initializer(frame).into_box()
     }
 
+    /// Share the same opaque-tail API as bit frames in byte-compaction builds.
+    pub fn new_from_with_trailer(frame: &Frame, trailer: &[u8]) -> Box<Self> {
+        Self::initializer_with_trailer(frame, trailer).into_box()
+    }
+
     /// Size the byte archive once and let its eventual owner allocate storage.
     pub(crate) fn initializer(frame: &Frame) -> Initializer<Self, impl FnOnce(*mut Self) + '_> {
+        Self::initializer_with_trailer(frame, &[])
+    }
+
+    pub(crate) fn initializer_with_trailer<'a>(
+        frame: &'a Frame,
+        trailer: &'a [u8],
+    ) -> Initializer<Self, impl FnOnce(*mut Self) + 'a> {
         assert!(frame.unit > 0, "frame unit must be nonzero");
         let unit = u16::try_from(frame.unit).expect("compact frame unit exceeds u16");
         let length = u16::try_from(frame.length).expect("compact frame length exceeds u16");
@@ -405,17 +418,21 @@ impl CompactFrame {
             .checked_mul(compact_unit)
             .and_then(|size| size.checked_add(header_size))
             .expect("compact frame buffer size overflow");
-        let layout = compact_frame_allocation_layout(buffer_size);
+        let allocation_bytes = buffer_size
+            .checked_add(trailer.len())
+            .expect("frame trailer overflow");
+        let layout = compact_frame_allocation_layout(allocation_bytes);
         // SAFETY: The checked layout matches the counters and tail. Borrow the
         // payload as MaybeUninit until packing has initialized every byte.
         unsafe {
-            Initializer::new(layout, buffer_size, move |raw: *mut Self| {
+            Initializer::new(layout, allocation_bytes, move |raw: *mut Self| {
                 ptr::addr_of_mut!((*raw).unit).write(unit);
                 ptr::addr_of_mut!((*raw).length).write(length);
                 let buffer = slice::from_raw_parts_mut(
                     ptr::addr_of_mut!((*raw).buffer).cast::<MaybeUninit<u8>>(),
-                    buffer_size,
+                    allocation_bytes,
                 );
+                copy_bytes(&mut buffer[buffer_size..], trailer);
                 copy_bytes(&mut buffer[..header_size], &source[..header_size]);
                 for (index, row) in source[header_size..].chunks_exact(frame.unit).enumerate() {
                     let offset = header_size + index * compact_unit;
@@ -483,13 +500,24 @@ impl CompactFrame {
     pub fn buffer(&mut self) -> CompactFrameLayout {
         let unit = self.unit();
         let header_size = unit + self.first().len();
-        let (header, data) = self.buffer.split_at_mut(header_size);
+        let payload_len = self.row_payload_len();
+        let (header, data) = self.buffer[..payload_len].split_at_mut(header_size);
         let (mask, first) = header.split_at_mut(unit);
         CompactFrameLayout {
             mask: Mask::get_mut(mask),
             first,
             data,
         }
+    }
+
+    fn row_payload_len(&self) -> usize {
+        self.unit() * if self.is_empty() { 1 } else { 2 }
+            + self.len().saturating_sub(1) * self.mask().compact_unit()
+    }
+
+    /// Exact opaque suffix, derived from the row schema and DST allocation length.
+    pub fn trailer(&self) -> &[u8] {
+        &self.buffer[self.row_payload_len()..]
     }
 
     pub fn uncompact(&self, new: &mut Frame) {
@@ -522,8 +550,8 @@ impl CompactFrame {
         CompressionStats {
             data: self.len() * self.unit(),
             // Every payload byte after the mask belongs to a stored row.
-            compressed: self.buffer.len() - self.unit(),
-            overhead: size_of_val(self) - self.buffer.len() + self.unit(),
+            compressed: self.row_payload_len() - self.unit(),
+            overhead: size_of_val(self) - self.row_payload_len() + self.unit(),
             overalloc: 0,
         }
     }

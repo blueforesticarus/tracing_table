@@ -151,16 +151,24 @@ impl PerCallsiteData {
                 .data
                 .ring
                 .iter()
-                .map(|b| (b.data.frame.len(), &b.descriptor, &b.data.metadata))
+                .map(|b| {
+                    (
+                        b.data.frame.len(),
+                        &b.descriptor,
+                        &b.data.metadata,
+                        b.data.parent_offsets(),
+                    )
+                })
                 .chain(std::iter::once((
                     arch.data.active.length,
                     &arch.data.active_descriptor,
                     &arch.data.active_metadata,
+                    arch.data.active_parent_offsets(),
                 )));
             let mut rows = arch.data.iter();
             let mut strings = None;
             let mut string_id = None;
-            for (count, descriptor, metadata) in frames {
+            for (count, descriptor, metadata, parent_offsets) in frames {
                 if count == 0 {
                     continue;
                 }
@@ -212,7 +220,13 @@ impl PerCallsiteData {
                             );
                         }
                         if a.parent {
-                            row.parent = Some(reader.span());
+                            let residual = reader.u64();
+                            let entry = parent_offsets.entry(reader.u16());
+                            row.parent = Some(SpanId {
+                                index: entry.decode(residual),
+                                callsite: entry.callsite,
+                                archetype: entry.archetype,
+                            });
                         }
                     }
                     if a.follows_from {
