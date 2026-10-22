@@ -40,13 +40,12 @@ pub use value::InputValue;
 pub mod template;
 
 /// Uncompressed bytes per archetype block; the reference comparison favors 4 KiB.
-/// Capacity rounds down to whole rows, subject to MESSAGE_BLOCK_MIN_ROWS.
+/// Capacity rounds down to whole rows, subject to RecordingLayer::message_block_min_rows.
 pub const MESSAGE_BLOCK_TARGET_SIZE: usize = 4 * 1024;
 
-/// Process-wide row floor for newly created blocks; configure before recording.
-/// The default preserves the 4 KiB policy. Experiments can prioritize a row count
-/// over that byte target without changing struct layouts or metadata accounting.
-pub static MESSAGE_BLOCK_MIN_ROWS: AtomicUsize = AtomicUsize::new(1);
+/// Default row floor for new recording layers; zero disables the optional floor.
+/// Kept for existing experiments; prefer RecordingLayer::message_block_min_rows.
+pub static MESSAGE_BLOCK_MIN_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
 #[rustfmt::skip]
@@ -79,7 +78,7 @@ pub struct PerCallsiteData {
 }
 
 impl PerCallsiteData {
-    fn get_arch(&mut self) -> usize {
+    fn get_arch(&mut self, min_rows: usize) -> usize {
         let archetype = &self.last_archetype; //aliased mutability issue with structs needs to be fixed. 
         let unit = archetype.unit();
 
@@ -87,9 +86,7 @@ impl PerCallsiteData {
             Some(i) => *i,
             None => {
                 // A row floor takes precedence over the target for wide schemas.
-                let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit)
-                    .max(MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed))
-                    .max(1);
+                let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit).max(min_rows).max(1);
                 let i = self.cache.len();
                 self.lookup.insert(archetype.clone(), i);
                 self.cache.push(
@@ -131,7 +128,7 @@ impl PerArchData {
     }
 
     /// Keep message-chunk policy here; BufferCollection only knows how to rotate.
-    fn prepare_chunk(&mut self) -> bool {
+    fn prepare_chunk(&mut self, string_compression_level: Option<u32>) -> bool {
         // Check caps only on initial allocation, frame growth, or chunk rollover.
         let allocated = self.data.active.length == self.data.active.capacity()
             || (self.data.count == 1 && self.data.active.length == 0);
@@ -144,7 +141,9 @@ impl PerArchData {
             // target within half a delta. Oversized chunks remain indivisible.
             let projected = size.saturating_add(delta).saturating_add(delta / 2);
             if size > 0 && projected >= STRING_BUFFER_TARGET_SIZE.load(Ordering::Relaxed) {
-                self.strings.rotate(false); // Expansion rebuilds the index from entry lengths.
+                // Expansion rebuilds the index from entry lengths for either encoder.
+                self.strings
+                    .rotate_with_level(false, string_compression_level);
             }
             self.chunk_string_start = self.strings.active.byte_len();
             self.data.string_buffer = self.strings.active_index();
@@ -289,6 +288,14 @@ pub struct RecordingLayer {
     /// Used for newly registered callsites; configure before recording.
     pub string_storage: StringStorage,
 
+    /// Some(3) defaults to native LZ4 HC3; None selects lz4_flex.
+    /// Initialized from STRING_COMPRESSION_LEVEL ("flex" or 1..=12).
+    pub string_compression_level: Option<u32>,
+
+    /// Optional row floor over the byte target; zero disables it (default).
+    /// Initialized from MESSAGE_BLOCK_MIN_ROWS; configure before recording.
+    pub message_block_min_rows: usize,
+
     /// Retained chunk/string storage limits in bytes; active storage is protected.
     pub global_memory_cap: usize,
     pub callsite_memory_cap: usize,
@@ -309,6 +316,22 @@ impl RecordingLayer {
             last_event: Mutex::new(None),
             timestamp_bit_shift: 10,
             string_storage: StringStorage::Offset,
+            // Preserve the explicit flex override while defaulting to HC3.
+            string_compression_level: match std::env::var("STRING_COMPRESSION_LEVEL").as_deref() {
+                Ok("flex") => None,
+                Ok(value) => Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|level| (1..=12).contains(level))
+                        .unwrap_or(3),
+                ),
+                Err(_) => Some(3),
+            },
+            message_block_min_rows: std::env::var("MESSAGE_BLOCK_MIN_ROWS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed)),
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
@@ -759,9 +782,9 @@ impl RecordingLayer {
         site.last_archetype.is_span_end = false;
         site.last_archetype.is_event = is_event;
         let callsite = site.id;
-        let index = site.get_arch();
+        let index = site.get_arch(self.message_block_min_rows);
         let arch = &mut site.cache[index];
-        let allocated = arch.prepare_chunk();
+        let allocated = arch.prepare_chunk(self.string_compression_level);
         let (bytes, index) = arch.data.allocate();
         let id = SpanId {
             index: index as u64,
@@ -841,10 +864,10 @@ impl RecordingLayer {
             callsite_data.last_archetype.parent = false;
 
             // let callsite = callsite_data.id;
-            let arch = callsite_data.get_arch();
+            let arch = callsite_data.get_arch(self.message_block_min_rows);
             let arch = &mut callsite_data.cache[arch];
 
-            allocated = arch.prepare_chunk();
+            allocated = arch.prepare_chunk(self.string_compression_level);
             let (data, _index) = arch.data.allocate();
             let mut data = BytePacker::new(data);
             // Write the header by value through its verified NoUninit implementation.
@@ -1306,7 +1329,9 @@ mod test {
     #[test]
     fn only_empty_chunks_can_change_string_buffers() {
         use super::*;
-        let recorder = Arc::new(RecordingLayer::new());
+        let mut layer = RecordingLayer::new();
+        layer.string_compression_level = Some(9); // Exercise native HC through recording.
+        let recorder = Arc::new(layer);
         let _guard = tracing::subscriber::set_default(
             Registry::default().with(LocalRecordingLayer(recorder.clone())),
         );
@@ -1327,13 +1352,13 @@ mod test {
         // Tiny dummy row chunks exercise populated and already-cycled states.
         arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
-        arch.prepare_chunk();
+        arch.prepare_chunk(recorder.string_compression_level);
         assert_eq!(arch.data.string_buffer, 0);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.data.cycle_if_needed();
         assert_eq!(arch.data.active.length, 0);
-        arch.prepare_chunk();
-        arch.prepare_chunk(); // Repeated preparation must not rotate again.
+        arch.prepare_chunk(recorder.string_compression_level);
+        arch.prepare_chunk(recorder.string_compression_level); // Repeated preparation must not rotate again.
         assert_eq!(arch.data.ring[0].string_buffer, 0);
         assert_eq!(arch.data.string_buffer, 1);
         let old = arch.strings.get(0).unwrap();

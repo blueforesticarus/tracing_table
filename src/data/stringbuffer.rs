@@ -210,13 +210,37 @@ impl Buffer {
 
     /// Consume the writable cache, discarding its dedup lookup.
     pub fn compress(self, keep_index: bool) -> CompressedBuffer {
+        self.compress_with_level(keep_index, None)
+    }
+
+    /// Keep the size-prefixed block format identical across flex and native HC.
+    pub fn compress_with_level(self, keep_index: bool, level: Option<u32>) -> CompressedBuffer {
+        fn compress(bytes: &[u8], level: Option<u32>) -> Box<[u8]> {
+            // Native HC expects an addressable source; empty Vecs have a dangling pointer.
+            if bytes.is_empty() {
+                return lz4_flex::compress_prepend_size(bytes).into_boxed_slice();
+            }
+            match level {
+                None => lz4_flex::compress_prepend_size(bytes),
+                Some(level) => {
+                    assert!((1..=12).contains(&level), "LZ4 HC level must be 1..=12");
+                    lz4::block::compress(
+                        bytes,
+                        Some(lz4::block::CompressionMode::HIGHCOMPRESSION(level as i32)),
+                        true,
+                    )
+                    .expect("string buffer LZ4 compression")
+                }
+            }
+            .into_boxed_slice()
+        }
         // TODO compressing index is probably pointless
         let index = keep_index.then(|| {
             let bytes: Vec<u8> = self.index.iter().flat_map(|v| v.to_le_bytes()).collect();
-            lz4_flex::compress_prepend_size(&bytes).into_boxed_slice()
+            compress(&bytes, level)
         });
         CompressedBuffer {
-            data: lz4_flex::compress_prepend_size(&self.data).into_boxed_slice(),
+            data: compress(&self.data, level),
             index,
         }
     }
@@ -397,8 +421,13 @@ impl BufferCollection {
 
     /// Freeze the active buffer and start an empty one, returning its ID.
     pub fn rotate(&mut self, keep_index: bool) -> usize {
+        self.rotate_with_level(keep_index, None)
+    }
+
+    /// The recording layer chooses the encoder; buffer IDs and readers stay the same.
+    pub fn rotate_with_level(&mut self, keep_index: bool, level: Option<u32>) -> usize {
         self.compressed
-            .push_back(std::mem::take(&mut self.active).compress(keep_index));
+            .push_back(std::mem::take(&mut self.active).compress_with_level(keep_index, level));
         self.active_index()
     }
 
@@ -461,8 +490,14 @@ mod tests {
             assert_eq!(buffer.add_string(text), address);
         }
         assert_eq!(buffer.byte_len(), stats.data);
-        for keep_index in [false, true] {
-            let compressed = buffer.clone().compress(keep_index);
+        // Native HC blocks must remain readable by flex, with and without an index.
+        for (keep_index, level) in [None, Some(1), Some(3), Some(9), Some(12)]
+            .into_iter()
+            .flat_map(|level| [false, true].map(|keep_index| (keep_index, level)))
+        {
+            let empty = Buffer::default().compress_with_level(keep_index, level);
+            assert!(empty.decompress().unwrap().is_empty());
+            let compressed = buffer.clone().compress_with_level(keep_index, level);
             assert_eq!(compressed.has_index(), keep_index);
             let stats = compressed.compression_ratio();
             assert_eq!(stats.data, buffer.byte_len());
