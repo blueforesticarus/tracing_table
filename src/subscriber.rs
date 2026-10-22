@@ -280,8 +280,8 @@ pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static>
     })
 }
 
-/// Row-header time: nanoseconds since the recorder started, shifted right by
-/// RecordingLayer::timestamp_bit_shift. Shared by row sizing, writing, and decoding.
+/// Row-header time: zigzag offset from the block's immutable timestamp.start,
+/// in ticks of 1 << RecordingLayer::timestamp_bit_shift nanoseconds.
 /// Span end slots store duration + 1 instead; zero marks a still-open span.
 pub type PackedTimestamp = u64;
 
@@ -318,6 +318,10 @@ pub struct RecordingLayer {
     /// TODO could be automatic based on time between messages.
     pub timestamp_bit_shift: u8,
 
+    /// Permit row timestamps earlier than their block's fixed origin. Defaults
+    /// to false (panic); signed offsets always use the same zigzag wire layout.
+    pub allow_negative_timestamp_offsets: bool,
+
     /// Used for newly registered callsites; configure before recording.
     pub string_storage: StringStorage,
 
@@ -348,6 +352,7 @@ impl RecordingLayer {
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
             last_event: Mutex::new(None),
             timestamp_bit_shift: 10,
+            allow_negative_timestamp_offsets: false,
             string_storage: StringStorage::Offset,
             // Preserve the explicit flex override while defaulting to HC3.
             string_compression_level: match std::env::var("STRING_COMPRESSION_LEVEL").as_deref() {
@@ -816,14 +821,16 @@ impl RecordingLayer {
         let index = site.get_arch(self.message_block_min_rows);
         let arch = &mut site.cache[index];
         let allocated = arch.prepare_chunk(self.string_compression_level);
-        let (bytes, index) = arch.data.allocate();
+        let (bytes, index, timestamp_offset) = arch
+            .data
+            .allocate(time.value, self.allow_negative_timestamp_offsets);
         let id = SpanId {
             index: index as u64,
             callsite: callsite as u32,
             archetype: arch.id,
         };
         let mut packer = BytePacker::new(bytes);
-        packer.write_any_value(time.value, false);
+        packer.write_any_value(timestamp_offset, false);
         if is_event {
             // Same-archetype runs already have row order; count only transitions
             // within a shifted tick. Keep the full callsite ID (event IDs exceed u32).
@@ -904,7 +911,8 @@ impl RecordingLayer {
             let arch = &mut callsite_data.cache[arch];
 
             allocated = arch.prepare_chunk(self.string_compression_level);
-            let (data, _index) = arch.data.allocate();
+            // Update rows carry no timestamp offset, so arrival order is unrestricted.
+            let (data, _index, _) = arch.data.allocate(time.value, true);
             let mut data = BytePacker::new(data);
             // Write the header by value through its verified NoUninit implementation.
             data.write_any_value(id, false); // end data points to start data
@@ -929,9 +937,10 @@ impl RecordingLayer {
         {
             let data = &mut callsite_data.cache[id.archetype as usize].data;
             // A long-lived span may close after its start chunk has been evicted.
-            let retained = if let Some(mut row) = data.get_mut(id.index as usize) {
+            let retained = if let Some((descriptor, mut row)) = data.get_mut(id.index as usize) {
                 let row = row.get_mut();
-                let start = PackedTimestamp::from_ne_bytes(row[..8].try_into().unwrap());
+                let offset = PackedTimestamp::from_ne_bytes(row[..8].try_into().unwrap());
+                let start = descriptor.decode_timestamp(offset);
                 let mut packer = BytePacker::new(row);
                 packer.skip::<PackedTimestamp>(false);
                 // Bias the duration so a zero-tick closed span differs from an open span.
@@ -1102,10 +1111,101 @@ mod test {
     use std::sync::Arc;
 
     use streaming_iterator::StreamingIterator;
-    use tracing::{Level, debug, info, span};
+    use tracing::{Level, Metadata, debug, info, span};
     use tracing_subscriber::{Registry, layer::SubscriberExt};
 
     use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
+
+    // Shared static metadata exercises both row headers without a seed subscriber.
+    fn timestamp_metadata() -> [&'static Metadata<'static>; 2] {
+        use tracing_core::Callsite;
+        [
+            tracing::callsite!(name: "timestamp event", kind: tracing_core::Kind::EVENT, fields:)
+                .metadata(),
+            tracing::callsite!(name: "timestamp span", kind: tracing_core::Kind::SPAN, fields:)
+                .metadata(),
+        ]
+    }
+
+    fn timestamp(value: u64) -> super::Time {
+        super::Time { value, shift: 0 }
+    }
+
+    #[test]
+    fn block_timestamp_offsets_preserve_event_and_span_starts_forever() {
+        use crate::data::blockbuffer::BlockCache;
+        for metadata in timestamp_metadata() {
+            let mut recorder = RecordingLayer::new();
+            recorder.allow_negative_timestamp_offsets = true;
+            recorder.global_memory_cap = usize::MAX;
+            recorder.callsite_memory_cap = usize::MAX;
+            recorder.record_start(metadata, timestamp(0), None, false, |_| {});
+            let shared = recorder.callsites.read().values().next().unwrap().clone();
+            {
+                let mut site = shared.write();
+                let arch = &mut site.cache[0];
+                // Tiny fixed-capacity blocks force two archives and an active tail.
+                arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
+            }
+            let times = [1_000, 999, 1_005, 5_000, 4_990];
+            let spans: Vec<_> = times
+                .into_iter()
+                .map(|ts| recorder.record_start(metadata, timestamp(ts), None, false, |_| {}))
+                .collect();
+            if metadata.is_span() {
+                // Patch archived and active rows; decoded starts must stay exact.
+                for &span in &spans[..4] {
+                    recorder.close_span(metadata, span, timestamp(6_000), None, None);
+                }
+            }
+            let mut site = shared.write();
+            let mut decoded = Vec::new();
+            site.visit_rows(|row| {
+                decoded.push(row.timestamp.unwrap());
+                if metadata.is_span() {
+                    assert_eq!(
+                        row.end_timestamp,
+                        Some(if row.index == 5 { 0 } else { 6_000 })
+                    );
+                }
+            });
+            assert_eq!(decoded, times);
+            let data = &mut site.cache[0].data;
+            let mut raw = data.iter();
+            let mut offsets = Vec::new();
+            while let Some(row) = raw.next() {
+                offsets.push(u64::from_ne_bytes(row[..8].try_into().unwrap()));
+            }
+            drop(raw);
+            assert_eq!(offsets, [0, 1, 0, 7_990, 0]);
+            assert_eq!(data.ring[0].descriptor.timestamp.start, 1_000);
+            assert_eq!(data.ring[1].descriptor.timestamp.start, 1_005);
+            assert_eq!(data.active_descriptor.timestamp.start, 4_990);
+            data.drop_chunk(1).unwrap();
+            assert!(data.descriptor(1).is_none());
+            drop(site);
+            let mut retained = Vec::new();
+            shared
+                .read()
+                .visit_rows(|row| retained.push(row.timestamp.unwrap()));
+            assert_eq!(retained, times[2..]);
+        }
+    }
+
+    #[test]
+    fn earlier_block_timestamp_panics_by_default_without_allocating_a_row() {
+        let metadata = timestamp_metadata()[0];
+        let recorder = RecordingLayer::new();
+        assert!(!recorder.allow_negative_timestamp_offsets);
+        recorder.record_start(metadata, timestamp(1_000), None, false, |_| {});
+        let shared = recorder.callsites.read().values().next().unwrap().clone();
+        // Rejection must leave the existing origin and row count intact.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recorder.record_start(metadata, timestamp(999), None, false, |_| {});
+        }));
+        assert!(result.is_err());
+        assert_eq!(shared.read().cache[0].data.active.length, 1);
+    }
 
     #[test]
     fn timestamp_index_saturates_until_the_tick_changes() {

@@ -66,6 +66,9 @@ pub struct Descriptor {
     pub string_buffer: usize,
     /// Deduplicated deferred-span block candidates; the boxed Vec is allocated lazily.
     pub span_fields: Option<Box<Vec<SpanFieldsRef>>>,
+    /// Invariant: start is the first row's timestamp and NEVER changes for this block
+    /// ts are stored as offsets from start, preserving exact start times forever.
+    /// if negative offsets are enabled, start need not be the minimum timestamp.
     pub(crate) timestamp: Range<usize>,
 }
 
@@ -78,6 +81,26 @@ pub struct SpanFieldsRef {
 }
 
 impl Descriptor {
+    /// Zigzag preserves small offsets of either sign for the frame compressor.
+    pub(crate) fn encode_timestamp(&self, ts: u64, allow_negative: bool) -> u64 {
+        let base = self.timestamp.start as u64;
+        assert!(
+            allow_negative || ts >= base,
+            "timestamp precedes block timestamp base"
+        );
+        let delta =
+            i64::try_from(i128::from(ts) - i128::from(base)).expect("timestamp offset exceeds i64");
+        ((delta as u64) << 1) ^ ((delta >> 63) as u64)
+    }
+
+    /// Recover nominal time without consulting the mutable end of the range.
+    pub fn decode_timestamp(&self, offset: u64) -> u64 {
+        let delta = ((offset >> 1) as i64) ^ -((offset & 1) as i64);
+        (self.timestamp.start as u64)
+            .checked_add_signed(delta)
+            .expect("timestamp offset exceeds u64")
+    }
+
     /// Count inline metadata, the rare boxed Vec header, and used/spare entries once.
     pub fn compression_ratio(&self) -> CompressionStats {
         let mut stats = CompressionStats {
@@ -177,14 +200,33 @@ impl BlockCache {
         self.active.clear();
     }
 
-    pub fn allocate(&mut self) -> (&mut [u8], usize) {
+    /// Initialize the origin after rollover and validate before committing a row.
+    /// Return its encoded timestamp alongside the bytes and absolute row index.
+    pub fn allocate(&mut self, ts: u64, allow_negative: bool) -> (&mut [u8], usize, u64) {
         self.cycle_if_needed();
+        if self.active.length == 0 {
+            let ts = usize::try_from(ts).expect("block timestamp exceeds usize");
+            self.active_descriptor.timestamp = ts..ts;
+        }
+        let offset = self.active_descriptor.encode_timestamp(ts, allow_negative);
         let (buffer, index) = self.active.allocate().unwrap();
-        (buffer, index + self.active_descriptor.index)
+        (buffer, index + self.active_descriptor.index, offset)
+    }
+
+    /// Find metadata by absolute retained row index, including after eviction.
+    pub fn descriptor(&self, index: usize) -> Option<&Descriptor> {
+        if index >= self.active_descriptor.index {
+            return (index - self.active_descriptor.index < self.active.length)
+                .then_some(&self.active_descriptor);
+        }
+        self.ring.iter().rev().find_map(|block| {
+            (index >= block.descriptor.index && index - block.descriptor.index < block.data.len())
+                .then_some(&block.descriptor)
+        })
     }
 
     pub fn push(&mut self, data: &[u8], ts: usize) {
-        self.allocate().0.copy_from_slice(data);
+        self.allocate(ts as u64, true).0.copy_from_slice(data);
         self.update_mask_after_append();
         self.update_ts_range(ts, None);
     }
@@ -207,21 +249,24 @@ impl BlockCache {
         Ok(())
     }
 
-    pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<Row<'a>> {
+    /// Borrow a row and its descriptor together, so decoding needs one lookup.
+    pub fn get_mut(&mut self, index: usize) -> Option<(&Descriptor, Row<'_>)> {
         if index >= self.active_descriptor.index {
-            Row {
+            if index - self.active_descriptor.index >= self.active.length {
+                return None;
+            }
+            let row = Row {
                 init: false, // we aren't copying the data, just providing the buffer
                 buffer: RowBuffer::Owned(Box::default()),
                 index: index - self.active_descriptor.index,
                 frame: crate::data::dataframe::AnyFrame::Frame(&mut self.active),
-            }
-            .into()
+            };
+            Some((&self.active_descriptor, row))
         } else {
-            let Some(data) = self
-                .ring
-                .iter_mut()
-                .rev()
-                .find(|d| d.descriptor.index <= index)
+            let Some(data) =
+                self.ring.iter_mut().rev().find(|d| {
+                    d.descriptor.index <= index && index - d.descriptor.index < d.data.len()
+                })
             else {
                 return None;
             };
@@ -230,13 +275,13 @@ impl BlockCache {
             let frame = AnyFrame::BitCompact(&mut data.data);
             #[cfg(not(feature = "bit-compression"))]
             let frame = AnyFrame::Compact(&mut data.data);
-            Row {
+            let row = Row {
                 init: false, // Decode only if the caller accesses the archived row.
                 buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
                 index: index - data.descriptor.index,
                 frame,
-            }
-            .into()
+            };
+            Some((&data.descriptor, row))
         }
     }
 
@@ -300,8 +345,7 @@ impl BlockCache {
         self.active.update_mask(self.active.length - 1, false /*only need to check for newly constant bits when changing data, not when appending. */);
     }
 
-    // track earliest and latest ts for block
-    // called when a span closes
+    // Extend the upper bound on append/close; NEVER move the decoding origin.
     pub fn update_ts_range(&mut self, ts: usize, index: Option<usize>) {
         let index = index.unwrap_or(self.active_descriptor.index + self.active.length);
 
@@ -318,9 +362,6 @@ impl BlockCache {
                 .timestamp
         };
 
-        if timestamp.start == 0 || timestamp.start > ts {
-            timestamp.start = ts;
-        }
         if timestamp.end < ts {
             timestamp.end = ts;
         }
@@ -378,6 +419,42 @@ mod test {
     use crate::data::dataframe::Frame;
 
     use super::BlockCache;
+
+    #[test]
+    fn timestamp_origin_zero_is_not_an_uninitialized_sentinel() {
+        let mut cache = BlockCache::new(8, 2, 2);
+        for ts in [0, 7, 20] {
+            cache.push(&[0; 8], ts);
+        }
+        // Later appends, archived closes, and active closes only grow the end.
+        cache.update_ts_range(100, Some(1));
+        cache.update_ts_range(200, Some(3));
+        assert_eq!(cache.ring[0].descriptor.timestamp, 0..100);
+        assert_eq!(cache.active_descriptor.timestamp, 20..200);
+        // Growing a starter frame also preserves the first row's origin.
+        let mut growing = BlockCache::new(8, 1, 8);
+        growing.push(&[0; 8], 100);
+        growing.push(&[0; 8], 50);
+        assert!(growing.active.capacity() > 1);
+        assert_eq!(growing.active_descriptor.timestamp, 100..100);
+    }
+
+    #[test]
+    fn zigzag_timestamp_offsets_cover_signed_limits_without_truncation() {
+        use super::Descriptor;
+        let descriptor = Descriptor {
+            timestamp: (1usize << 63)..usize::MAX,
+            ..Default::default()
+        };
+        // The full signed offset domain round-trips even at large absolute times.
+        for (ts, expected) in [(0, u64::MAX), (1 << 63, 0), (u64::MAX, u64::MAX - 1)] {
+            let offset = descriptor.encode_timestamp(ts, true);
+            assert_eq!(offset, expected);
+            assert_eq!(descriptor.decode_timestamp(offset), ts);
+        }
+        let zero = Descriptor::default();
+        assert!(std::panic::catch_unwind(|| zero.encode_timestamp(u64::MAX, true)).is_err());
+    }
 
     #[test]
     fn span_candidates_deduplicate_move_with_the_block_and_drop_with_it() {
@@ -475,7 +552,7 @@ mod test {
         // Patch an archived baseline, then another row with an already-varying
         // bit. Other archived frames remain fully constant and must terminate.
         for (index, bit) in [(1, 0x80), (2, 0x80), (17, 0)] {
-            cache.get_mut(index).unwrap().get_mut()[0] ^= bit;
+            cache.get_mut(index).unwrap().1.get_mut()[0] ^= bit;
             expected[index - 1][0] ^= bit; // Absolute row indexes start at one.
         }
         let mut rows = cache.iter();

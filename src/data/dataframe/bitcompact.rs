@@ -11,11 +11,12 @@ use super::{CompressionStats, Frame, Mask, NeedsRebuild, StackVec};
 /// Stores the mask and first row once, then only varying bits for later rows.
 /// Each packed row starts on a byte boundary and occupies ceil(varying_bits / 8)
 /// bytes. Bits are ordered by source byte, then least-significant source bit.
-#[repr(C, align(16))]
+#[repr(C)]
 pub struct BitCompactFrame {
-    unit: usize,
-    length: usize,
-    compact_unit: usize,
+    // Widen these bounded counters before doing row or buffer arithmetic.
+    unit: u16,
+    length: u16,
+    compact_unit: u16,
     // Private spare storage permits construction without zeroing the allocation.
     // new_from initializes every payload byte before exposing the completed frame.
     buffer: [MaybeUninit<u8>],
@@ -24,6 +25,9 @@ pub struct BitCompactFrame {
 impl BitCompactFrame {
     pub fn new_from(frame: &Frame) -> Box<Self> {
         assert!(frame.unit > 0, "frame unit must be nonzero");
+        // Validate active-frame metadata before allocating the narrower archive.
+        let unit = u16::try_from(frame.unit).expect("bit compact frame unit exceeds u16");
+        let length = u16::try_from(frame.length).expect("bit compact frame length exceeds u16");
         let source_size = frame
             .length
             .checked_mul(frame.unit)
@@ -49,6 +53,8 @@ impl BitCompactFrame {
             .checked_mul(compact_unit)
             .and_then(|size| size.checked_add(header_size))
             .expect("bit compact frame size overflow");
+        let stored_compact_unit =
+            u16::try_from(compact_unit).expect("bit compact frame compact unit exceeds u16");
         let layout = allocation_layout(buffer_size);
 
         // SAFETY: Header fields are written before Box creation. The tail is
@@ -59,9 +65,9 @@ impl BitCompactFrame {
                 alloc::handle_alloc_error(layout);
             }
             let raw: *mut Self = ptr::from_raw_parts_mut(allocation, buffer_size);
-            ptr::addr_of_mut!((*raw).unit).write(frame.unit);
-            ptr::addr_of_mut!((*raw).length).write(frame.length);
-            ptr::addr_of_mut!((*raw).compact_unit).write(compact_unit);
+            ptr::addr_of_mut!((*raw).unit).write(unit);
+            ptr::addr_of_mut!((*raw).length).write(length);
+            ptr::addr_of_mut!((*raw).compact_unit).write(stored_compact_unit);
             Box::from_raw(raw)
         };
         copy_bytes(&mut compact.buffer[..header_size], &source[..header_size]);
@@ -78,16 +84,16 @@ impl BitCompactFrame {
     }
 
     pub fn unit(&self) -> usize {
-        self.unit
+        usize::from(self.unit)
     }
     pub fn len(&self) -> usize {
-        self.length
+        usize::from(self.length)
     }
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.len() == 0
     }
     pub fn compact_unit(&self) -> usize {
-        self.compact_unit
+        usize::from(self.compact_unit)
     }
 
     /// Initialized mask, first row (if any), and packed rows; there is no spare tail.
@@ -98,30 +104,30 @@ impl BitCompactFrame {
     }
 
     pub fn mask(&self) -> &Mask {
-        Mask::get(&self.buffer()[..self.unit])
+        Mask::get(&self.buffer()[..self.unit()])
     }
 
     pub fn first(&self) -> &[u8] {
         let end = if self.is_empty() {
-            self.unit
+            self.unit()
         } else {
-            2 * self.unit
+            2 * self.unit()
         };
-        &self.buffer()[self.unit..end]
+        &self.buffer()[self.unit()..end]
     }
 
     /// Decode one row into an existing buffer, without allocating or clearing it.
     pub fn read_row(&self, index: usize, output: &mut [u8]) {
-        assert!(index < self.length, "row index out of bounds");
-        assert_eq!(output.len(), self.unit, "row size mismatch");
+        assert!(index < self.len(), "row index out of bounds");
+        assert_eq!(output.len(), self.unit(), "row size mismatch");
         output.copy_from_slice(self.first());
         self.unpack_varying(index, output);
     }
 
     /// Update in place, or return NeedsRebuild without changes if a constant bit changes.
     pub fn try_write_row(&mut self, index: usize, row: &[u8]) -> Result<(), NeedsRebuild> {
-        assert!(index < self.length, "row index out of bounds");
-        assert_eq!(row.len(), self.unit, "row size mismatch");
+        assert!(index < self.len(), "row index out of bounds");
+        assert_eq!(row.len(), self.unit(), "row size mismatch");
         let first = self.first();
         let constants_changed = self
             .mask()
@@ -132,8 +138,8 @@ impl BitCompactFrame {
             return Err(NeedsRebuild);
         }
 
-        let unit = self.unit;
-        let compact_unit = self.compact_unit;
+        let unit = self.unit();
+        let compact_unit = self.compact_unit();
         let (header, packed) = self.buffer.split_at_mut(2 * unit);
         if index == 0 {
             copy_bytes(&mut header[unit..], row);
@@ -150,8 +156,8 @@ impl BitCompactFrame {
         if index == 0 {
             return;
         }
-        let offset = 2 * self.unit + (index - 1) * self.compact_unit;
-        let packed = &self.buffer()[offset..offset + self.compact_unit];
+        let offset = 2 * self.unit() + (index - 1) * self.compact_unit();
+        let packed = &self.buffer()[offset..offset + self.compact_unit()];
         let mut position = 0;
         for (value, &varying) in output.iter_mut().zip(self.mask().iter()) {
             *value &= !varying;
@@ -170,25 +176,25 @@ impl BitCompactFrame {
     }
 
     pub fn uncompact(&self, new: &mut Frame) {
-        assert_eq!(new.unit, self.unit, "uncompact unit mismatch");
+        assert_eq!(new.unit, self.unit(), "uncompact unit mismatch");
         assert!(
-            new.capacity() >= self.length,
+            new.capacity() >= self.len(),
             "uncompact destination is too small"
         );
         new.length = 0;
-        new.buffer[..self.unit].copy_from_slice(self.mask());
-        for index in 0..self.length {
-            let start = (index + 1) * self.unit;
+        new.buffer[..self.unit()].copy_from_slice(self.mask());
+        for index in 0..self.len() {
+            let start = (index + 1) * self.unit();
             // SAFETY: Seed the entire destination row before creating a readable
             // slice over it. The source and destination are disjoint allocations.
             unsafe {
                 ptr::copy_nonoverlapping(
                     self.first().as_ptr(),
                     new.buffer.as_mut_ptr().add(start),
-                    self.unit,
+                    self.unit(),
                 );
             }
-            self.unpack_varying(index, &mut new.buffer[start..start + self.unit]);
+            self.unpack_varying(index, &mut new.buffer[start..start + self.unit()]);
             // Publish after writing; the copied mask already describes these rows.
             new.length += 1;
         }
@@ -196,9 +202,9 @@ impl BitCompactFrame {
 
     pub fn compression_ratio(&self) -> CompressionStats {
         CompressionStats {
-            data: self.length * self.unit,
-            compressed: self.buffer.len() - self.unit,
-            overhead: size_of_val(self) - self.buffer.len() + self.unit,
+            data: self.len() * self.unit(),
+            compressed: self.buffer.len() - self.unit(),
+            overhead: size_of_val(self) - self.buffer.len() + self.unit(),
             overalloc: 0,
         }
     }
@@ -233,11 +239,12 @@ fn pack_row(row: &[u8], mask: &[u8], output: &mut [MaybeUninit<u8>]) {
 }
 
 fn allocation_layout(buffer_size: usize) -> Layout {
-    // Keep the three usize fields and trailing alignment padding in the DST layout.
-    let size = size_of::<[usize; 3]>()
+    // Keep the three u16 fields and trailing alignment padding in the DST layout.
+    let size = size_of::<[u16; 3]>()
         .checked_add(buffer_size)
         .expect("bit compact frame allocation size overflow");
-    Layout::from_size_align(size, 16)
+    // Match the header's natural alignment so Box deallocates with the same layout.
+    Layout::from_size_align(size, align_of::<u16>())
         .expect("bit compact frame allocation exceeds layout limits")
         .pad_to_align()
 }
@@ -277,16 +284,16 @@ impl StreamingIterator for BitCompactFrameIter<'_> {
 
     fn advance(&mut self) {
         // Count rows, including identical rows whose packed size is zero bytes.
-        if self.yielded < self.frame.length {
+        if self.yielded < self.frame.len() {
             self.frame.read_row(self.yielded, &mut self.buffer);
             self.yielded += 1;
         } else {
-            self.yielded = self.frame.length + 1;
+            self.yielded = self.frame.len() + 1;
         }
     }
 
     fn get(&self) -> Option<&Self::Item> {
-        (self.yielded > 0 && self.yielded <= self.frame.length).then(|| self.buffer.as_ref())
+        (self.yielded > 0 && self.yielded <= self.frame.len()).then(|| self.buffer.as_ref())
     }
 }
 
@@ -395,6 +402,10 @@ mod tests {
             let mut compact = BitCompactFrame::new_from(&frame);
             assert_eq!(compact.compact_unit(), varying_bits.div_ceil(8));
             assert_eq!(compact.buffer().len(), 6 + varying_bits.div_ceil(8));
+            // Odd payload lengths still need final padding for the u16 header.
+            let layout = Layout::for_value(&*compact);
+            assert_eq!(layout.align(), align_of::<u16>());
+            assert_eq!(layout, allocation_layout(compact.buffer().len()));
             if varying_bits % 8 != 0 {
                 // Padding belongs to each row and must never contain source bits.
                 assert_eq!(compact.buffer().last().unwrap() >> (varying_bits % 8), 0);

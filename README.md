@@ -1,5 +1,8 @@
 This crate implements an memory-efficient cache for tracing logs, with support for per-callsite rollover. 
 
+Archived frames use bit compaction by default. Build with `--no-default-features`
+to use byte compaction, or set `default-features = false` on the dependency.
+
 # Rollover
 Every callsite (instance of trace!, info!, span! etc.) get's it's own cache of logs, with it's own rollover. This means that quick spamming logs (such as is common for level=trace) will not push uncommon logs (an important error, for example) off the queue. 
 
@@ -569,3 +572,28 @@ extra span fields and follows_from are both very uncommon (follows_from does not
 | Container metadata | 1,267,790 B | 1,056,709 B | **16.65%** |
 
 > container metadata went down because: smaller span rows let more rows fit into each 4 KiB block, so we need fewer blocks—and fewer containers around them.
+
+# timestamps are offsets now
+
+store timestamp as offset from block metadata. 
+shaves some data by potentially avoiding power-of-2 crossing. -> more constant bits
+
+| Storage | Before | After | Change |
+|---|---:|---:|---:|
+| Overall | 8,277,942 B | 8,086,422 B | −2.31% |
+| Span payload | 3,409,090 B | 3,302,500 B | −3.13% |
+| Event/log payload | 4,292,862 B | 4,208,457 B | −1.97% |
+| Overhead | 575,990 B | 575,465 B | −0.09% |
+
+TODO: stride
+
+# overhead reductions
+- changed compact / bitcompact frame header (unit, length) to u16 which saves 12 bytes per block.
+- reduce alignment to 2
+
+*this means blocks cannot be more than 2^16 rows which is fine.*
+
+| Storage | Before | After |
+|---|---:|---:|
+| Frame headers/alignment | 298,443 B | 57,405 B |
+| Archive total | 8,600,133 B | 8,359,095 B |

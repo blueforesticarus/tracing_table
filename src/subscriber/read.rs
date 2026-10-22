@@ -140,15 +140,16 @@ impl PerCallsiteData {
                 .data
                 .ring
                 .iter()
-                .map(|b| (b.data.len(), b.descriptor.string_buffer))
+                .map(|b| (b.data.len(), &b.descriptor))
                 .chain(std::iter::once((
                     arch.data.active.length,
-                    arch.data.active_descriptor.string_buffer,
+                    &arch.data.active_descriptor,
                 )));
             let mut rows = arch.data.iter();
             let mut strings = None;
             let mut string_id = None;
-            for (count, buffer_id) in frames {
+            for (count, descriptor) in frames {
+                let buffer_id = descriptor.string_buffer;
                 if count == 0 {
                     continue;
                 }
@@ -175,7 +176,8 @@ impl PerCallsiteData {
                     if a.is_span_end {
                         row.span = Some(reader.span());
                     } else {
-                        row.timestamp = Some(reader.u64());
+                        // Span end edits never move the block's decoding origin.
+                        row.timestamp = Some(descriptor.decode_timestamp(reader.u64()));
                         if a.is_event {
                             row.timestamp_index = Some(reader.u16());
                         } else {
