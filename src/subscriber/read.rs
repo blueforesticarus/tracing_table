@@ -31,6 +31,10 @@ pub struct DecodedRow {
     pub archetype: u32,
     pub index: u64,
     pub timestamp: Option<u64>,
+    /// Event/log run within a shifted tick. For nondecreasing timestamps, sort by
+    /// (timestamp, timestamp_index, index). Absent on spans and span updates.
+    /// u16::MAX marks lost ordering precision until the timestamp changes.
+    pub timestamp_index: Option<u16>,
     pub end_timestamp: Option<u64>,
     pub extra_fields: Option<SpanFieldsRef>,
     /// Present on span starts and update rows, absent on events.
@@ -50,6 +54,9 @@ impl Reader<'_> {
     }
     fn u32(&mut self) -> u32 {
         u32::from_ne_bytes(self.bytes())
+    }
+    fn u16(&mut self) -> u16 {
+        u16::from_ne_bytes(self.bytes())
     }
     fn u64(&mut self) -> u64 {
         u64::from_ne_bytes(self.bytes())
@@ -111,6 +118,7 @@ impl PerCallsiteData {
                         archetype: arch.id,
                         index,
                         timestamp: None,
+                        timestamp_index: None,
                         end_timestamp: None,
                         extra_fields: None,
                         span: None,
@@ -123,13 +131,22 @@ impl PerCallsiteData {
                         row.span = Some(reader.span());
                     } else {
                         row.timestamp = Some(reader.u64());
-                        if !a.is_event {
+                        if a.is_event {
+                            row.timestamp_index = Some(reader.u16());
+                        } else {
                             row.span = Some(SpanId {
                                 index: row.index,
                                 callsite: self.id as u32,
                                 archetype: arch.id,
                             });
-                            row.end_timestamp = Some(reader.u64());
+                            // Stored ends are duration + 1; preserve the public
+                            // nominal timestamp and existing zero-for-open API.
+                            let offset = reader.u64();
+                            row.end_timestamp = Some(if offset == 0 {
+                                0
+                            } else {
+                                row.timestamp.unwrap() + (offset - 1)
+                            });
                             row.extra_fields = Some(SpanFieldsRef {
                                 archetype: reader.u32(),
                                 block: reader.u32(),

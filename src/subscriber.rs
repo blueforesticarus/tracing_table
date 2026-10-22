@@ -12,7 +12,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use parking_lot::{ArcRwLockWriteGuard, RawRwLock, RwLock};
+use parking_lot::{ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
 use tracing::{
     Level, Metadata,
     field::{FieldSet, Visit},
@@ -242,6 +242,7 @@ pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static>
 
 /// Row-header time: nanoseconds since the recorder started, shifted right by
 /// RecordingLayer::timestamp_bit_shift. Shared by row sizing, writing, and decoding.
+/// Span end slots store duration + 1 instead; zero marks a still-open span.
 pub type PackedTimestamp = u64;
 
 // NOTE: this could include a basis to indicate whether it is system time or monotonic, and to convert between them
@@ -269,8 +270,8 @@ pub struct RecordingLayer {
     event_id_counter: AtomicU64,
 
     /// How many bits to shift timestamp.
-    /// a value of 0 corresponds to nanoseconds since epoch
-    /// a value of 10 (the default) therefore has a resolution of 1.024 microseconds.
+    /// A value of 0 preserves nanoseconds since the recorder started.
+    /// The default of 10 gives a resolution of 1,024 nanoseconds per tick.
     /// You can adjust this to only store as much precision as is meaningfull.
     /// This is needed because the CompactFrame cannot filter out noise. For many callsites, timestamps will be the only recorded data.
     /// low variance (more signifigant) bits get automatically compressed when constant within a frame.
@@ -284,10 +285,9 @@ pub struct RecordingLayer {
     pub global_memory_cap: usize,
     pub callsite_memory_cap: usize,
 
-    /// XXX an actual problem with our system is that accurate log ordering cannot be recreated at the moment. Timestamps can be equal and we dont have ordering info across across archetypes
-    /// we probably also want thread number in the log somewhere
-    // pub last_ts: usize,
-    // pub ts_count: usize,
+    // Shared across event/log callsites; spans never advance this ordering state.
+    // Last shifted timestamp, (callsite, archetype), and run index.
+    last_event: Mutex<Option<(PackedTimestamp, (u64, u32), u16)>>,
     system_time: SystemTime,
     started: Instant,
 }
@@ -298,7 +298,8 @@ impl RecordingLayer {
             callsites: Default::default(),
             span_id_counter: 1.into(),
             event_id_counter: ((1usize + std::u32::MAX as usize) as u64).into(),
-            timestamp_bit_shift: 3,
+            last_event: Mutex::new(None),
+            timestamp_bit_shift: 10,
             string_storage: StringStorage::Offset,
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
@@ -529,7 +530,9 @@ impl Archetype {
         let mut bytes = 0;
         if !self.is_span_end {
             bytes += std::mem::size_of::<PackedTimestamp>();
-            if !self.is_event {
+            if self.is_event {
+                bytes += size_of::<u16>(); // timestamp index, before parent/fields
+            } else {
                 bytes += std::mem::size_of::<PackedTimestamp>(); //end timestamp
                 bytes += std::mem::size_of::<SpanFieldsRef>();
             }
@@ -759,7 +762,21 @@ impl RecordingLayer {
         };
         let mut packer = BytePacker::new(bytes);
         packer.write_any_value(time.value, false);
-        if !is_event {
+        if is_event {
+            // Same-archetype runs already have row order; count only transitions
+            // within a shifted tick. Keep the full callsite ID (event IDs exceed u32).
+            let mut last = self.last_event.lock();
+            let origin = (callsite, arch.id);
+            let count = match *last {
+                // MAX marks lost precision and stays saturated until the tick changes.
+                Some((ts, previous, count)) if ts == time.value => {
+                    count.saturating_add(u16::from(previous != origin))
+                }
+                _ => 0,
+            };
+            *last = Some((time.value, origin, count));
+            packer.write_any_value(count, false);
+        } else {
             packer.write_any_value(PackedTimestamp::default(), false);
             packer.write_any_value(SpanFieldsRef::default(), false);
             packer.write_any_value(PLACE_HOLDER, false);
@@ -772,7 +789,8 @@ impl RecordingLayer {
         if let Some(count) = arch.archetype.template {
             for argument in &fields.template_args[..count] {
                 packer.write_any_value(
-                    site.string_storage.intern(&mut arch.strings.active, argument),
+                    site.string_storage
+                        .intern(&mut arch.strings.active, argument),
                     false,
                 );
             }
@@ -842,9 +860,11 @@ impl RecordingLayer {
             // A long-lived span may close after its start chunk has been evicted.
             let retained = if let Some(mut row) = data.get_mut(id.index as usize) {
                 let row = row.get_mut();
+                let start = PackedTimestamp::from_ne_bytes(row[..8].try_into().unwrap());
                 let mut packer = BytePacker::new(row);
                 packer.skip::<PackedTimestamp>(false);
-                packer.write_any_value(time.value, false); // end timestamp;
+                // Bias the duration so a zero-tick closed span differs from an open span.
+                packer.write_any_value(time.value - start + 1, false);
                 packer.write_any_value(extra_fields, false);
                 if let Some(f) = follow_from {
                     packer.write_any_value(f, false)
@@ -1018,14 +1038,64 @@ mod test {
     use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
 
     #[test]
+    fn timestamp_index_saturates_until_the_tick_changes() {
+        fn emit() {
+            tracing::info!(parent: None, "same origin");
+        }
+        let mut layer = RecordingLayer::new();
+        layer.timestamp_bit_shift = 63; // All live calls in this test occupy tick zero.
+        let recorder = Arc::new(layer);
+        let dispatch =
+            tracing::Dispatch::new(Registry::default().with(LocalRecordingLayer(recorder.clone())));
+        tracing::dispatcher::with_default(&dispatch, || {
+            emit();
+            let (ts, origin, _) = recorder.last_event.lock().unwrap();
+            // Seed just below the limit instead of emitting 65K transitions.
+            *recorder.last_event.lock() = Some((ts, origin, u16::MAX - 1));
+            emit(); // Same origin retains MAX - 1.
+            tracing::info!(parent: None, "different origin"); // Reaches MAX.
+            emit(); // Further transitions saturate, including returns to an old origin.
+            emit();
+        });
+        let mut indices = Vec::new();
+        for site in recorder.callsites.read().values() {
+            site.read()
+                .visit_rows(|row| indices.push(row.timestamp_index.unwrap()));
+        }
+        indices.sort_unstable();
+        assert_eq!(indices, [0, u16::MAX - 1, u16::MAX, u16::MAX, u16::MAX]);
+
+        // A new shifted tick restores precise indexing even after saturation.
+        let metadata = recorder
+            .callsites
+            .read()
+            .values()
+            .next()
+            .unwrap()
+            .read()
+            .metadata;
+        recorder.record_start(
+            metadata,
+            super::Time {
+                value: 1,
+                shift: 63,
+            },
+            None,
+            false,
+            |_| {},
+        );
+        assert_eq!(recorder.last_event.lock().unwrap().2, 0);
+    }
+
+    #[test]
     fn matched_messages_store_only_buffer_offset_args() {
         fn emit(count: u64, message: &str) {
             tracing::info!(count, message, tail = "tail");
         }
         // Fill an archived block even when the configured target grows. The
-        // fixed template has the smallest row: timestamp, count and tail offset.
+        // fixed template has the smallest row: timestamp/index, count and tail offset.
         let pairs = super::MESSAGE_BLOCK_TARGET_SIZE
-            / (size_of::<super::PackedTimestamp>() + 8 + 4)
+            / (size_of::<super::PackedTimestamp>() + size_of::<u16>() + 8 + 4)
             + 1;
         for format in ["hello {name} {}!", "fixed"] {
             let recorder = Arc::new(RecordingLayer::new());
@@ -1073,7 +1143,11 @@ mod test {
                 assert_eq!(types[1], None); // No original message bytes or string offset.
                 assert_eq!(
                     matched.archetype.unit(),
-                    size_of::<super::PackedTimestamp>() + 8 + 4 + arg_count * size_of::<u32>()
+                    size_of::<super::PackedTimestamp>()
+                        + size_of::<u16>()
+                        + 8
+                        + 4
+                        + arg_count * size_of::<u32>()
                 );
                 assert_eq!(matched.data.active.unit, matched.archetype.unit());
                 assert!(!matched.data.ring.is_empty()); // Exercise compressed chunks too.
