@@ -45,14 +45,8 @@ pub struct BlockCache {
     /// Preserve absolute block references when eviction removes a prefix.
     pub offset: usize,
 
-    // starting index of active frame
-    pub count: usize,
-
-    /// BufferCollection ID used by string offsets in the active chunk.
-    pub string_buffer: usize,
-
-    // timestamp
-    timestamp: Range<usize>,
+    /// Metadata moves intact into Data when the active frame is archived.
+    pub active_descriptor: Descriptor,
 
     // used for get_mut
     edit_buffer: Vec<u8>,
@@ -60,10 +54,60 @@ pub struct BlockCache {
 
 pub struct Data {
     pub data: Box<ArchivedFrame>,
+    pub descriptor: Descriptor,
+}
+
+/// Metadata shared by active and archived blocks; row indices remain absolute.
+#[derive(Debug, Default)]
+pub struct Descriptor {
+    /// One-based starting row index within the archetype.
     pub index: usize,
     /// BufferCollection ID shared by every string field in this chunk.
     pub string_buffer: usize,
+    /// Deduplicated deferred-span block candidates; the boxed Vec is allocated lazily.
+    pub span_fields: Option<Box<Vec<SpanFieldsRef>>>,
     pub(crate) timestamp: Range<usize>,
+}
+
+/// Location in the same callsite. Block ordinals are one-based and survive eviction.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bytemuck::NoUninit)]
+pub struct SpanFieldsRef {
+    pub archetype: u32,
+    pub block: u32,
+}
+
+impl Descriptor {
+    /// Count inline metadata, the rare boxed Vec header, and used/spare entries once.
+    pub fn compression_ratio(&self) -> CompressionStats {
+        let mut stats = CompressionStats {
+            overhead: size_of::<Self>(),
+            ..Default::default()
+        };
+        if let Some(refs) = self.span_fields.as_deref() {
+            stats.overhead += size_of_val(refs) + refs.len() * size_of::<SpanFieldsRef>();
+            stats.overalloc += (refs.capacity() - refs.len()) * size_of::<SpanFieldsRef>();
+        }
+        stats
+    }
+
+    /// The inline descriptor is already charged by its owning block/cache.
+    pub fn heap_bytes(&self) -> usize {
+        let stats = self.compression_ratio();
+        stats.overhead - size_of::<Self>() + stats.overalloc
+    }
+}
+
+impl Data {
+    /// Share descriptor accounting with active blocks, excluding its inline bytes here.
+    pub fn compression_ratio(&self) -> CompressionStats {
+        self.data.compression_ratio()
+            + self.descriptor.compression_ratio()
+            + CompressionStats {
+                overhead: size_of::<Self>() - size_of::<Descriptor>(),
+                ..Default::default()
+            }
+    }
 }
 
 /// Dropping chunks must preserve the retained suffix and protect the active chunk.
@@ -81,9 +125,10 @@ impl BlockCache {
             active: Frame::new(unit, start_cap),
             ring: Vec::new(),
             offset: 0,
-            timestamp: Range { start: 0, end: 0 },
-            count: 1,
-            string_buffer: 0,
+            active_descriptor: Descriptor {
+                index: 1,
+                ..Default::default()
+            },
             edit_buffer: vec![0; unit],
         }
     }
@@ -118,21 +163,24 @@ impl BlockCache {
         assert_eq!(frame.first(), &self.active.buffer[self.unit..2 * self.unit]);
 
         let length = frame.len();
+        // Keep the string buffer until prepare_chunk selects the next one;
+        // timestamp range and deferred references start fresh for the new frame.
+        let next = Descriptor {
+            index: self.active_descriptor.index + length,
+            string_buffer: self.active_descriptor.string_buffer,
+            ..Default::default()
+        };
         self.ring.push(Data {
             data: frame,
-            timestamp: self.timestamp.clone(),
-            index: self.count,
-            string_buffer: self.string_buffer,
+            descriptor: std::mem::replace(&mut self.active_descriptor, next),
         });
-        self.count += length;
-        self.timestamp = Range { start: 0, end: 0 };
         self.active.clear();
     }
 
     pub fn allocate(&mut self) -> (&mut [u8], usize) {
         self.cycle_if_needed();
         let (buffer, index) = self.active.allocate().unwrap();
-        (buffer, index + self.count)
+        (buffer, index + self.active_descriptor.index)
     }
 
     pub fn push(&mut self, data: &[u8], ts: usize) {
@@ -144,7 +192,10 @@ impl BlockCache {
     /// Drop the oldest completed chunk by its first row's absolute index.
     /// Reject stale indexes and later/active chunks without changing the cache.
     pub fn drop_chunk(&mut self, index: usize) -> Result<(), DropChunkError> {
-        let oldest = self.ring.first().map_or(self.count, |chunk| chunk.index);
+        let oldest = self
+            .ring
+            .first()
+            .map_or(self.active_descriptor.index, |chunk| chunk.descriptor.index);
         if index < oldest {
             return Err(DropChunkError::AlreadyDropped);
         }
@@ -157,16 +208,21 @@ impl BlockCache {
     }
 
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<Row<'a>> {
-        if index >= self.count {
+        if index >= self.active_descriptor.index {
             Row {
                 init: false, // we aren't copying the data, just providing the buffer
                 buffer: RowBuffer::Owned(Box::default()),
-                index: index - self.count,
+                index: index - self.active_descriptor.index,
                 frame: crate::data::dataframe::AnyFrame::Frame(&mut self.active),
             }
             .into()
         } else {
-            let Some(data) = self.ring.iter_mut().rev().find(|d| d.index <= index) else {
+            let Some(data) = self
+                .ring
+                .iter_mut()
+                .rev()
+                .find(|d| d.descriptor.index <= index)
+            else {
                 return None;
             };
 
@@ -177,11 +233,66 @@ impl BlockCache {
             Row {
                 init: false, // Decode only if the caller accesses the archived row.
                 buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
-                index: index - data.index,
+                index: index - data.descriptor.index,
                 frame,
             }
             .into()
         }
+    }
+
+    // TODO abstract metadata, move span handling to subscriber.rs
+
+    /// Candidates can include other spans' updates; readers must match the full SpanId.
+    pub fn span_fields_refs(&self, index: usize) -> &[SpanFieldsRef] {
+        if index >= self.active_descriptor.index {
+            return if index - self.active_descriptor.index < self.active.length {
+                self.active_descriptor
+                    .span_fields
+                    .as_deref()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            } else {
+                &[]
+            };
+        }
+        self.ring
+            .iter()
+            .rev()
+            .find(|block| block.descriptor.index <= index)
+            .and_then(|block| block.descriptor.span_fields.as_deref())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Allocate the boxed Vec only on the first link; deduplicated appends reuse capacity.
+    pub(crate) fn add_span_fields_ref(&mut self, index: usize, reference: SpanFieldsRef) {
+        let refs = if index >= self.active_descriptor.index {
+            if index - self.active_descriptor.index >= self.active.length {
+                return;
+            }
+            &mut self.active_descriptor.span_fields
+        } else if let Some(block) = self
+            .ring
+            .iter_mut()
+            .rev()
+            .find(|b| b.descriptor.index <= index)
+        {
+            &mut block.descriptor.span_fields
+        } else {
+            return; // A late close may outlive its evicted start block.
+        };
+        let refs = refs.get_or_insert_with(|| Box::new(Vec::new()));
+        if !refs.contains(&reference) {
+            refs.push(reference);
+        }
+    }
+
+    /// Inline box handles belong to the cache/descriptors; charge their heap exactly once.
+    pub fn span_fields_heap_bytes(&self) -> usize {
+        std::iter::once(&self.active_descriptor)
+            .chain(self.ring.iter().map(|block| &block.descriptor))
+            .map(Descriptor::heap_bytes)
+            .sum()
     }
 
     /// NOTE: could simplify by computing mask when compacting. Pretty sure it's the same amount of processing.
@@ -192,17 +303,18 @@ impl BlockCache {
     // track earliest and latest ts for block
     // called when a span closes
     pub fn update_ts_range(&mut self, ts: usize, index: Option<usize>) {
-        let index = index.unwrap_or(self.count + self.active.length);
+        let index = index.unwrap_or(self.active_descriptor.index + self.active.length);
 
-        let timestamp = if index >= self.count {
-            &mut self.timestamp
+        let timestamp = if index >= self.active_descriptor.index {
+            &mut self.active_descriptor.timestamp
         } else {
             &mut self
                 .ring
                 .iter_mut()
                 .rev()
-                .find(|d| d.index <= index)
+                .find(|d| d.descriptor.index <= index)
                 .unwrap()
+                .descriptor
                 .timestamp
         };
 
@@ -222,30 +334,29 @@ impl BlockCache {
             .chain(self.active.iter().into_streaming_iter_ref())
     }
 
-    /// Split resident storage by lifetime; shared cache state belongs to active storage.
-    pub fn compression_parts(&self) -> (CompressionStats, CompressionStats) {
-        let active = self.active.compression_ratio()
+    /// Active frame, descriptor and shared cache/scratch state; no archived traversal.
+    pub fn active_compression_ratio(&self) -> CompressionStats {
+        self.active.compression_ratio()
+            + self.active_descriptor.compression_ratio()
             + CompressionStats {
-                overhead: size_of::<Self>() + self.edit_buffer.len(),
+                overhead: size_of::<Self>() - size_of::<Descriptor>() + self.edit_buffer.len(),
                 overalloc: self.edit_buffer.capacity() - self.edit_buffer.len(),
                 ..Default::default()
-            };
+            }
+    }
+
+    /// Split resident storage by lifetime; shared cache state belongs to active storage.
+    pub fn compression_parts(&self) -> (CompressionStats, CompressionStats) {
         let archived = self
             .ring
             .iter()
-            .map(|v| {
-                v.data.compression_ratio()
-                    + CompressionStats {
-                        overhead: size_of_val(v),
-                        ..Default::default()
-                    }
-            })
+            .map(Data::compression_ratio)
             .fold(CompressionStats::default(), |a, b| a + b)
             + CompressionStats {
                 overalloc: (self.ring.capacity() - self.ring.len()) * size_of::<Data>(),
                 ..Default::default()
             };
-        (active, archived)
+        (self.active_compression_ratio(), archived)
     }
 
     pub fn compression_ratio(&self) -> CompressionStats {
@@ -267,6 +378,91 @@ mod test {
     use crate::data::dataframe::Frame;
 
     use super::BlockCache;
+
+    #[test]
+    fn span_candidates_deduplicate_move_with_the_block_and_drop_with_it() {
+        use super::SpanFieldsRef;
+        let mut cache = BlockCache::new(1, 2, 2);
+        cache.active_descriptor.string_buffer = 7;
+        cache.push(&[1], 1);
+        let first = SpanFieldsRef {
+            archetype: 2,
+            block: 1,
+        };
+        let second = SpanFieldsRef {
+            archetype: 3,
+            block: 4,
+        };
+        cache.add_span_fields_ref(1, first);
+        let allocation = cache
+            .active_descriptor
+            .span_fields
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        cache.add_span_fields_ref(1, first);
+        assert_eq!(
+            cache
+                .active_descriptor
+                .span_fields
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            allocation
+        );
+        let refs = cache.active_descriptor.span_fields.as_deref().unwrap();
+        assert_eq!(
+            cache.span_fields_heap_bytes(),
+            size_of_val(refs) + refs.capacity() * size_of::<SpanFieldsRef>()
+        );
+        let header = refs as *const Vec<SpanFieldsRef>;
+        cache.add_span_fields_ref(1, second);
+        assert_eq!(
+            cache.active_descriptor.span_fields.as_deref().unwrap() as *const Vec<SpanFieldsRef>,
+            header
+        );
+        assert_eq!(cache.span_fields_refs(1), &[first, second]);
+        // Filling/rolling over the frame transfers ownership without losing candidates.
+        cache.push(&[2], 2);
+        let descriptor_stats = cache.active_descriptor.compression_ratio();
+        cache.push(&[3], 3);
+        let archived = &cache.ring[0].descriptor;
+        assert_eq!(archived.index, 1);
+        assert_eq!(archived.string_buffer, 7);
+        assert_eq!(archived.timestamp, 1..2);
+        assert_eq!(
+            archived.span_fields.as_deref().unwrap() as *const Vec<SpanFieldsRef>,
+            header
+        );
+        // Descriptor ownership changes, but its inline/heap/spare accounting does not.
+        let archived_stats = archived.compression_ratio();
+        assert_eq!(
+            (archived_stats.overhead, archived_stats.overalloc),
+            (descriptor_stats.overhead, descriptor_stats.overalloc)
+        );
+        assert_eq!(cache.active_descriptor.index, 3);
+        assert_eq!(cache.active_descriptor.string_buffer, 7);
+        assert_eq!(cache.active_descriptor.timestamp, 3..3);
+        assert!(cache.active_descriptor.span_fields.is_none());
+        assert_eq!(cache.span_fields_refs(2), &[first, second]);
+        assert!(cache.span_fields_refs(3).is_empty());
+        cache.add_span_fields_ref(2, second);
+        assert_eq!(
+            cache.span_fields_heap_bytes(),
+            size_of::<Vec<SpanFieldsRef>>()
+                + cache.ring[0]
+                    .descriptor
+                    .span_fields
+                    .as_ref()
+                    .unwrap()
+                    .capacity()
+                    * size_of::<SpanFieldsRef>()
+        );
+        cache.drop_chunk(1).unwrap();
+        cache.add_span_fields_ref(1, first); // A late close must not attach to another block.
+        assert!(cache.span_fields_refs(1).is_empty());
+        assert_eq!(cache.span_fields_heap_bytes(), 0);
+    }
 
     #[test]
     fn archived_edits_and_constant_blocks_preserve_the_complete_stream() {

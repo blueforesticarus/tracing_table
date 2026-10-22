@@ -438,6 +438,7 @@ pub enum Operation {
         id: u64,
         fields: Vec<Option<InputValue>>,
     },
+    /// Capture keeps every callback; replay stores the latest predecessor on close.
     Follows {
         id: u64,
         follows: u64,
@@ -765,6 +766,7 @@ impl Fixture {
                     updates.record(|visitor| visit_values(metadata, fields, visitor));
                 }
                 Operation::Follows { id, follows } => {
+                    // Resolve while the predecessor is alive; it may close first.
                     let follows = spans[follows].stored;
                     spans.get_mut(id).unwrap().follows = Some(follows);
                 }

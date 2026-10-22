@@ -1,7 +1,7 @@
 //! CODEX GENERATED
 //! Full row decoding, shared by verification, benchmarks, and future viewers.
 use super::{InputValue, PerCallsiteData, SpanFieldsRef, SpanId, StringStorage};
-use crate::data::{CompressionStats, dyntuple::ValueKind};
+use crate::data::{CompressionStats, blockbuffer::ArchivedFrameIter, dyntuple::ValueKind};
 use streaming_iterator::StreamingIterator;
 
 /// Storage categories retain active tails instead of silently dropping partial blocks.
@@ -36,6 +36,7 @@ pub struct DecodedRow {
     /// u16::MAX marks lost ordering precision until the timestamp changes.
     pub timestamp_index: Option<u16>,
     pub end_timestamp: Option<u64>,
+    /// Resolved from block-level candidates on read; never stored in a start row.
     pub extra_fields: Option<SpanFieldsRef>,
     /// Present on span starts and update rows, absent on events.
     pub span: Option<SpanId>,
@@ -70,6 +71,45 @@ impl Reader<'_> {
     }
 }
 impl PerCallsiteData {
+    /// Locate deferred data using only this start block's deduplicated candidates.
+    /// Missing/evicted candidates are harmless; other rows in a candidate block
+    /// must not be mistaken for the requested span.
+    pub fn span_fields_ref(&self, span: SpanId) -> Option<SpanFieldsRef> {
+        if self.id != u64::from(span.callsite) {
+            return None;
+        }
+        let start = self.cache.get(span.archetype as usize)?;
+        for &reference in start.data.span_fields_refs(span.index as usize) {
+            let Some(update) = self.cache.get(reference.archetype as usize) else {
+                continue;
+            };
+            if !update.archetype.is_span_end {
+                continue;
+            }
+            let Some(block) = (reference.block as usize)
+                .checked_sub(1)
+                .and_then(|block| block.checked_sub(update.data.offset))
+            else {
+                continue;
+            };
+            let matches = |bytes: &[u8]| {
+                let id = Reader(bytes).span();
+                (id.callsite, id.archetype, id.index) == (span.callsite, span.archetype, span.index)
+            };
+            if let Some(frame) = update.data.ring.get(block) {
+                let mut rows = ArchivedFrameIter::new(&frame.data);
+                while let Some(row) = rows.next() {
+                    if matches(row) {
+                        return Some(reference);
+                    }
+                }
+            } else if block == update.data.ring.len() && update.data.active.iter().any(matches) {
+                return Some(reference);
+            }
+        }
+        None
+    }
+
     pub fn storage_stats(&self) -> StorageStats {
         let mut total = StorageStats::default();
         for arch in &self.cache {
@@ -90,15 +130,20 @@ impl PerCallsiteData {
     pub fn visit_rows(&self, mut consume: impl FnMut(DecodedRow)) {
         for arch in &self.cache {
             let a = &arch.archetype;
-            let mut index = arch.data.ring.first().map_or(arch.data.count, |b| b.index) as u64;
+            let mut index = arch
+                .data
+                .ring
+                .first()
+                .map_or(arch.data.active_descriptor.index, |b| b.descriptor.index)
+                as u64;
             let frames = arch
                 .data
                 .ring
                 .iter()
-                .map(|b| (b.data.len(), b.string_buffer))
+                .map(|b| (b.data.len(), b.descriptor.string_buffer))
                 .chain(std::iter::once((
                     arch.data.active.length,
-                    arch.data.string_buffer,
+                    arch.data.active_descriptor.string_buffer,
                 )));
             let mut rows = arch.data.iter();
             let mut strings = None;
@@ -147,35 +192,39 @@ impl PerCallsiteData {
                             } else {
                                 row.timestamp.unwrap() + (offset - 1)
                             });
-                            row.extra_fields = Some(SpanFieldsRef {
-                                archetype: reader.u32(),
-                                block: reader.u32(),
-                            });
-                            let follows = reader.span();
-                            row.follows_from = (follows.index != 0).then_some(follows);
+                            row.extra_fields = self.span_fields_ref(row.span.unwrap());
                         }
                         if a.parent {
                             row.parent = Some(reader.span());
                         }
                     }
+                    if a.follows_from {
+                        row.follows_from = Some(reader.span());
+                    }
                     for kind in &a.field_types {
-                        row.fields.push(kind.as_ref().map(|kind| match kind {
-                            ValueKind::F64 => InputValue::F64(reader.u64()),
-                            ValueKind::I64 => InputValue::I64(i64::from_ne_bytes(reader.bytes())),
-                            ValueKind::U64 => InputValue::U64(reader.u64()),
-                            ValueKind::I128 => {
-                                InputValue::I128(i128::from_ne_bytes(reader.bytes()))
+                        row.fields.push(kind.as_ref().map(|kind| {
+                            match kind {
+                                ValueKind::F64 => InputValue::F64(reader.u64()),
+                                ValueKind::I64 => {
+                                    InputValue::I64(i64::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::U64 => InputValue::U64(reader.u64()),
+                                ValueKind::I128 => {
+                                    InputValue::I128(i128::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::U128 => {
+                                    InputValue::U128(u128::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::Bool => InputValue::Bool(reader.bytes::<1>()[0] != 0),
+                                ValueKind::BufferOffset => InputValue::Text(
+                                    StringStorage::Offset.read(strings, reader.u32()).to_owned(),
+                                ),
+                                ValueKind::BufferIndex => InputValue::Text(
+                                    StringStorage::Index
+                                        .read(strings, u32::from(reader.u16()))
+                                        .to_owned(),
+                                ),
                             }
-                            ValueKind::U128 => {
-                                InputValue::U128(u128::from_ne_bytes(reader.bytes()))
-                            }
-                            ValueKind::Bool => InputValue::Bool(reader.bytes::<1>()[0] != 0),
-                            ValueKind::BufferOffset => InputValue::Text(
-                                StringStorage::Offset.read(strings, reader.u32()).to_owned(),
-                            ),
-                            ValueKind::BufferIndex => InputValue::Text(
-                                StringStorage::Index.read(strings, u32::from(reader.u16())).to_owned(),
-                            ),
                         }));
                     }
                     if let Some(count) = a.template {

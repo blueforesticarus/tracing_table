@@ -513,8 +513,8 @@ mod tests {
             let arch = &site.cache[0];
             assert_eq!(arch.data.ring.len(), 1);
             assert_eq!(arch.data.ring[0].data.len(), 2);
-            assert_eq!(arch.data.ring[0].string_buffer, 0);
-            assert_eq!(arch.data.string_buffer, 1);
+            assert_eq!(arch.data.ring[0].descriptor.string_buffer, 0);
+            assert_eq!(arch.data.active_descriptor.string_buffer, 1);
             assert_eq!(arch.strings.active.len(), 2);
             let mut rows = Vec::new();
             site.visit_rows(|row| rows.push(row.fields));

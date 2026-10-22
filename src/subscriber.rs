@@ -55,6 +55,8 @@ pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
 
 // Preserve the existing subscriber-facing import while buffer policy lives with storage.
 pub use crate::data::stringbuffer::StringStorage;
+// Keep the public subscriber import while the block owns reference storage.
+pub use crate::data::blockbuffer::SpanFieldsRef;
 
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
@@ -147,7 +149,7 @@ impl PerArchData {
             || self.strings.active.len() == Buffer::MAX_ENTRIES;
         // Check caps only on initial allocation, frame growth, or chunk rollover.
         let allocated = self.data.active.length == self.data.active.capacity()
-            || (self.data.count == 1 && self.data.active.length == 0)
+            || (self.data.active_descriptor.index == 1 && self.data.active.length == 0)
             || strings_full;
         if strings_full {
             eprintln!(
@@ -177,7 +179,7 @@ impl PerArchData {
                     .rotate_with_level(false, string_compression_level);
             }
             self.chunk_string_start = self.strings.active.byte_len();
-            self.data.string_buffer = self.strings.active_index();
+            self.data.active_descriptor.string_buffer = self.strings.active_index();
         }
         allocated
     }
@@ -499,23 +501,23 @@ impl RecordingLayer {
                     let Some(chunk) = arch.data.ring.first() else {
                         continue;
                     };
-                    let candidate = (site_index, arch_index, chunk.index);
+                    let candidate = (site_index, arch_index, chunk.descriptor.index);
                     // The per-callsite cap chooses the oldest chunk across its archetypes.
                     if site.id == callsite
                         && size > self.callsite_memory_cap
-                        && (local.is_none() || chunk.timestamp.start < oldest)
+                        && (local.is_none() || chunk.descriptor.timestamp.start < oldest)
                     {
-                        oldest = chunk.timestamp.start;
+                        oldest = chunk.descriptor.timestamp.start;
                         local = Some(candidate);
                     }
                     // Global candidates are each archetype's oldest chunk. Buffer IDs
                     // increase with chunk age, so users of this buffer form a prefix.
-                    let buffer_id = chunk.string_buffer;
+                    let buffer_id = chunk.descriptor.string_buffer;
                     let users = arch
                         .data
                         .ring
-                        .partition_point(|c| c.string_buffer == buffer_id)
-                        + usize::from(arch.data.string_buffer == buffer_id);
+                        .partition_point(|c| c.descriptor.string_buffer == buffer_id)
+                        + usize::from(arch.data.active_descriptor.string_buffer == buffer_id);
                     let buffer_bytes = if buffer_id == arch.strings.active_index() {
                         bytes(arch.strings.active.compression_ratio())
                     } else {
@@ -525,9 +527,10 @@ impl RecordingLayer {
                         )
                     };
                     let duration = chunk
+                        .descriptor
                         .timestamp
                         .end
-                        .saturating_sub(chunk.timestamp.start)
+                        .saturating_sub(chunk.descriptor.timestamp.start)
                         .max(1);
                     // Prefer more stored bytes per timestamp tick, charging only this
                     // chunk's share of its buffer. Zero-duration chunks use one tick.
@@ -564,7 +567,7 @@ impl RecordingLayer {
             // completed chunks left, discard_before(active_index) still keeps the active buffer.
             let new_oldest = arch.data.ring.first();
             let first_buffer = new_oldest
-                .map(|chunk| chunk.string_buffer)
+                .map(|chunk| chunk.descriptor.string_buffer)
                 .unwrap_or(arch.strings.active_index());
             arch.strings.discard_before(first_buffer);
         }
@@ -599,7 +602,6 @@ impl Archetype {
                 bytes += size_of::<u16>(); // timestamp index, before parent/fields
             } else {
                 bytes += std::mem::size_of::<PackedTimestamp>(); //end timestamp
-                bytes += std::mem::size_of::<SpanFieldsRef>();
             }
         } else {
             bytes += std::mem::size_of::<SpanId>();
@@ -633,15 +635,6 @@ pub struct SpanId {
     pub archetype: u32,
 }
 
-/// Location of deferred span fields in the same callsite. Blocks are one-based;
-/// block zero means no update row. Completed block positions never move.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bytemuck::NoUninit)]
-pub struct SpanFieldsRef {
-    pub archetype: u32,
-    pub block: u32,
-}
-
 pub const PLACE_HOLDER: SpanId = SpanId {
     index: 0,
     callsite: 0,
@@ -668,6 +661,8 @@ pub const PLACE_HOLDER: SpanId = SpanId {
 //     pub fields: Vec<ValueData>,
 // }
 
+// TODO: Support multiple follows-from predecessors per span; storage currently
+// retains only the latest predecessor, including during dump replay.
 struct FollowFrom(SpanId);
 
 #[derive(Clone)]
@@ -695,10 +690,12 @@ where
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let id: SpanId = *ctx.span(follows).unwrap().extensions().get().unwrap();
+        // Match replay's single-predecessor storage: the latest callback wins.
+        // insert() panics if a span receives a second follows-from callback.
         ctx.span(span)
             .unwrap()
             .extensions_mut()
-            .insert(FollowFrom(id));
+            .replace(FollowFrom(id));
     }
 
     fn on_record(
@@ -810,7 +807,8 @@ impl RecordingLayer {
                 .map(|value| value.as_ref().map(ValueKind::from)),
         );
         site.last_archetype.extra_hash = 0;
-        site.last_archetype.follows_from = !is_event;
+        // Follows-from is known at close and lives only in deferred rows.
+        site.last_archetype.follows_from = false;
         site.last_archetype.parent = parent.is_some();
         site.last_archetype.is_span_end = false;
         site.last_archetype.is_event = is_event;
@@ -842,8 +840,6 @@ impl RecordingLayer {
             packer.write_any_value(count, false);
         } else {
             packer.write_any_value(PackedTimestamp::default(), false);
-            packer.write_any_value(SpanFieldsRef::default(), false);
-            packer.write_any_value(PLACE_HOLDER, false);
         }
         if let Some(parent) = parent {
             packer.write_any_value(parent, false);
@@ -882,21 +878,28 @@ impl RecordingLayer {
         callsite_data.finished_count += 1;
 
         let mut allocated = false;
-        let extra_fields = if let Some(fields) = fields {
+        // A follows-only span needs an update row too; absent fields consume no bytes.
+        let has_fields = fields
+            .as_ref()
+            .is_some_and(|f| f.values.iter().any(Option::is_some));
+        let extra_fields = if has_fields || follow_from.is_some() {
             callsite_data.last_archetype.field_types.clear();
-            callsite_data.last_archetype.field_types.extend(
-                fields
-                    .values
-                    .iter()
-                    .map(|opt| opt.as_ref().map(ValueKind::from)),
-            );
+            callsite_data
+                .last_archetype
+                .field_types
+                .extend((0..metadata.fields().len()).map(|index| {
+                    fields
+                        .as_ref()
+                        .and_then(|f| f.values[index].as_ref())
+                        .map(ValueKind::from)
+                }));
             callsite_data.last_archetype.extra_hash = 0;
-            callsite_data.last_archetype.follows_from = false;
+            callsite_data.last_archetype.follows_from = follow_from.is_some();
+            callsite_data.last_archetype.template = None;
             callsite_data.last_archetype.is_span_end = true;
             callsite_data.last_archetype.is_event = false;
             callsite_data.last_archetype.parent = false;
 
-            // let callsite = callsite_data.id;
             let arch = callsite_data.get_arch(self.message_block_min_rows);
             let arch = &mut callsite_data.cache[arch];
 
@@ -905,19 +908,23 @@ impl RecordingLayer {
             let mut data = BytePacker::new(data);
             // Write the header by value through its verified NoUninit implementation.
             data.write_any_value(id, false); // end data points to start data
-            // most won't have end data, so this is good
+            if let Some(follows) = follow_from {
+                data.write_any_value(follows, false);
+            }
             // Transfer values into the row, interning strings in this chunk's buffer.
-            fields.write(&mut data, &mut arch.strings.active);
+            if let Some(fields) = fields {
+                fields.write(&mut data, &mut arch.strings.active);
+            }
             arch.data.update_mask_after_append();
             arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
-            SpanFieldsRef {
+            Some(SpanFieldsRef {
                 archetype: arch.id,
                 block: u32::try_from(arch.data.offset + arch.data.ring.len() + 1)
                     .expect("span update block exceeds u32"),
-            }
+            })
         } else {
-            SpanFieldsRef::default()
+            None
         };
         {
             let data = &mut callsite_data.cache[id.archetype as usize].data;
@@ -929,15 +936,14 @@ impl RecordingLayer {
                 packer.skip::<PackedTimestamp>(false);
                 // Bias the duration so a zero-tick closed span differs from an open span.
                 packer.write_any_value(time.value - start + 1, false);
-                packer.write_any_value(extra_fields, false);
-                if let Some(f) = follow_from {
-                    packer.write_any_value(f, false)
-                }
                 true
             } else {
                 false
             };
             if retained {
+                if let Some(reference) = extra_fields {
+                    data.add_span_fields_ref(id.index as usize, reference);
+                }
                 data.update_ts_range(time.value as usize, Some(id.index as usize));
             }
         }
@@ -1296,7 +1302,7 @@ mod test {
                         arch.data.cycle_if_needed();
                     }
                     arch.strings.rotate(false);
-                    arch.data.string_buffer = arch.strings.active_index();
+                    arch.data.active_descriptor.string_buffer = arch.strings.active_index();
                     arch.strings.active.add_string("protected");
                     arch.data.push(&vec![0; unit], 4000);
                 }
@@ -1386,14 +1392,14 @@ mod test {
         arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.prepare_chunk(recorder.string_compression_level);
-        assert_eq!(arch.data.string_buffer, 0);
+        assert_eq!(arch.data.active_descriptor.string_buffer, 0);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.data.cycle_if_needed();
         assert_eq!(arch.data.active.length, 0);
         arch.prepare_chunk(recorder.string_compression_level);
         arch.prepare_chunk(recorder.string_compression_level); // Repeated preparation must not rotate again.
-        assert_eq!(arch.data.ring[0].string_buffer, 0);
-        assert_eq!(arch.data.string_buffer, 1);
+        assert_eq!(arch.data.ring[0].descriptor.string_buffer, 0);
+        assert_eq!(arch.data.active_descriptor.string_buffer, 1);
         let old = arch.strings.get(0).unwrap();
         assert_eq!(old.get_index(0), Some(text.as_str()));
     }

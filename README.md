@@ -553,3 +553,19 @@ we forcibly rotate string buffer and message block if string buffer gets to 2^16
 
 Archived storage is now 9,465,582 bytes, down 2.71%. No entry-limits were hit. 
 The size savings is mostly just fitting more rows in the block. The active data grew considerably due to more strings left in the active buffer.
+
+# infrequent span metadata
+extra span fields and follows_from are both very uncommon (follows_from does not exist in our sample data.)
+
+1. dont store spanfieldsref per row. store it as a `Option<Box<Vec<_>>>` on the block. since vast majority of rows don't need it. simply ensure block metadata has spanfieldsref of every row that has one (deduped of course) this is enough to know whether to scan the extra span fields block when looking up a span. 
+
+2. follows_from is now treated similar to an extra field, the extra fields block is archetyped on its presense
+
+| Measure | Before | Now | Reduction |
+|---|---:|---:|---:|
+| Total archived storage, including metadata | 9,465,582 B | 8,802,389 B | **7.01%** |
+| Span payload | 3,864,239 B | 3,412,127 B | **11.70%** |
+| Payload per archived span | 6.616 B | 5.883 B | **11.07%** |
+| Container metadata | 1,267,790 B | 1,056,709 B | **16.65%** |
+
+> container metadata went down because: smaller span rows let more rows fit into each 4 KiB block, so we need fewer blocks—and fewer containers around them.
