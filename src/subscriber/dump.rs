@@ -759,9 +759,9 @@ impl Fixture {
                 Operation::Record { id, fields } => {
                     let span = spans.get_mut(id).unwrap();
                     let metadata = self.callsites[span.site].metadata;
-                    let updates = span
-                        .fields
-                        .get_or_insert_with(|| FieldValues::new(metadata.fields().len(), 0));
+                    let updates = span.fields.get_or_insert_with(|| {
+                        FieldValues::new(metadata.fields().len(), 0, string_storage)
+                    });
                     updates.record(|visitor| visit_values(metadata, fields, visitor));
                 }
                 Operation::Follows { id, follows } => {

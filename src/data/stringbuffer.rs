@@ -5,7 +5,44 @@ use std::{borrow::Cow, collections::VecDeque, hash::BuildHasher, ops::Deref};
 use foldhash::fast::RandomState;
 use hashbrown::{HashTable, hash_table::Entry};
 
-use super::CompressionStats;
+use super::{CompressionStats, dyntuple::ValueData};
+
+/// Choose a string reference once per callsite. Both forms use u32 in raw rows;
+/// indices have smaller numeric ranges for the ordinary compaction algorithms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StringStorage {
+    #[default]
+    Offset,
+    Index,
+}
+impl StringStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Offset => "offset",
+            Self::Index => "index",
+        }
+    }
+
+    pub(crate) fn intern(self, buffer: &mut Buffer, text: &str) -> ValueData {
+        let (index, offset) = buffer.add_string(text);
+        match self {
+            Self::Offset => {
+                ValueData::BufferOffset(u32::try_from(offset).expect("string offset exceeds u32"))
+            }
+            Self::Index => {
+                ValueData::BufferIndex(u32::try_from(index).expect("string index exceeds u32"))
+            }
+        }
+    }
+
+    pub(crate) fn read(self, buffer: &ExpandedBuffer, reference: u32) -> &str {
+        match self {
+            Self::Offset => buffer.get_offset(reference as usize),
+            Self::Index => buffer.get_index(reference as usize),
+        }
+        .expect("stored string reference")
+    }
+}
 
 // Bits 0..16: hash, 16..36: offset, 36..50: length, 50..64: index.
 // Keep packing here so all insertions use the same checked layout.

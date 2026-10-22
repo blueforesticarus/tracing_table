@@ -28,7 +28,7 @@ use crate::data::{
     CompressionStats,
     blockbuffer::BlockCache,
     dyntuple::{BytePacker, ValueData, ValueKind},
-    stringbuffer::{Buffer, BufferCollection, ExpandedBuffer},
+    stringbuffer::{Buffer, BufferCollection},
 };
 
 // Portable capture/loading is opt-in; live recording does not depend on its state.
@@ -49,52 +49,8 @@ pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
     AtomicUsize::new(std::env::var("STRING_BUFFER_TARGET_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 15))
 });
 
-/// Choose a string reference once per callsite. Both forms use u32 in raw rows;
-/// indices have smaller numeric ranges for the ordinary compaction algorithms.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StringStorage {
-    #[default]
-    Offset,
-    Index,
-}
-impl StringStorage {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Offset => "offset",
-            Self::Index => "index",
-        }
-    }
-
-    fn kind(self, value: &ValueData) -> ValueKind {
-        match value {
-            ValueData::BufferOffset(_) | ValueData::BufferIndex(_) => match self {
-                Self::Offset => ValueKind::BufferOffset,
-                Self::Index => ValueKind::BufferIndex,
-            },
-            _ => ValueKind::from(value),
-        }
-    }
-
-    fn intern(self, buffer: &mut Buffer, text: &str) -> ValueData {
-        let (index, offset) = buffer.add_string(text);
-        match self {
-            Self::Offset => {
-                ValueData::BufferOffset(u32::try_from(offset).expect("string offset exceeds u32"))
-            }
-            Self::Index => {
-                ValueData::BufferIndex(u32::try_from(index).expect("string index exceeds u32"))
-            }
-        }
-    }
-
-    fn read(self, buffer: &ExpandedBuffer, reference: u32) -> &str {
-        match self {
-            Self::Offset => buffer.get_offset(reference as usize),
-            Self::Index => buffer.get_index(reference as usize),
-        }
-        .expect("stored string reference")
-    }
-}
+// Preserve the existing subscriber-facing import while buffer policy lives with storage.
+pub use crate::data::stringbuffer::StringStorage;
 
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
@@ -396,7 +352,7 @@ impl RecordingLayer {
             .or_insert_with(|| {
                 let template = resolve();
                 let acount = template.as_ref().map_or(0, |t| t.field_names.len());
-                let fields = FieldValues::new(vcount, acount);
+                let fields = FieldValues::new(vcount, acount, self.string_storage);
                 Arc::new(
                     PerCallsiteData {
                         id,
@@ -687,7 +643,8 @@ where
         let span = ctx.span(id).unwrap();
         let mut ext = span.extensions_mut();
         if ext.get_mut::<FieldValues>().is_none() {
-            ext.insert(FieldValues::new(span.fields().len(), 0));
+            let storage = self.register(span.metadata()).string_storage;
+            ext.insert(FieldValues::new(span.fields().len(), 0, storage));
         }
         ext.get_mut::<FieldValues>()
             .unwrap()
@@ -783,7 +740,7 @@ impl RecordingLayer {
             site.field_value_scratchpad
                 .values
                 .iter()
-                .map(|value| value.as_ref().map(|v| site.string_storage.kind(v))),
+                .map(|value| value.as_ref().map(ValueKind::from)),
         );
         site.last_archetype.extra_hash = 0;
         site.last_archetype.follows_from = !is_event;
@@ -811,7 +768,7 @@ impl RecordingLayer {
             packer.write_any_value(parent, false);
         }
         let fields = &mut site.field_value_scratchpad;
-        fields.write(&mut packer, &mut arch.strings.active, site.string_storage);
+        fields.write(&mut packer, &mut arch.strings.active);
         if let Some(count) = arch.archetype.template {
             for argument in &fields.template_args[..count] {
                 packer.write_any_value(
@@ -849,7 +806,7 @@ impl RecordingLayer {
                 fields
                     .values
                     .iter()
-                    .map(|opt| opt.as_ref().map(|v| callsite_data.string_storage.kind(v))),
+                    .map(|opt| opt.as_ref().map(ValueKind::from)),
             );
             callsite_data.last_archetype.extra_hash = 0;
             callsite_data.last_archetype.follows_from = false;
@@ -868,11 +825,7 @@ impl RecordingLayer {
             data.write_any_value(id, false); // end data points to start data
             // most won't have end data, so this is good
             // Transfer values into the row, interning strings in this chunk's buffer.
-            fields.write(
-                &mut data,
-                &mut arch.strings.active,
-                callsite_data.string_storage,
-            );
+            fields.write(&mut data, &mut arch.strings.active);
             arch.data.update_mask_after_append();
             arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
@@ -914,9 +867,11 @@ impl RecordingLayer {
 // ----------------  CRUFT ------------------------
 
 // Text belongs to the subscriber until its archetype is known (or a span closes).
-// Strings retain capacity; BufferOffset(0) is only a scratch placeholder for text
-// and is replaced with its deduplicated buffer offset/index before packing.
+// Strings retain capacity. Text placeholders already have their final reference
+// kind; packing fills in the buffer address without changing that kind.
 struct FieldValues {
+    // Capture the callsite's mode once, including for deferred span updates.
+    string_storage: StringStorage,
     values: Vec<Option<ValueData>>,
     strings: Vec<String>,
     // Rendered captures are packed only when the selected archetype uses a template.
@@ -925,12 +880,15 @@ struct FieldValues {
 impl FieldValues {
     /// Events, span starts and deferred updates share reference encoding.
     /// Scratch strings stay textual until the destination buffer is selected.
-    fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer, storage: StringStorage) {
+    fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer) {
         for (index, field) in self.values.iter_mut().enumerate() {
             if let Some(value) = field.take() {
                 let value = match value {
-                    ValueData::BufferOffset(_) | ValueData::BufferIndex(_) => {
-                        storage.intern(buffer, &self.strings[index])
+                    ValueData::BufferOffset(_) => {
+                        StringStorage::Offset.intern(buffer, &self.strings[index])
+                    }
+                    ValueData::BufferIndex(_) => {
+                        StringStorage::Index.intern(buffer, &self.strings[index])
                     }
                     value => value,
                 };
@@ -948,8 +906,9 @@ impl FieldValues {
     }
 
     // Size both kinds of reusable scratch storage when the callsite is registered.
-    fn new(vcount: usize, arg_count: usize) -> Self {
+    fn new(vcount: usize, arg_count: usize, string_storage: StringStorage) -> Self {
         Self {
+            string_storage,
             values: vec![None; vcount],
             strings: vec![String::new(); vcount],
             template_args: vec![String::new(); arg_count],
@@ -988,7 +947,11 @@ impl ValueRecorder<'_> {
             self.template_arg_count = Some(template.field_names.len());
             return;
         }
-        self.data.values[field.index()] = Some(ValueData::BufferOffset(0));
+        // Keep the placeholder's type identical to the eventual stored reference.
+        self.data.values[field.index()] = Some(match self.data.string_storage {
+            StringStorage::Offset => ValueData::BufferOffset(0),
+            StringStorage::Index => ValueData::BufferIndex(0),
+        });
     }
 }
 
@@ -1076,7 +1039,7 @@ mod test {
                 let mut site = site.write();
                 let template = super::template::CompiledTemplate::compile(format).unwrap();
                 site.field_value_scratchpad =
-                    super::FieldValues::new(3, template.field_names.len());
+                    super::FieldValues::new(3, template.field_names.len(), site.string_storage);
                 site.template = Some(template);
             }
             tracing::dispatcher::with_default(&dispatch, || {
