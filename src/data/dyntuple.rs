@@ -45,8 +45,9 @@ impl ValueKind {
             ValueKind::I128 => size_of::<i128>(),
             ValueKind::U128 => size_of::<u128>(),
             ValueKind::Bool => size_of::<bool>(),
-            // Both string references occupy four bytes regardless of pointer width.
-            ValueKind::BufferOffset | ValueKind::BufferIndex => size_of::<u32>(),
+            ValueKind::BufferOffset => size_of::<u32>(),
+            // String buffers are capped so insertion indexes fit in two bytes.
+            ValueKind::BufferIndex => size_of::<u16>(),
         }
     }
 }
@@ -62,7 +63,7 @@ pub enum ValueData {
     /// A resolved byte offset. The caller supplies the buffer and resolves reads.
     BufferOffset(u32),
     /// Insertion index; resolves through ExpandedBuffer::get_index.
-    BufferIndex(u32),
+    BufferIndex(u16),
 }
 
 /// A value that can write its representation through the safe packing API.
@@ -355,15 +356,24 @@ mod tests {
     fn buffer_references_round_trip_unaligned() {
         for value in [
             ValueData::BufferOffset(70_000),
-            ValueData::BufferIndex(70_000),
+            ValueData::BufferIndex(u16::MAX),
         ] {
             let kind = ValueKind::from(value);
             let mut bytes = vec![0; 1 + kind.unit()];
             let mut packer = BytePacker::new(&mut bytes);
             packer.write_any_value(ValueData::Bool(true), false);
             packer.write_any_value(value, false);
-            assert_eq!(bytes.len(), 5);
-            assert_eq!(u32::from_ne_bytes(bytes[1..].try_into().unwrap()), 70_000);
+            match value {
+                ValueData::BufferOffset(offset) => {
+                    assert_eq!(bytes.len(), 5);
+                    assert_eq!(u32::from_ne_bytes(bytes[1..].try_into().unwrap()), offset);
+                }
+                ValueData::BufferIndex(index) => {
+                    assert_eq!(bytes.len(), 3);
+                    assert_eq!(u16::from_ne_bytes(bytes[1..].try_into().unwrap()), index);
+                }
+                _ => unreachable!(),
+            }
             // A leading bool forces the reference to be unaligned in a packed row.
             let mut packer = BytePacker::new(&mut bytes);
             unsafe {
@@ -375,7 +385,7 @@ mod tests {
                 );
                 assert!(matches!(
                     decoded,
-                    ValueData::BufferOffset(70_000) | ValueData::BufferIndex(70_000)
+                    ValueData::BufferOffset(70_000) | ValueData::BufferIndex(u16::MAX)
                 ));
             }
         }

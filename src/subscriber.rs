@@ -129,9 +129,38 @@ impl PerArchData {
 
     /// Keep message-chunk policy here; BufferCollection only knows how to rotate.
     fn prepare_chunk(&mut self, string_compression_level: Option<u32>) -> bool {
+        // Reserve worst-case entries for the entire row, including template captures.
+        // TODO this seems like something to be computed earlier and passed here.
+        let strings = self
+            .archetype
+            .field_types
+            .iter()
+            .flatten()
+            .filter(|kind| matches!(kind, ValueKind::BufferOffset | ValueKind::BufferIndex))
+            .count()
+            + self.archetype.template.unwrap_or(0);
+        assert!(
+            strings <= Buffer::MAX_ENTRIES,
+            "row exceeds string buffer capacity"
+        );
+        let strings_full = self.strings.active.len() + strings > Buffer::MAX_ENTRIES
+            || self.strings.active.len() == Buffer::MAX_ENTRIES;
         // Check caps only on initial allocation, frame growth, or chunk rollover.
         let allocated = self.data.active.length == self.data.active.capacity()
-            || (self.data.count == 1 && self.data.active.length == 0);
+            || (self.data.count == 1 && self.data.active.length == 0)
+            || strings_full;
+        if strings_full {
+            eprintln!(
+                "WARNING: string buffer entry limit (65536) forces string buffer and chunk rotation: callsite={}, archetype={}, entries={}, row_strings={}",
+                self.archetype.callsite,
+                self.id,
+                self.strings.active.len(),
+                strings,
+            );
+            // Temporary: chunks require a constant string buffer, so a forced
+            // string-buffer rotation must also rotate the current chunk.
+            self.data.cycle();
+        }
         self.data.cycle_if_needed();
         // Only an empty chunk can change buffers, regardless of who cycled it.
         if self.data.active.length == 0 {
@@ -140,7 +169,9 @@ impl PerArchData {
             // Rotate if another equal-growth chunk would approach (or pass) the
             // target within half a delta. Oversized chunks remain indivisible.
             let projected = size.saturating_add(delta).saturating_add(delta / 2);
-            if size > 0 && projected >= STRING_BUFFER_TARGET_SIZE.load(Ordering::Relaxed) {
+            if strings_full
+                || (size > 0 && projected >= STRING_BUFFER_TARGET_SIZE.load(Ordering::Relaxed))
+            {
                 // Expansion rebuilds the index from entry lengths for either encoder.
                 self.strings
                     .rotate_with_level(false, string_compression_level);
@@ -402,6 +433,7 @@ impl RecordingLayer {
                             follows_from: false,
                             field_types: vec![None; vcount],
                             template: None,
+                            string_storage: self.string_storage,
                             extra_hash: 0,
                             is_span_end: false,
                             is_event: false,
@@ -552,11 +584,13 @@ pub struct Archetype {
 
     /// Matched template argument count; Some(0) represents a matched literal message.
     pub template: Option<usize>,
+    /// Template captures use the same reference width as ordinary string fields.
+    pub string_storage: StringStorage,
     extra_hash: usize,
 }
 
 impl Archetype {
-    /// Full packed row width: header, metadata fields, then template argument offsets.
+    /// Full packed row width: header, metadata fields, then template string references.
     pub fn unit(&self) -> usize {
         let mut bytes = 0;
         if !self.is_span_end {
@@ -581,8 +615,7 @@ impl Archetype {
                 bytes += k.unit()
             }
         }
-        // Template references use u32 for either offset or index addressing.
-        bytes + self.template.unwrap_or(0) * size_of::<u32>()
+        bytes + self.template.unwrap_or(0) * self.string_storage.unit()
     }
 }
 

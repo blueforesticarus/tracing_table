@@ -20,7 +20,17 @@ Blockbuffers for a specific archetype are initially allocated with only enough s
 
 Log data is packed into a byte_slice as (timestamp, end_timestamp (for spans), event/span id, parent id, follows_from id, fields...). If the log has no follows_from id, it is not stored (the log will get a different archetype).
 
-By default Timestamps are stored as u64 nanoseconds. However, 6 of those bytes represent days. A bit shift can be set to disregard the low bits, if they are noise. This is specified with the env var `RUST_LOG_TIMER_RES=<amount to shift>`
+Events and logs store a `u16 timestamp_index` immediately after the shifted timestamp.
+One recorder-wide last timestamp/callsite/archetype/count tracks runs: the index
+increments on a callsite or archetype change within the same tick, stays unchanged
+for consecutive rows of the same archetype, and resets to zero when the tick changes.
+For nondecreasing timestamps, sort by `(timestamp, timestamp_index, row index)` to
+reconstruct event/log order. Spans do not store or advance this index. The counter
+saturates at `u16::MAX`, which marks lost precise ordering until the tick changes.
+
+Timestamps are stored as shifted `u64` nanoseconds since the recorder started.
+The default shift is **10**, giving **1,024 ns (1.024 µs) ticks**. Set
+`RecordingLayer::timestamp_bit_shift` before recording to choose another resolution.
 
 *TODO: End timestamps are relative to the start timestamp?*
 
@@ -260,6 +270,10 @@ priorities:
 We DO NOT CARE ABOUT
 - modification (log messages are immutable)
 
+## Baseline
+compressing raw messages with lz4 yields 6 bytes per row
+best case with drain yields
+
 ## MVP
 1. archetype on format of message (takes care of well behaved)
 2. store templates once, globally deduped, with cap. 
@@ -271,3 +285,271 @@ hiccup: if we do message template extraction, then we change archetype when we c
 then:
 - static storage for module paths
 - evaluate theoretically possible compression by looking at actual logs
+
+## CAPS
+
+20M global cap
+256k per callsite cap
+
+for global cap we drop the oldest block for one of the archetypes.
+the block which is selected is the one with the largest CompressedSize/TimestampRange
+ie. larger blocks and more frequent blocks are given less retention priority.
+# Capture/replay benchmarking
+
+The [benchmark standard](doc/benchmarking.md) describes streaming LZ4/MessagePack capture, deterministic replay with original timestamps, and per-callsite timing/storage reports.
+
+Set `RecordingLayer::string_compression_level` before recording: `Some(3)` is
+the default (HC3), `Some(1..=12)` selects native LZ4 HC, and `None` selects
+`lz4_flex`. The environment variable `STRING_COMPRESSION_LEVEL=9` selects HC9;
+`flex` selects `lz4_flex`.
+Readers support both encoders without configuration.
+
+`RecordingLayer::message_block_min_rows` defaults to `0` (no optional row floor),
+or the value of `MESSAGE_BLOCK_MIN_ROWS` in the environment. The byte target
+still applies, with capacity for at least one row.
+
+The earlier [string LZ4 level comparison](doc/investigation2_2026-10-15.txt)
+reports fast/HC3/HC9/HC12 storage sizes, with
+[per-archetype results](doc/investigation2_2026-10-15.csv). It does not measure
+compression time.
+
+## thoughts on string indirection
+EAS:
+
+Any string (or other variable size field) storage requires indirection to be included in the table. 
+
+currently indirection is 4b index per row, with the buffer in block metadata
+blocks are 4kib by default, if that was ALL string refs, we'd have 128 string indices, so conservatively we are only storing ~8bits per row per string. 
+
+now, if the string is constant, it will get compacted. so we only care about the case where if varies.
+
+strings have 4bytes in the index + 2 bytes length prefix in the buffer and are probably at least 4 bytes themselves. 10 bytes per string. In the case of all unique strings, message block indexes are 10%. 
+
+If the string varies and there are 128 string indices thats **128bytes vs 20bytes** minimum in the string buffer (2 unique strings). 
+- However this is worst case, more likely we'd only need 1 bit to distinguish 2 unique strings, or a few more if other fields also have strings. 
+- The worst case is if one field has unique strings per row and the other has 2 unique values at very different indices. resulting in most bits being different.
+
+codex testing
+
+> extraction increase combined (index+string) size for 18 callsites -- 39 decrease, and 29 stay the same within ±5%.
+> 24 callsites have constant message and string storage becomes zero with extraction
+> 
+> this table generated with bitcompact and string indices. only archived blocks considered, active string buffers used by archived blocks were pruned to only strings used in those archived blocks then lz4 compressed before having space counted.
+
+| Extreme | Callsite / template / string fields | Extraction | Unit (indices) | Index | Storage | Combined |
+|---|---|---|---:|---:|---:|---:|
+| Largest increase, B/row | **287** | Off | 28 (4) | 0.560 | 0.760 | 1.321 |
+| | `multi draw indexed indirect count: {:?} {}, ({:?} {})x, max {}x` | On | 44 (20) | 2.262 | 0.325 | 2.587 |
+| | | Change | | | | **+1.266 (+95.9%)** |
+| Largest increase, % | **240** | Off | 28 (4) | 0.218 | 0.049 | 0.267 |
+| | `set index buffer{}: {:?} (offset = {}, size = {})` | On | 40 (16) | 0.755 | 0.031 | 0.786 |
+| | | Change | | | | **+0.519 (+194.8%)** |
+| Largest decrease, B/row | **177** | Off | 28 (4) | 0.639 | 27.195 | 27.834 |
+| Largest decrease, % | `initial overloads for {fun:?}, {:#?}` | On | 32 (8) | 1.588 | 2.039 | 3.627 |
+| | | Change | | | | **−24.207 (−87.0%)** |
+| Highest index, extraction off | **116** | Off | 52 (12) | 2.060 | 2.449 | 4.509 |
+| | `transform components` | On | 48 (8) | 1.718 | 2.445 | 4.163 |
+| | , rotation, scale | Change | | | | **−0.345 (−7.7%)** |
+| Highest index, extraction on | **239** | Off | 28 (4) | 1.032 | 3.059 | 4.090 |
+| | `set vertex buffer {}: {:?} (offset = {}, size = {})` | On | 40 (16) | 3.681 | 1.084 | 4.765 |
+| | | Change | | | | **+0.674 (+16.5%)** |
+| Lowest nonconstant index, extraction off | **288** | Off | 28 (4) | 0.179 | 0.001729 | 0.181 |
+| Lowest nonconstant index, extraction on | `ComputePass::dispatch {groups:?}` | On | 28 (4) | 0.179 | 0.000916 | 0.180 |
+| | | Change | | | | **−0.000814 (−0.5%)** |
+
+![Histogram of extraction's change in combined index and compressed-string bytes per archived row](doc/bevy_reference_index_space_histogram.png)
+
+> Includes all 110 message-bearing callsites with compiled templates and archived blocks, without a 5% cutoff: 89 decrease and 21 increase. Negative values mean savings. [SVG](doc/bevy_reference_index_space_histogram.svg) ·
+[Per-callsite data](doc/bevy_reference_index_space_histogram.csv).
+
+selective extraction (only were it helps, according to above)
+| Extraction | Bytes/row | Total bytes | Bytes saved vs off | Saving |
+|---|---:|---:|---:|---:|
+| Off | 9.876 | 5,706,608 | — | — |
+| Everywhere | 8.781 | 5,079,243 | 627,365 | 10.99% |
+| Only the 89 improving callsites | 8.727 | 5,045,954 | 660,654 | 11.58% |
+
+> These payload totals exclude object metadata and unused capacity.
+> [Calculation and storage scopes](doc/bevy_reference_selective_extraction.md).
+
+conclusion: *extract everywhere is simpler, and barely worse*
+
+---
+
+- [x] TODO switch to 16bit index to fit up to 2x rows in our 4k block
+- TODO make block table metadata a smallvec to allow multiple buffers per block 
+       this is better than compressing an index per row because it is monotonically increasing meaning we only need to store the row at which it changes (one u16) not one bit per row (4k bits)
+     - XXX: poses issues if span closes and changes strings. strings have to either be immutable or we have to allow expanding archived buffers on change.
+- TODO store index as offset, since multiple blocks share string chunks
+
+## timestamps
+Wed Oct 21 09:29:36 PM EDT 2026
+
+currently 74% of span data and 40% of event data. around 3.6 Bytes per row per timestamp.
+
+1. IMPROVEMENT: store end timestamp as offset. for nonoverlapping spans it will reduce bits needed. for overlapping spans it could go either way.
+- span end timestamp goes from 3.6 to 2.2 B/row 
+- overall storage savings of **7.3%** 
+
+2. ADJUSTMENT: default ts shift of 6 (64ns) instead of 3 (8ns) which reduces storage by 6.4%, ts bytes per row is now 3.25 B/row  and end ts offset becomes 1.8 B/row
+
+3. IDEA: stride-offset storage
+in any monotonically increasing array of integers, where the range of values is X(X1->X2). The maximum difference between an element Ai's linear value (i/N * X + X1) and it's value is X. This means that the range of values stored as offsets from linear stride is at most the same range as the values themselves. 
+
+The metadata cost is two integers (the initial and the stride, or the two ends).
+
+codex test implementation gives 3% overall reduction. defer for now
+
+4. COMPARE: ts stored as offset from block metadata
+   if ts crosses a 2^N boundary it needs N bits, even if range of values is much smaller. 
+   codex suggests this will save 2.34% overall, almost as much as stride. 
+
+   > Some blocks shed 12 varying bits per row by removing those boundary-crossing carry bits. Byte rounding absorbs much of the potential saving.
+
+5. parent SpanId
+   - is ~1B/row for the index
+   - *surprisingly* ~0.3B/row for the callsite+arch, 0.15 of which is varying bits. I would have expect this was virtual always constant.
+   - [Parent spanid index experiment](#parent-spanid-index-experiment)
+
+---
+
+![Archived storage pie charts](doc/bevy_reference_archived_storage.png)
+
+[SVG](doc/bevy_reference_archived_storage.svg) · [Storage breakdown and methodology](doc/bevy_reference_archived_storage.md)
+   
+# lz4 sanity check
+
+| Form | Bytes | MiB |
+|---|---:|---:|
+| Uncompacted baseline | 50,947,723 | 48.588 |
+| Compacted | 7,853,079 | 7.489 |
+| Uncompacted + LZ4 | 15,079,583 | 14.381 |
+| Compacted + LZ4 | 7,233,403 | 6.898 |
+
+using HC12 helps lz4 uncompacted (bringing it to 12MiB) but has virtually no effect on compacted+lz4. (it is also much slower ~80ms vs 7.2)
+
+conclusion: compaction is better than lz4, and lz4 on top of compaction saves 7.9% 
+
+TODO: support lz4 compressing frames that especially benefit. 
+- you have to compress most frames to get most benefit, it is not dominated by a subset of frames.
+
+# parent spanid index experiment
+CODEX:
+Parent-index experiment: subtract the first index for each parent
+callsite/archetype within a block, or predict it with a fitted first value and
+stride. Metadata is built at compaction and retained in exact-length Box slices.
+Offset entries are 8 bytes; stride entries are 12 bytes: callsite 2 + archetype 1 +
+index 5 + f32 stride 4, with alignment one and no padding. Both use ZigZag
+residuals; callsite/archetype remain in each row. Extraction stays enabled.
+
+| Predictor | Payload bytes before | Payload bytes saved | Added Box metadata bytes | Total storage change |
+|---|---:|---:|---:|---:|
+| First-index offset | 9,476,806 | 207,621 | 437,504 | +220,688 (+2.05%) |
+| Stride residual | 9,476,806 | 588,420 | 514,588 | −79,796 (−0.74%) |
+
+Payload includes archived compacted rows and compressed strings, before container metadata.
+
+Stride stores only a base projected to block row zero and an f32 slope, fitted
+from each group's first/last actual indices and row positions. No endpoint
+positions are retained. Metadata costs include 277,696 bytes of Box handles in
+occupied/spare descriptors plus exactly 236,892 bytes for 19,741 stride entries;
+there is no spare heap capacity. Total changes also include frame alignment.
+
+Of 12,100 parent-bearing blocks, **12,033 support stride and 67 fall back** to
+their original encoding because a projected base is negative and cannot fit the
+unsigned 5-byte field. **Zero blocks** exceed the callsite, archetype or original
+index widths; zero exceed the positive base range or finite f32 stride range.
+All 12,100 support the offset-only encoding. The 376 blocks without parents
+allocate no entry arrays and count as zero in the histogram.
+[Full investigation, layouts and reproduction](doc/bevy_reference_parent_index.md).
+
+![Histogram of distinct parent callsite and archetype pairs per archived block, counting blocks without a parent as zero](doc/bevy_reference_parent_groups_histogram.png)
+
+[SVG](doc/bevy_reference_parent_groups_histogram.svg) · [Histogram data](doc/bevy_reference_parent_groups_histogram.csv).
+
+---
+
+Experiment: offset/stride
+
+The initial SmallVec metadata increased storage (+5.19% for offset, +6.27% for
+stride). Packing entries into exact-sized Boxes made stride slightly profitable.
+Further estimates use the measured block sizes to select the cheapest encoding
+per block. The single-allocation model stores packed metadata (8 bytes per offset
+entry, 12 per stride entry) alongside rows in the existing frame Box, with a
+2-byte count/mode field, eliminating separate Box handles.
+
+| Approach | Net bytes saved | Overall saving |
+|---|---:|---:|
+| Current packed Boxes | 79,796 | 0.74% |
+| Selective stride, current Box layout | 214,220 | 1.99% |
+| One allocation + selective stride | 422,176 | 3.92% |
+| One allocation + cheapest raw/offset/stride | **442,752** | **4.11%** |
+
+All use the same 64 ns baseline. Rows after the first are modeled estimates,
+including metadata and 16-byte allocation alignment; they are not implemented or timed.
+
+# reconstructing order / disambiguation of timestamps
+
+- timestamps can be nonunique, losing ordering information
+- events are implicitly ordered in archetype
+- store a monotonically increasing disambiguator when subsequent events have the same ts but different arch. reset to 0 when ts changes
+- only bother for events. allow spans to lose ordering info
+- store as u16, if exhausted store u16::MAX and allow losing order info
+
+surprisingly with 64ns ticks we get zero nonunique ts in our bevy dump, and compacted storage is neglibible.
+
+investigating clock res/accuracy:
+- back to back calls to Instant::now() give ~20ns
+- shift 12 (4us) has no overlaps, shift 14 (16us) 25% of rows share a ts 
+  - overall storage drops 14.5% (compared to shift 6), or 3.69% (compared to shift 12) while index grows to 1.65% of event/log payload
+  - shift 10 (1us )is good middle of the road. 7.9% improvement vs shift 6 **making this the new default**
+
+TODO: since overlaps are so rare and cheap to store, adding them to **spans** would not be a problem. but for now I am not going to bother. *defering until more of the code takes shape.*
+
+# optimizing block sizes
+- switched to min row count of 256 (most rows will be 256)
+- for really small rows still targets 4kib
+
+this has brought the overall B/row down from 8.7 to 7.6
+- spans 6.7 -> 6.2
+- events/logs 8.6 -> 8.2
+
+appears to mostly be in overhead (first+mask)
+
+COST: active went from 2.2M to 5.5M, undoing savings (but better as we collect more logs)
+TODO: make active smaller than compact. we can build up compact frames from multiple active frames.
+TODO: choose when to compact based on when we lose a constant bit.
+
+*for now default min row count is 0 (disabled)*
+
+# lz4 level
+Thu Oct 22 02:00:32 AM EDT 2026
+
+All string buffers. lz4 level comparison.
+
+Same 503 buffers, 7,409,798 raw bytes. Times are medians of seven release runs, measured separately. Times are total for all buffers.
+
+| Level | Total bytes | Compress (ms) | Decompress (ms) |
+|---|---:|---:|---:|
+| `lz4_flex` | 1,965,193 | 7.367 | 2.844 |
+| HC1 | 1,708,153 | 11.251 | 2.788 |
+| HC2 | 1,708,153 | 11.366 | 2.608 |
+| HC3 | 1,482,898 | 31.541 | 2.659 |
+| HC4 | 1,451,153 | 38.138 | 2.518 |
+| HC5 | 1,431,356 | 46.452 | 2.591 |
+| HC6 | 1,420,958 | 58.449 | 2.586 |
+| HC7 | 1,415,061 | 69.647 | 2.626 |
+| HC8 | 1,412,712 | 81.495 | 2.607 |
+| HC9 | 1,411,602 | 95.079 | 2.609 |
+
+conclusion: HC3 as default.
+
+- string event/log payload: 3.1B/row -> 2.3 B/row
+- Archived string storage dropped 24.8%, from 1,884,468 to 1,416,776 bytes. Library and replay checks pass.
+- overall storage drops from 8.6 -> 8.35 B/row (3% improvement)
+
+# switching to u16 string indexes
+we forcibly rotate string buffer and message block if string buffer gets to 2^16 entries.
+
+Archived storage is now 9,465,582 bytes, down 2.71%. No entry-limits were hit. 
+The size savings is mostly just fitting more rows in the block. The active data grew considerably due to more strings left in the active buffer.

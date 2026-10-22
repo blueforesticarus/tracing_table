@@ -100,26 +100,33 @@ impl BlockCache {
                 frame.length = self.active.length;
                 self.active = frame;
             } else {
-                // active frame has reached max size, compact put in ring buffer.
-                // active frame cleared, retains allocated capacity
-                let frame = ArchivedFrame::new_from(&self.active);
-
-                // mask and first element
-                assert_eq!(&frame.mask()[..], &self.active.buffer[..self.unit]);
-                assert_eq!(frame.first(), &self.active.buffer[self.unit..2 * self.unit]);
-
-                let length = frame.len();
-                self.ring.push(Data {
-                    data: frame,
-                    timestamp: self.timestamp.clone(),
-                    index: self.count,
-                    string_buffer: self.string_buffer,
-                });
-                self.count += length;
-                self.timestamp = Range { start: 0, end: 0 };
-                self.active.clear();
+                self.cycle();
             }
         }
+    }
+
+    /// Archive a populated chunk early when its owner must change string buffers.
+    pub(crate) fn cycle(&mut self) {
+        if self.active.length == 0 {
+            return;
+        }
+        // Compact the populated frame and retain its allocated capacity for reuse.
+        let frame = ArchivedFrame::new_from(&self.active);
+
+        // mask and first element
+        assert_eq!(&frame.mask()[..], &self.active.buffer[..self.unit]);
+        assert_eq!(frame.first(), &self.active.buffer[self.unit..2 * self.unit]);
+
+        let length = frame.len();
+        self.ring.push(Data {
+            data: frame,
+            timestamp: self.timestamp.clone(),
+            index: self.count,
+            string_buffer: self.string_buffer,
+        });
+        self.count += length;
+        self.timestamp = Range { start: 0, end: 0 };
+        self.active.clear();
     }
 
     pub fn allocate(&mut self) -> (&mut [u8], usize) {

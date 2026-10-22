@@ -174,13 +174,20 @@ impl PerCallsiteData {
                                 StringStorage::Offset.read(strings, reader.u32()).to_owned(),
                             ),
                             ValueKind::BufferIndex => InputValue::Text(
-                                StringStorage::Index.read(strings, reader.u32()).to_owned(),
+                                StringStorage::Index.read(strings, u32::from(reader.u16())).to_owned(),
                             ),
                         }));
                     }
                     if let Some(count) = a.template {
                         let captures: Vec<_> = (0..count)
-                            .map(|_| self.string_storage.read(strings, reader.u32()))
+                            .map(|_| {
+                                // Template captures follow the callsite's packed string mode.
+                                let reference = match self.string_storage {
+                                    StringStorage::Offset => reader.u32(),
+                                    StringStorage::Index => u32::from(reader.u16()),
+                                };
+                                self.string_storage.read(strings, reference)
+                            })
                             .collect();
                         let message = self
                             .template

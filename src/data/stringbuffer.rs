@@ -7,15 +7,22 @@ use hashbrown::{HashTable, hash_table::Entry};
 
 use super::{CompressionStats, dyntuple::ValueData};
 
-/// Choose a string reference once per callsite. Both forms use u32 in raw rows;
-/// indices have smaller numeric ranges for the ordinary compaction algorithms.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Choose a string reference once per callsite: u32 offsets or u16 indexes in raw rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum StringStorage {
     #[default]
     Offset,
     Index,
 }
 impl StringStorage {
+    // Share the packed reference width with template row sizing and consumers.
+    pub fn unit(self) -> usize {
+        match self {
+            Self::Offset => size_of::<u32>(),
+            Self::Index => size_of::<u16>(),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Offset => "offset",
@@ -30,7 +37,7 @@ impl StringStorage {
                 ValueData::BufferOffset(u32::try_from(offset).expect("string offset exceeds u32"))
             }
             Self::Index => {
-                ValueData::BufferIndex(u32::try_from(index).expect("string index exceeds u32"))
+                ValueData::BufferIndex(u16::try_from(index).expect("string index exceeds u16"))
             }
         }
     }
@@ -136,6 +143,9 @@ impl Deref for Buffer {
 }
 
 impl Buffer {
+    /// Hard entry limit, independent of the smaller packed lookup bounds below.
+    pub const MAX_ENTRIES: usize = 1 << 16;
+
     /// Fast lookup bounds; oversized entries remain readable through their u32 offsets.
     pub const MAX_STRING_LENGTH: usize = (1 << 14) - 1;
     pub const MAX_STRINGS: usize = 1 << 14;
@@ -249,6 +259,11 @@ impl Buffer {
 impl ExpandedBuffer {
     // Keep writing and scanning the escaped length format in this module only.
     fn append(&mut self, text: &str) -> (usize, usize) {
+        // Owners must rotate before appending an entry that cannot have a u16 index.
+        assert!(
+            self.index.len() < Buffer::MAX_ENTRIES,
+            "string buffer is full"
+        );
         let offset = self.data.len();
         let length = u32::try_from(text.len()).expect("string exceeds u32 length");
         let prefix = if length < u16::MAX as u32 { 2 } else { 6 };
@@ -459,6 +474,76 @@ impl BufferCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_buffers_force_chunk_rotation_and_preserve_rows() {
+        use crate::subscriber::{InputValue, LocalRecordingLayer, RecordingLayer};
+        use std::sync::Arc;
+        use tracing_subscriber::{Registry, prelude::*};
+
+        fn emit(a: &str, b: &str) {
+            tracing::info!(a, b);
+        }
+        for mode in [StringStorage::Offset, StringStorage::Index] {
+            let mut layer = RecordingLayer::new();
+            layer.string_storage = mode;
+            layer.callsite_memory_cap = usize::MAX;
+            layer.global_memory_cap = usize::MAX;
+            let recorder = Arc::new(layer);
+            let dispatch = tracing::Dispatch::new(
+                Registry::default().with(LocalRecordingLayer(recorder.clone())),
+            );
+            tracing::dispatcher::with_default(&dispatch, || emit("first a", "first b"));
+            let site = recorder.callsites.read().values().next().unwrap().clone();
+            {
+                let mut site = site.write();
+                let buffer = &mut site.cache[0].strings.active;
+                // Fill storage directly to avoid quadratic overflow dedup work in this boundary test.
+                while buffer.len() < Buffer::MAX_ENTRIES - 2 {
+                    buffer.storage.append("unused");
+                }
+            }
+            tracing::dispatcher::with_default(&dispatch, || emit("last a", "last b"));
+            assert_eq!(
+                site.read().cache[0].strings.active.len(),
+                Buffer::MAX_ENTRIES
+            );
+            tracing::dispatcher::with_default(&dispatch, || emit("rotated a", "rotated b"));
+            let site = site.read();
+            let arch = &site.cache[0];
+            assert_eq!(arch.data.ring.len(), 1);
+            assert_eq!(arch.data.ring[0].data.len(), 2);
+            assert_eq!(arch.data.ring[0].string_buffer, 0);
+            assert_eq!(arch.data.string_buffer, 1);
+            assert_eq!(arch.strings.active.len(), 2);
+            let mut rows = Vec::new();
+            site.visit_rows(|row| rows.push(row.fields));
+            for (row, (a, b)) in rows.iter().zip([
+                ("first a", "first b"),
+                ("last a", "last b"),
+                ("rotated a", "rotated b"),
+            ]) {
+                assert_eq!(
+                    *row,
+                    vec![
+                        Some(InputValue::Text(a.into())),
+                        Some(InputValue::Text(b.into()))
+                    ]
+                );
+            }
+            assert_eq!(rows.len(), 3);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "string buffer is full")]
+    fn string_buffers_reject_entries_beyond_u16_indexes() {
+        let mut buffer = Buffer::default();
+        // Exercise the hard append guard independently of recording-layer rotation.
+        for _ in 0..=Buffer::MAX_ENTRIES {
+            buffer.storage.append("entry");
+        }
+    }
 
     #[test]
     fn strings_survive_dedup_and_compression() {
