@@ -40,8 +40,13 @@ pub use value::InputValue;
 pub mod template;
 
 /// Uncompressed bytes per archetype block; the reference comparison favors 4 KiB.
-/// Capacity rounds down to whole rows.
+/// Capacity rounds down to whole rows, subject to MESSAGE_BLOCK_MIN_ROWS.
 pub const MESSAGE_BLOCK_TARGET_SIZE: usize = 4 * 1024;
+
+/// Process-wide row floor for newly created blocks; configure before recording.
+/// The default preserves the 4 KiB policy. Experiments can prioritize a row count
+/// over that byte target without changing struct layouts or metadata accounting.
+pub static MESSAGE_BLOCK_MIN_ROWS: AtomicUsize = AtomicUsize::new(1);
 
 /// Target uncompressed bytes (32 KiB by default); set via env or `.store(bytes, Ordering::Relaxed)`.
 #[rustfmt::skip]
@@ -77,11 +82,14 @@ impl PerCallsiteData {
     fn get_arch(&mut self) -> usize {
         let archetype = &self.last_archetype; //aliased mutability issue with structs needs to be fixed. 
         let unit = archetype.unit();
-        let cap = MESSAGE_BLOCK_TARGET_SIZE / unit;
 
         let i = match self.lookup.get(archetype) {
             Some(i) => *i,
             None => {
+                // A row floor takes precedence over the target for wide schemas.
+                let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit)
+                    .max(MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed))
+                    .max(1);
                 let i = self.cache.len();
                 self.lookup.insert(archetype.clone(), i);
                 self.cache.push(
