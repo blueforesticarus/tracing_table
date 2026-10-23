@@ -1,5 +1,6 @@
 //! CODEX GENERATED: reviewed
-//! Thin ownership for slice-tailed values: a u32 length lives before the value.
+//! Thin ownership for slice-tailed values: a u16 length lives before the value.
+use super::unalign::Unalign;
 use std::{
     alloc::{self, Layout},
     marker::PhantomData,
@@ -7,10 +8,15 @@ use std::{
     ptr::{self, NonNull, Pointee},
 };
 
-/// One-pointer owner for DSTs whose metadata is a slice length fitting in u32.
-#[repr(C, packed(4))]
+/// One-pointer owner for DSTs whose metadata is a slice length fitting in u16.
+/// Lengths count bytes for archived byte tails, elements for ordinary slices.
+/// Future option: encode length in units of the pointee's alignment to extend
+/// the range. That requires preserving discarded low bits (for example in tagged
+/// pointer bits); rounding alone loses exact frame/trailer boundaries.
+#[repr(C)]
 pub struct SmallBox<T: ?Sized + Pointee<Metadata = usize>> {
-    pointer: NonNull<u8>,
+    // Only the stored address is unaligned; allocations still satisfy T's alignment.
+    pointer: Unalign<NonNull<u8>, 2>,
     owner: PhantomData<T>,
 }
 
@@ -38,7 +44,7 @@ impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
             initialize,
             ..
         } = tail;
-        u32::try_from(length).expect("SmallBox length exceeds u32");
+        u16::try_from(length).expect("SmallBox length exceeds u16");
         let (value_layout, tail_offset) = Layout::new::<H>().extend(tail_layout).unwrap();
         let (layout, offset) = Self::layout(value_layout.pad_to_align());
         let allocation = Allocation::new(layout);
@@ -61,25 +67,25 @@ impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
     }
 
     pub(crate) fn layout(value: Layout) -> (Layout, usize) {
-        let (layout, offset) = Layout::new::<u32>().extend(value).unwrap();
+        let (layout, offset) = Layout::new::<u16>().extend(value).unwrap();
         (layout.pad_to_align(), offset)
     }
 
-    /// Adopt an initialized value allocated using Self::layout. The four bytes
-    /// immediately before the value must be writable; its slice length must fit u32.
+    /// Adopt an initialized value allocated using Self::layout. The two bytes
+    /// immediately before the value must be writable; its slice length must fit u16.
     /// The caller transfers sole ownership of both value and allocation.
     unsafe fn from_raw(value: *mut T) -> Self {
-        let length = u32::try_from(ptr::metadata(value)).expect("SmallBox length exceeds u32");
+        let length = u16::try_from(ptr::metadata(value)).expect("SmallBox length exceeds u16");
         let pointer = value.cast::<u8>();
         // SAFETY: The caller reserved the prefix in this same allocation.
         unsafe {
             pointer
-                .sub(size_of::<u32>())
-                .cast::<u32>()
+                .sub(size_of::<u16>())
+                .cast::<u16>()
                 .write_unaligned(length);
         }
         Self {
-            pointer: unsafe { NonNull::new_unchecked(pointer) },
+            pointer: Unalign::new(unsafe { NonNull::new_unchecked(pointer) }),
             owner: PhantomData,
         }
     }
@@ -87,7 +93,7 @@ impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
     /// Move a boxed slice-tailed value into a thin allocation without cloning T.
     pub fn from_box(value: Box<T>) -> Self {
         let length = ptr::metadata(value.as_ref());
-        u32::try_from(length).expect("SmallBox length exceeds u32");
+        u16::try_from(length).expect("SmallBox length exceeds u16");
         let value_layout = Layout::for_value(value.as_ref());
         let (layout, offset) = Self::layout(value_layout);
         let allocation = Allocation::new(layout);
@@ -112,12 +118,13 @@ impl<T: ?Sized + Pointee<Metadata = usize>> SmallBox<T> {
         // before the aligned value. Prefix padding accommodates higher alignments.
         let length = unsafe {
             self.pointer
+                .get()
                 .as_ptr()
-                .sub(size_of::<u32>())
-                .cast::<u32>()
+                .sub(size_of::<u16>())
+                .cast::<u16>()
                 .read_unaligned()
         };
-        ptr::from_raw_parts_mut(self.pointer.as_ptr(), length as usize)
+        ptr::from_raw_parts_mut(self.pointer.get().as_ptr(), length as usize)
     }
 }
 
@@ -220,7 +227,7 @@ impl<T: ?Sized + Pointee<Metadata = usize>> Drop for SmallBox<T> {
         // SAFETY: Constructors allocate the prefix and T together. Drop T once,
         // then release the whole allocation, including during destructor unwinding.
         unsafe {
-            let _allocation = Allocation(self.pointer.as_ptr().sub(offset), layout);
+            let _allocation = Allocation(self.pointer.get().as_ptr().sub(offset), layout);
             ptr::drop_in_place(raw);
         }
     }
@@ -230,6 +237,66 @@ impl<T: ?Sized + Pointee<Metadata = usize>> Drop for SmallBox<T> {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn u16_prefix_preserves_exact_byte_lengths_at_the_limit() {
+        // Odd lengths must not be rounded into the DST metadata or its trailer.
+        for length in [0, 1, 2, 3, u16::MAX as usize - 1, u16::MAX as usize] {
+            let mut value = SmallBox::from_box(vec![37u8; length].into_boxed_slice());
+            assert_eq!(value.len(), length);
+            assert_eq!(value.allocation_size(), (2 + length).next_multiple_of(2));
+            if length != 0 {
+                value[length - 1] = 91;
+                assert_eq!(value[length - 1], 91);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "SmallBox length exceeds u16")]
+    fn oversized_boxed_tail_is_rejected_before_ownership_moves() {
+        SmallBox::from_box(vec![0u8; u16::MAX as usize + 1].into_boxed_slice());
+    }
+
+    #[test]
+    fn oversized_direct_tail_drops_header_without_running_initializer() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct Header(Rc<Cell<usize>>);
+        impl Drop for Header {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        #[repr(C)]
+        struct Combined {
+            header: Header,
+            tail: [u8],
+        }
+        let drops = Rc::new(Cell::new(0));
+        let called = Cell::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let length = u16::MAX as usize + 1;
+            // SAFETY: The byte-tail layout matches; the length check must reject
+            // it before allocating or invoking this deliberately failing writer.
+            let tail = unsafe {
+                Initializer::new(
+                    Layout::array::<u8>(length).unwrap(),
+                    length,
+                    |_: *mut [u8]| {
+                        called.set(true);
+                        panic!("oversized tail initializer must not run");
+                    },
+                )
+            };
+            // SAFETY: Combined is repr(C) with exactly this header and tail.
+            let _: SmallBox<Combined> =
+                unsafe { SmallBox::with_header(Header(drops.clone()), tail) };
+        }));
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert_eq!(drops.get(), 1);
+    }
 
     #[test]
     fn thin_slices_preserve_alignment_mutation_and_owned_drops() {

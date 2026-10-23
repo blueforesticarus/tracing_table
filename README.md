@@ -11,12 +11,25 @@ to restore byte-aligned packed rows. The constant does not affect byte compactio
 
 Parent references store a u64 ZigZag index delta and a u16 dictionary index.
 Each block's collocated metadata stores a u16 entry count; its compacted frame
-ends with that many `(u32 callsite, u32 archetype, u64 offset)` entries.
-All entries retain their identity, including singletons. The offset is the exact
-first parent index for that identity in the block; row deltas preserve exact IDs.
+ends with that many `(CallsiteArchetype, FloatU16 offset, FloatU16 stride)` entries,
+8 bytes each. `CallsiteArchetype` packs a 20-bit callsite and a 12-bit archetype
+into one u32. All entries retain their identity, including singletons.
+Active blocks use a zero stride and an offset from the first matching parent.
+At initial archival, each identity's first and last matching rows define a line.
+Its intercept is the offset; a negative intercept instead fits a line through
+the origin and the last matching point. Flat, decreasing and singleton groups
+use a zero stride and the first matching index as their offset.
+
+Stride stores the line's total increase over the actual frame length `L`, so
+the predictor at zero-based row `R` is `offset + round(stride * R / L)`.
+Both coefficients use the existing unsigned `FloatU16`; residuals are computed
+from their decoded values and preserve every parent ID exactly. Fitting and
+prediction use integer arithmetic with wide intermediates, including saturated
+coefficients and full-range u64 IDs. Parent fitting recomputes only its residual mask.
 The frame's existing allocation length and row layout imply the trailer's size.
-Both compaction formats preserve trailers through archived edits. Readers return
-ordinary `SpanId` values. [Measured storage comparison and pies](doc/parent_dictionary_2026-10-22.md).
+Both compaction formats preserve these predictors through archived edits without
+refitting. Readers return ordinary `SpanId` values.
+[Earlier offset-only storage comparison](doc/parent_dictionary_2026-10-22.md).
 
 Bit-compacted frames store the packed-row stride as `u16`: at most **65,535
 varying bits per row** with continuous packing, or **65,528 bits** with
@@ -57,7 +70,17 @@ Timestamps are stored as shifted `u64` nanoseconds since the recorder started.
 The default shift is **10**, giving **1,024 ns (1.024 µs) ticks**. Set
 `RecordingLayer::timestamp_bit_shift` before recording to choose another resolution.
 
-*TODO: End timestamps are relative to the start timestamp?*
+Active timestamp headers store unsigned offsets from the block's fixed first
+timestamp. At archival, the first and last start timestamps fit a stride over
+the actual row count `L`: the predicted offset at row `R` is
+`round(stride * R / L)`. Collocated metadata stores the stride as `FloatU16` in
+shifted ticks, keeping small values such as 50 exact even at shift 20.
+Strides above `FloatU16::MAX` (4,396,972,769,280 ticks, about 4,397 seconds at
+nanosecond resolution) are disabled with zero; those blocks retain unsigned
+offsets. Enabled blocks store exact ZigZag residuals from the decoded predictor.
+Only timestamp mask bits are recomputed. Readers use the frame's existing row
+count; archived edits retain the fitted stride, and late span closes only extend
+the timestamp range. Span ends store duration + 1, with zero reserved for an open span.
 
 Event id's are assigned as per-archetype sequential counters, to maximise how many bytes can be compacted. Archetypes ids themselves are also sequential.
 
@@ -240,36 +263,44 @@ python3 -m unittest discover -s util
 
 # OVERHAUL
 
-1. implement our own string cache
+1. [x] implement our own string cache
    this needs to handle singleton and repeated strings more intelligently 
    it needs to not inline short strings if it prevents block compaction
    it likely should store seperate index tables for different lengths of string
    it possibly should consider how its design can facilitate prefix and mask representations
    the storage of strings itself should likely be blocks which can be compressed.
    must support deletion
-2. support deletion of blocks, which must also cleanup strings
-3. order of logs (in a thread, at a minimum, though possibly nominally) must be recoverable. timestamps are not enough
+2. [x] support deletion of blocks, which must also cleanup strings
+3. [x] order of logs (in a thread, at a minimum, though possibly nominally) must be recoverable. timestamps are not enough
    what we should do, is use timestamp + disambiguator
    disambiguator SHOULD be cross thread so that cross thread timing can be reconstructed, since that timing may be nonarbitrary in the case of locks.
    we can reduce bits in order to 
-4. we might want to allow blocks to grow past default length, untill adding the row would require invalidate a currently compactible bytecolumn
-5. support bitpacked version of frame
-6. support compressing frames.
-7. should allow per thread dumping to a collector thread
-8. probably should have bounded lookups for spans active at a given time, which effects block design, might be able to get away without it due to events pointing to span id's. we already have bounded lookup for events/span start/end
+4. [ ] we might want to allow blocks to grow past default length, untill adding the row would require invalidate a currently compactible bytecolumn
+5. [x] support bitpacked version of frame
+6. [ ] support compressing frames.
+7. [ ] should allow per thread dumping to a collector thread
+8. [ ] probably should have bounded lookups for spans active at a given time, which effects block design, might be able to get away without it due to events pointing to span id's. we already have bounded lookup for events/span start/end
 9.  we need indexing over fields, for efficient entity lookup
-10. all sources of memory use must be tracked. 
-11. we should probably compute the prefix per block, when compacting.
+10. [ ] all sources of memory use must be tracked. 
+    - mostly done, but malloc overhead unaccounted for
+11. [x] we should probably compute the prefix per block, when compacting.
    though this may result in "finished frame 1000|1" "finished frame 1000|2"
    when what we want is "finished frame |10001"
    however whole archetype prefixing means one weird message disables prefixing entirely. 
-   **compromise might be reseting when prefix is 0 (or a small number of bytes, 8 feels right due to overhead reasons)**
+   *compromise might be reseting when prefix is 0 (or a small number of bytes, 8 feels right due to overhead reasons)*
    but we still should resplit the block on compression
-12. traitify dyntuple values. support multiple rep formats for a given output type. try to avoid depending on subscriber for soundness of dyntuple actions. may consider nestable / composable dyntuples.
-13. need a test which compares just recording every log directly to a file with logs reconstructed from the tracing_table, for accuracy.
-14. we may want to store the blocks columnar, either by field or by byte. This might assist with compression. supporting this is tricky, ideally should be a compiletime abstraction for perf
-15. messages are generally similar per callsite, so it is likely they should be stored together per callsite, possibly in a compressed block. fields are more likely to be shared, so perhaps handle those seperately. compression could use lz4 with a dictionary shared by all the blocks of a given archetype.
-16. however string fields are stored it needs to be easy to equality check, so we can scan for a value like entity="201v1", *this is different than message which has different tradeoffs*
+   - **NO LONGER APPLICABLE** prefix feature replaced with template extraction
+12. [ ] traitify dyntuple values. support multiple rep formats for a given output type. try to avoid depending on subscriber for soundness of dyntuple actions. may consider nestable / composable dyntuples.
+13. [x] need a test which compares just recording every log directly to a file with logs reconstructed from the tracing_table, for accuracy.
+14. [ ] we may want to store the blocks columnar, either by field or by byte. This might assist with compression. supporting this is tricky, perhaps should be a compiletime abstraction for perf
+15. [x] messages are generally similar per callsite, so it is likely they should be stored together per callsite, possibly in a compressed block. fields are more likely to be shared, so perhaps handle those seperately. compression could use lz4 with a dictionary shared by all the blocks of a given archetype.
+   - DONE: what we ended up doing is a little different, but similar in intent
+16. [x] however string fields are stored it needs to be easy to equality check, so we can scan for a value like entity="201v1", *this is different than message which has different tradeoffs*
+   - DONE: we keep hash tables only for the active string buffers (ie for fast insertion), so this doesn't help with scanning. 
+   - scanning for small strings is already fast, 201v1 is 5 bytes
+     large strings largely skip by length
+   - we ended up not inlining small strings because mixed short and non-short strings would result in very poor compaction. 
+   - [ ] **TODO:** create test workload where string indirection is worst case (lots of very short, unique strings, with common prefix) and test. 
 
 ## TODO benchmark
 64K is a good default lz4 size. my guess is that's as large as we want to go considering random access (following span heirarchy, indexing by entity, etc.)
@@ -337,6 +368,33 @@ The earlier [string LZ4 level comparison](doc/investigation2_2026-10-15.txt)
 reports fast/HC3/HC9/HC12 storage sizes, with
 [per-archetype results](doc/investigation2_2026-10-15.csv). It does not measure
 compression time.
+
+
+
+
+
+
+---
+
+
+
+
+
+
+
+# DEVLOG
+
+EAS: everything below this line is a devlog and was written by me, or least manually copied. The stuff above is an unfortionate mix of my notes and stuff codex produced.
+
+I have attempted to document my attempts to shave down the size, rational and the effect each change had. As well as things I tried which did not turn out beneficial.
+
+Some of the changes I made, some were refactors I had codex make. Some of the later ones I got lazy and let codex rewrite more code than I'd like without reviewing. 
+
+I try to mark LLM produced stuff for my own sanity, but I don't promise it is accurate. I'd like to go over the whole thing with a fine tooth comb and knock out all the things that don't feel like I wrote it, but until then this is a mix of deliberate engineering and throwaway slop. The library is mostly mine, except for dump/replay. The examples and benchmarks and most tests are generated and I haven't even looked at the former two. 
+
+The design of the log storage, for what is worth, was entirely explicit. 
+
+The first version of this library was produced by hand several years ago. Codex has been used to help refactor, clean up, optimize, test, and benchmark it. 
 
 ## thoughts on string indirection
 EAS:
@@ -718,7 +776,7 @@ parent spanid payload breakdown:
 | End buffer: parent table | 0 → 0.115 | +0.115 | 0 → 0.079 | +0.079 |
 | **Combined parent cost** | **1.340 → 1.099** | **−18.0%** | **1.112 → 0.876** | **−21.2%** |
 
-NEXT:
+---
 
 reconsider floating point offset 
    - offset can be really big while variance is really small, fixed precision might be better.
@@ -726,7 +784,61 @@ reconsider floating point offset
      - *TODO: this is on sample data, it would become more appealing as spanid's grew over running length of application.*
    - perhaps a unit larger than 1. current data this is slightly worse overall 0.14%. it is now a constant that can be set. Still defaulting to 1.
 
+
+---
+
 add stride ie. linear prediction with encoding
    - stride to be stored as same custom float, with unit 1, representing diff across whole buffer.
    - this requires rebuilding values at compact time. which complicates implementation
+   - metadata is simple. just add another custom 16bit float for the delta across the whole block 
+     - not single row: spanids can repeat and total delta can be less than the number of rows. storing stride over whole block means we can store an *integer*
 
+NOTE: linear extension and clamping.
+we dont want to store first and last row for a call/arch, or have to look it up
+instead we chose equivilent offset + stride which cover the whole block.
+*clamping*: consider that if the first row that uses call/arch X for parent is N and has span index 0, the implied first spanindex would be negative. We don't want to store that. so we should clamp the offset to zero. This will slightly worsen the accuracy, for earlier entries in the frame. 
+
+exact steps. 
+1. take first and last rows which use give call/arch, R1 and R2, and their span indices S1 S2
+2. take line defined by these points, see where it intersects R=0, this is the offset. if this is negative then replace line with one passing through R2, S2 (ie last) and 0,0
+3. look at where line intersets R=L (frame length). The corresponding S minus offset is your stride.
+4. to within precision: stride x R2 / L + offset = S2 and if we did not clamp to zero stride * R1 /L + offset = S1
+5. if stride would be negative we set stride to 0, if S1=S2 we set stride to zero, this gracefully falls back to offset encoding
+
+codex impl: saves 5.42%
+
+| Storage component | Before (B) | After (B) | Change (B) |
+|---|---:|---:|---:|
+| Parent SpanId row fields | 1,030,043.250 | 608,178.375 | −421,864.875 |
+| Other payload + packed padding | 5,620,037.750 | 5,619,809.625 | −228.125 |
+| Parent end tables | 112,690 | 135,228 | +22,538 |
+| Container metadata | 613,239 | 612,934 | −305 |
+| **Total archive** | **7,376,010** | **6,976,150** | **−399,860** |
+
+
+# strided (linear predicted) timestamp 
+before cleaning up the stride impl let's add stride for timestamps as well. 
+
+the stride can be stored with the same custom 16bit float
+- max value is 4T or ~4400 seconds at ns resolution. 
+- if this is exceeded, we will store with stride 0 (disabled)
+- NOTE: because users might greatly increase the ts shift, we want to be able to accurately store small strides. a block with a duration of 50ms and 1ms ticks (shift 20) would have a stride of 50.
+
+ALSO: add implicit leading 1 to mantisa of the float, unless exp=0 (to preserve small str handling)
+
+- store ts stride with CollocatedMetadata, which does not grow due consuming existing alignment padding. 
+- no change to Descriptor (already stores start ts)
+  
+| Component | Before KiB | After KiB | Change KiB | Change |
+|---|---:|---:|---:|---:|
+| **Archive overall** | **6,812.65** | **6,592.98** | **−219.67** | **−3.22%** |
+| Span payload | 2,682.23 | 2,570.81 | −111.41 | −4.15% |
+| Event/log payload | 3,531.85 | 3,423.41 | −108.45 | −3.07% |
+| Metadata overhead | 598.57 | 598.76 | +0.19 | +0.03% |
+| Start timestamps, combined | 2,666.75 | 2,449.98 | −216.77 | −8.13% |
+
+TODO review codex changes
+
+# overhead reduction
+Added [Unalign<T, A> (line 74)](/home/user/files/projects/dev/util/tracing_table/src/data/unalign.rs:74) with safe get, set, replace, and into_inner methods. Used it for StringBufferId and the SmallBox pointer.
+The fixed archive header shrank 26 → 22 bytes, saving 34,392 bytes on the reference capture without changing payloads.

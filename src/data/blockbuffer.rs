@@ -17,7 +17,8 @@ use super::stringbuffer::StringBufferId;
 mod metadata;
 pub use metadata::CollocatedMetadata;
 mod parent_offsets;
-pub use parent_offsets::{ParentOffsetEntry, ParentOffsets};
+pub use parent_offsets::{CallsiteArchetype, ParentOffsetEntry, ParentOffsets};
+mod timestamps;
 
 // Compile-time selection keeps both modes on the normal rollover/edit/read path.
 #[cfg(feature = "bit-compression")]
@@ -60,6 +61,9 @@ pub struct BlockCache {
 
     // Writable dictionary scratch is reused after its entries move into an archive.
     active_parent_offsets: Vec<u8>,
+    // These describe writable rows only; archived frames need neither field.
+    active_parent_row_offset: u16,
+    active_timestamp_header: bool,
 }
 
 pub struct Data {
@@ -67,7 +71,7 @@ pub struct Data {
     pub descriptor: Descriptor,
 }
 
-/// Shared metadata and variable-sized frame occupy one four-byte-aligned allocation.
+/// Shared metadata and variable-sized frame occupy one two-byte-aligned allocation.
 #[repr(C)]
 pub struct ArchivedBlock {
     pub metadata: CollocatedMetadata,
@@ -94,10 +98,17 @@ pub struct Descriptor {
     /// One-based starting row index within the archetype.
     pub index: usize,
     /// Invariant: start is the first row's timestamp and NEVER changes for this block
-    /// ts are stored as offsets from start, preserving exact start times forever.
+    /// Rows store exact offsets or stride residuals from this immutable origin.
     /// Appended timestamps must not precede start.
     pub(crate) timestamp: Range<usize>,
 }
+
+// Keep per-block predictors in the heap metadata, away from occupied/spare slots.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(size_of::<Descriptor>() == 24);
+    assert!(size_of::<Data>() == 32);
+};
 
 /// Location in the same callsite. Block ordinals are one-based and survive eviction.
 #[repr(C)]
@@ -112,18 +123,12 @@ impl Descriptor {
     pub(crate) fn encode_timestamp(&self, ts: u64) -> u64 {
         let base = self.timestamp.start as u64;
         assert!(ts >= base, "timestamp precedes block timestamp base");
-        // To support negative offsets later, enable zigzag here and in decoding:
-        // let delta = i64::try_from(i128::from(ts) - i128::from(base))
-        //     .expect("timestamp offset exceeds i64");
-        // ((delta as u64) << 1) ^ ((delta >> 63) as u64)
+        // Active and disabled-stride blocks retain the complete unsigned range.
         ts - base
     }
 
-    /// Recover nominal time without consulting the mutable end of the range.
+    /// Recover nominal time from an offset after any stride has been decoded.
     pub fn decode_timestamp(&self, offset: u64) -> u64 {
-        // Zigzag decoding must be enabled together with its encoder above:
-        // let delta = ((offset >> 1) as i64) ^ -((offset & 1) as i64);
-        // (self.timestamp.start as u64).checked_add_signed(delta)
         (self.timestamp.start as u64)
             .checked_add(offset)
             .expect("timestamp offset exceeds u64")
@@ -172,14 +177,13 @@ impl BlockCache {
             active_metadata: CollocatedMetadata::default(),
             edit_buffer: vec![0; unit],
             active_parent_offsets: Vec::new(),
+            active_parent_row_offset: 0,
+            active_timestamp_header: false,
         }
     }
 
     pub fn active_parent_offsets(&self) -> ParentOffsets<'_> {
-        ParentOffsets::new(
-            &self.active_parent_offsets,
-            self.active_metadata.parent_offset_count,
-        )
+        ParentOffsets::new(&self.active_parent_offsets)
     }
 
     /// Active dictionary heap belongs to writable storage, including spare capacity.
@@ -189,35 +193,50 @@ impl BlockCache {
 
     /// Call after cycle_if_needed/prepare_chunk and immediately before allocate,
     /// so the dictionary and the new row always belong to the same block.
-    pub fn encode_parent(&mut self, index: u64, callsite: u32, archetype: u32) -> (u64, u16) {
+    pub fn encode_parent(
+        &mut self,
+        index: u64,
+        identity: CallsiteArchetype,
+        row_offset: usize,
+    ) -> (u64, u16) {
         assert!(
             self.active.length < self.active.capacity(),
             "prepare chunk before encoding parent"
         );
-        let table_index = match self.active_parent_offsets().find(callsite, archetype) {
+        assert!(row_offset + ParentOffsets::ROW_BYTES <= self.unit);
+        let row_offset = u16::try_from(row_offset).expect("parent position exceeds u16");
+        assert!(
+            self.active_parent_offsets.is_empty() || self.active_parent_row_offset == row_offset
+        );
+        self.active_parent_row_offset = row_offset;
+        let table_index = match self.active_parent_offsets().find(identity) {
             Some(index) => index,
             None => {
-                let count = self.active_metadata.parent_offset_count;
-                let next = count
+                let count = self.active_parent_offsets().len() as u16;
+                // Reject overflow before appending an entry or changing row state.
+                count
                     .checked_add(1)
                     .expect("parent identity count exceeds u16");
                 self.active_parent_offsets
-                    .extend_from_slice(&callsite.to_le_bytes());
-                self.active_parent_offsets
-                    .extend_from_slice(&archetype.to_le_bytes());
+                    .extend_from_slice(&identity.to_bits().to_le_bytes());
                 // Store a two-byte predictor scaled by FloatU16::UNIT; every row uses
                 // its decoded value, so rounding never changes the original ID.
                 let offset = super::float_u16::FloatU16::from_u64_lossy(index);
                 self.active_parent_offsets
                     .extend_from_slice(&offset.to_bits().to_le_bytes());
-                self.active_metadata.parent_offset_count = next;
+                // Active rows use only the offset. Fit the final stride once
+                // the block length and each identity's last occurrence are known.
+                self.active_parent_offsets
+                    .extend_from_slice(&0u16.to_le_bytes());
                 count
             }
         };
         (
-            self.active_parent_offsets()
-                .entry(table_index)
-                .encode(index),
+            self.active_parent_offsets().entry(table_index).encode(
+                index,
+                self.active.length,
+                self.active.length + 1,
+            ),
             table_index,
         )
     }
@@ -244,6 +263,16 @@ impl BlockCache {
         if self.active.length == 0 {
             return;
         }
+        if self.active_timestamp_header {
+            self.active_metadata.fit_timestamp_stride(&mut self.active);
+        }
+        if !self.active_parent_offsets.is_empty() {
+            parent_offsets::fit_strides(
+                &mut self.active,
+                &mut self.active_parent_offsets,
+                usize::from(self.active_parent_row_offset),
+            );
+        }
         let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
         // timestamp range and deferred references start fresh for the new frame.
@@ -263,17 +292,35 @@ impl BlockCache {
         });
         self.active.clear();
         self.active_parent_offsets.clear();
+        self.active_parent_row_offset = 0;
+        self.active_timestamp_header = false;
     }
 
     /// Initialize the origin after rollover and validate before committing a row.
     /// Return its encoded timestamp alongside the bytes and absolute row index.
     pub fn allocate(&mut self, ts: u64) -> (&mut [u8], usize, u64) {
+        self.allocate_inner(ts, false)
+    }
+
+    /// Allocate an event/span start with a timestamp in the first eight bytes.
+    /// Generic payloads and deferred span updates continue to use allocate().
+    pub fn allocate_timestamp(&mut self, ts: u64) -> (&mut [u8], usize, u64) {
+        self.allocate_inner(ts, true)
+    }
+
+    fn allocate_inner(&mut self, ts: u64, timestamp_header: bool) -> (&mut [u8], usize, u64) {
         self.cycle_if_needed();
+        // A block has one row schema; generic payloads must never be rewritten.
+        assert!(self.active.length == 0 || self.active_timestamp_header == timestamp_header);
         if self.active.length == 0 {
             let ts = usize::try_from(ts).expect("block timestamp exceeds usize");
             self.active_descriptor.timestamp = ts..ts;
         }
         let offset = self.active_descriptor.encode_timestamp(ts);
+        if timestamp_header {
+            assert!(self.unit >= size_of::<u64>());
+        }
+        self.active_timestamp_header = timestamp_header;
         let (buffer, index) = self.active.allocate().unwrap();
         (buffer, index + self.active_descriptor.index, offset)
     }
@@ -288,6 +335,25 @@ impl BlockCache {
             (index >= block.descriptor.index
                 && index - block.descriptor.index < block.data.frame.len())
             .then_some(&block.descriptor)
+        })
+    }
+
+    /// Decode a retained timestamp with its metadata and existing frame length.
+    pub fn decode_timestamp(&self, encoded: u64, index: usize) -> Option<u64> {
+        if index >= self.active_descriptor.index {
+            return (index - self.active_descriptor.index < self.active.length)
+                .then(|| self.active_descriptor.decode_timestamp(encoded));
+        }
+        self.ring.iter().rev().find_map(|block| {
+            let row = index.checked_sub(block.descriptor.index)?;
+            (row < block.data.frame.len()).then(|| {
+                block.data.metadata.decode_timestamp(
+                    &block.descriptor,
+                    encoded,
+                    row,
+                    block.data.frame.len(),
+                )
+            })
         })
     }
 
@@ -488,7 +554,7 @@ mod test {
         // Cross padding boundaries and verify both archive formats with feature runs.
         for unit in 1..=33 {
             let mut cache = BlockCache::new(unit, 2, 2);
-            cache.active_metadata.string_buffer = StringBufferId(7);
+            cache.active_metadata.string_buffer = StringBufferId::new(7);
             cache.push(&vec![0; unit], 0);
             cache.push(&vec![1; unit], 1);
             cache.cycle();
@@ -499,6 +565,9 @@ mod test {
                 .unwrap();
             let (expected, _) =
                 super::SmallBox::<super::ArchivedBlock>::layout(value_layout.pad_to_align());
+            // No fixed padding remains between metadata, frame, or u16 prefix.
+            assert_eq!(offset, 14);
+            assert_eq!(expected.align(), 2);
             assert_eq!(
                 Layout::for_value(block.data.as_ref()),
                 value_layout.pad_to_align()
@@ -513,7 +582,7 @@ mod test {
                 stats.compressed + stats.overhead + stats.overalloc,
                 size_of::<Data>() + expected.pad_to_align().size()
             );
-            assert_eq!(block.data.metadata.string_buffer, StringBufferId(7));
+            assert_eq!(block.data.metadata.string_buffer, StringBufferId::new(7));
         }
     }
 
@@ -562,7 +631,7 @@ mod test {
     fn span_candidates_deduplicate_move_with_the_block_and_drop_with_it() {
         use super::{SpanFieldsRef, StringBufferId};
         let mut cache = BlockCache::new(1, 2, 2);
-        cache.active_metadata.string_buffer = StringBufferId(7);
+        cache.active_metadata.string_buffer = StringBufferId::new(7);
         cache.push(&[1], 1);
         let first = SpanFieldsRef {
             archetype: 2,
@@ -592,7 +661,7 @@ mod test {
         let archived = &cache.ring[0];
         assert_eq!(archived.descriptor.index, 1);
         assert_eq!(archived.descriptor.timestamp, 1..2);
-        assert_eq!(archived.data.metadata.string_buffer, StringBufferId(7));
+        assert_eq!(archived.data.metadata.string_buffer, StringBufferId::new(7));
         assert_eq!(
             archived.data.metadata.span_fields().unwrap().as_ptr(),
             allocation
@@ -604,7 +673,7 @@ mod test {
         );
         assert_eq!(cache.active_descriptor.index, 3);
         assert_eq!(cache.active_descriptor.timestamp, 3..3);
-        assert_eq!(cache.active_metadata.string_buffer, StringBufferId(7));
+        assert_eq!(cache.active_metadata.string_buffer, StringBufferId::new(7));
         assert!(cache.active_metadata.span_fields().is_none());
         assert_eq!(cache.span_fields_refs(2), &[first, second]);
         assert!(cache.span_fields_refs(3).is_empty());
@@ -619,7 +688,7 @@ mod test {
     #[test]
     fn archived_edits_and_constant_blocks_preserve_the_complete_stream() {
         let mut cache = BlockCache::new(2, 8, 8);
-        cache.active_metadata.string_buffer = super::StringBufferId(7);
+        cache.active_metadata.string_buffer = super::StringBufferId::new(7);
         let mut expected: Vec<_> = (0..35).map(|i| [0xA0 | (i / 8) as u8, 0x55]).collect();
         for row in &expected {
             cache.push(row, 0);
@@ -648,7 +717,7 @@ mod test {
             cache
                 .ring
                 .iter()
-                .all(|block| block.data.metadata.string_buffer == super::StringBufferId(7))
+                .all(|block| block.data.metadata.string_buffer == super::StringBufferId::new(7))
         );
         assert_eq!(cache.span_fields_refs(1), &[reference]);
         assert_eq!(cache.span_fields_refs(1).as_ptr(), allocation);

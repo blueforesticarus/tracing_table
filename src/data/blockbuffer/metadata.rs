@@ -14,7 +14,7 @@ impl ArchivedBlock {
         metadata: CollocatedMetadata,
         trailer: &[u8],
     ) -> SmallBox<Self> {
-        super::ParentOffsets::new(trailer, metadata.parent_offset_count);
+        super::ParentOffsets::new(trailer);
         // SAFETY: ArchivedBlock is repr(C), with metadata followed by its DST frame.
         unsafe {
             SmallBox::with_header(
@@ -25,25 +25,32 @@ impl ArchivedBlock {
     }
 
     pub fn parent_offsets(&self) -> super::ParentOffsets<'_> {
-        super::ParentOffsets::new(self.frame.trailer(), self.metadata.parent_offset_count)
+        super::ParentOffsets::new(self.frame.trailer())
     }
 }
 
-/// Shared active/archive metadata; the thin owner keeps alignment at four bytes.
+/// Shared active/archive metadata; both the thin owner and string ID align to two bytes.
 #[repr(C)]
 #[derive(Default)]
 pub struct CollocatedMetadata {
-    pub string_buffer: StringBufferId,
-    /// Per-block dictionary count; all entries retain their complete identity.
-    pub parent_offset_count: u16,
+    // Put the pointer first so no small field introduces padding before it.
+    /// most spans have no extra fields (recorded after creation),
+    /// if they do a record is created for the fields with the spanid of the span
+    /// we only store the set of extra fields blocks associated with any row of this block.
+    /// reader is responsible for rebuilding association if desired, this limits search space (likely to one block, if not zero)
     span_fields: Option<SmallBox<[SpanFieldsRef]>>,
+    pub string_buffer: StringBufferId,
+    /// Predicted increase across the existing frame length, in shifted ticks.
+    /// Zero disables prediction and retains unsigned timestamp offsets.
+    pub timestamp_stride: crate::data::float_u16::FloatU16,
 }
 
-const _: () = assert!(align_of::<CollocatedMetadata>() == 4);
+const _: () = assert!(align_of::<CollocatedMetadata>() == 2);
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<Option<SmallBox<[SpanFieldsRef]>>>() == 8);
-    assert!(size_of::<CollocatedMetadata>() == 16);
+    assert!(size_of::<CollocatedMetadata>() == 14);
+    assert!(std::mem::offset_of!(CollocatedMetadata, span_fields) == 0);
 };
 
 impl CollocatedMetadata {
@@ -83,7 +90,7 @@ mod tests {
     #[test]
     fn thin_span_list_preserves_entries_and_deduplicates_across_growth() {
         let mut metadata = CollocatedMetadata::default();
-        assert_eq!(align_of::<CollocatedMetadata>(), 4);
+        assert_eq!(align_of::<CollocatedMetadata>(), 2);
         assert!(metadata.span_fields().is_none());
         assert_eq!(metadata.heap_bytes(), 0);
         // Revisit every entry after each replacement; duplicates must not allocate.
@@ -106,7 +113,8 @@ mod tests {
         }
         assert_eq!(
             metadata.heap_bytes(),
-            size_of::<u32>() + 257 * size_of::<SpanFieldsRef>()
+            // The u16 prefix occupies four bytes after aligning the slice.
+            4 + 257 * size_of::<SpanFieldsRef>()
         );
     }
 }

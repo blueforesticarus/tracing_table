@@ -10,6 +10,9 @@ pub mod float_u16;
 pub mod smallbox;
 pub mod stringbuffer;
 
+// Explicit alignment wrappers keep packed field access inside a reusable utility.
+pub mod unalign;
+
 // The experimental smartstring implementation remains disabled.
 // pub mod smartstring;
 

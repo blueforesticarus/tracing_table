@@ -178,7 +178,7 @@ impl PerCallsiteData {
                     string_id = Some(buffer_id);
                 }
                 let strings = strings.as_deref().expect("retained string buffer");
-                for _ in 0..count {
+                for local_row in 0..count {
                     let mut reader = Reader(rows.next().expect("stored row"));
                     let mut row = DecodedRow {
                         archetype: arch.id,
@@ -197,7 +197,12 @@ impl PerCallsiteData {
                         row.span = Some(reader.span());
                     } else {
                         // Span end edits never move the block's decoding origin.
-                        row.timestamp = Some(descriptor.decode_timestamp(reader.u64()));
+                        row.timestamp = Some(metadata.decode_timestamp(
+                            descriptor,
+                            reader.u64(),
+                            local_row,
+                            count,
+                        ));
                         if a.is_event {
                             row.timestamp_index = Some(reader.u16());
                         } else {
@@ -223,9 +228,11 @@ impl PerCallsiteData {
                             let residual = reader.u64();
                             let entry = parent_offsets.entry(reader.u16());
                             row.parent = Some(SpanId {
-                                index: entry.decode(residual),
-                                callsite: entry.callsite,
-                                archetype: entry.archetype,
+                                // Prediction uses this block's zero-based row,
+                                // independent of absolute indices and eviction.
+                                index: entry.decode(residual, local_row, count),
+                                callsite: entry.identity.callsite(),
+                                archetype: entry.identity.archetype(),
                             });
                         }
                     }

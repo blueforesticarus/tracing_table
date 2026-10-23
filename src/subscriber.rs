@@ -26,7 +26,7 @@ use tracing_subscriber::{Layer, registry::LookupSpan};
 
 use crate::data::{
     CompressionStats,
-    blockbuffer::BlockCache,
+    blockbuffer::{BlockCache, CallsiteArchetype},
     dyntuple::{BytePacker, ValueData, ValueKind},
     stringbuffer::{Buffer, BufferCollection},
 };
@@ -282,7 +282,7 @@ pub fn log_callsite_adapter(e: &'_ tracing::Event) -> &'static Metadata<'static>
     })
 }
 
-/// Row-header time: unsigned offset from the block's immutable timestamp.start,
+/// Row-header time: unsigned offset or archived ZigZag stride residual,
 /// in ticks of 1 << RecordingLayer::timestamp_bit_shift nanoseconds.
 /// Span end slots store duration + 1 instead; zero marks a still-open span.
 pub type PackedTimestamp = u64;
@@ -525,7 +525,7 @@ impl RecordingLayer {
                     } else {
                         bytes(
                             arch.strings.compressed
-                                [(buffer_id.0 - arch.strings.offset().0) as usize]
+                                [(buffer_id.get() - arch.strings.offset().get()) as usize]
                                 .compression_ratio(),
                         )
                     };
@@ -820,8 +820,21 @@ impl RecordingLayer {
         let arch = &mut site.cache[index];
         let allocated = arch.prepare_chunk(self.string_compression_level);
         // Rollover has finished; intern into the dictionary for this exact row.
-        let parent = parent.map(|p| arch.data.encode_parent(p.index, p.callsite, p.archetype));
-        let (bytes, index, timestamp_offset) = arch.data.allocate(time.value);
+        let parent = parent.map(|p| {
+            // Parent follows the timestamp and event ordinal or span-end slot.
+            let offset = size_of::<PackedTimestamp>()
+                + if is_event {
+                    size_of::<u16>()
+                } else {
+                    size_of::<PackedTimestamp>()
+                };
+            arch.data.encode_parent(
+                p.index,
+                CallsiteArchetype::new(p.callsite, p.archetype),
+                offset,
+            )
+        });
+        let (bytes, index, timestamp_offset) = arch.data.allocate_timestamp(time.value);
         let id = SpanId {
             index: index as u64,
             callsite: callsite as u32,
@@ -936,10 +949,8 @@ impl RecordingLayer {
             let data = &mut callsite_data.cache[id.archetype as usize].data;
             // A long-lived span may close after its start chunk has been evicted.
             let retained = if let Some((descriptor, mut row)) = data.get_mut(id.index as usize) {
-                let row = row.get_mut();
-                let offset = PackedTimestamp::from_ne_bytes(row[..8].try_into().unwrap());
-                let start = descriptor.decode_timestamp(offset);
-                let mut packer = BytePacker::new(row);
+                let start = row.decode_timestamp(descriptor);
+                let mut packer = BytePacker::new(row.get_mut());
                 packer.skip::<PackedTimestamp>(false);
                 // Bias the duration so a zero-tick closed span differs from an open span.
                 packer.write_any_value(time.value - start + 1, false);
@@ -1175,7 +1186,7 @@ mod test {
                 offsets.push(u64::from_ne_bytes(row[..8].try_into().unwrap()));
             }
             drop(raw);
-            assert_eq!(offsets, [0, 1, 0, 3_995, 0]);
+            assert_eq!(offsets, [0, 0, 0, 0, 0]); // Archived starts lie on their strides.
             assert_eq!(data.ring[0].descriptor.timestamp.start, 1_000);
             assert_eq!(data.ring[1].descriptor.timestamp.start, 1_005);
             assert_eq!(data.active_descriptor.timestamp.start, 4_990);
@@ -1424,9 +1435,9 @@ mod test {
                 let lengths: Vec<_> = site.cache.iter().map(|arch| arch.data.ring.len()).collect();
                 // Local eviction chooses oldest; global eviction chooses size / duration.
                 assert_eq!(lengths, if global { vec![2, 0] } else { vec![1, 1] });
-                assert!(site.cache[0].strings.get(StringBufferId(0)).is_some());
+                assert!(site.cache[0].strings.get(StringBufferId::new(0)).is_some());
                 assert_eq!(
-                    site.cache[1].strings.get(StringBufferId(0)).is_none(),
+                    site.cache[1].strings.get(StringBufferId::new(0)).is_none(),
                     global
                 );
             }
@@ -1435,7 +1446,7 @@ mod test {
             recorder.drop_old_chunks(id);
             for arch in &shared.read().cache {
                 assert!(arch.data.ring.is_empty());
-                assert!(arch.strings.get(StringBufferId(0)).is_none());
+                assert!(arch.strings.get(StringBufferId::new(0)).is_none());
                 assert_eq!(arch.data.active.length, 1);
                 assert_eq!(arch.strings.active.get_index(0), Some("protected"));
             }
@@ -1495,7 +1506,7 @@ mod test {
         arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.prepare_chunk(recorder.string_compression_level);
-        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(0));
+        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId::new(0));
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.data.cycle_if_needed();
         assert_eq!(arch.data.active.length, 0);
@@ -1503,10 +1514,10 @@ mod test {
         arch.prepare_chunk(recorder.string_compression_level); // Repeated preparation must not rotate again.
         assert_eq!(
             arch.data.ring[0].data.metadata.string_buffer,
-            StringBufferId(0)
+            StringBufferId::new(0)
         );
-        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(1));
-        let old = arch.strings.get(StringBufferId(0)).unwrap();
+        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId::new(1));
+        let old = arch.strings.get(StringBufferId::new(0)).unwrap();
         assert_eq!(old.get_index(0), Some(text.as_str()));
     }
 }

@@ -5,7 +5,7 @@ use std::{borrow::Cow, collections::VecDeque, hash::BuildHasher, ops::Deref};
 use foldhash::fast::RandomState;
 use hashbrown::{HashTable, hash_table::Entry};
 
-use super::{CompressionStats, dyntuple::ValueData};
+use super::{CompressionStats, dyntuple::ValueData, unalign::Unalign};
 
 /// Choose a string reference once per callsite: u32 offsets or u16 indexes in raw rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -395,7 +395,24 @@ impl CompressedBuffer {
 /// Absolute, zero-based ID within one BufferCollection; stable across eviction.
 #[repr(transparent)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StringBufferId(pub u32);
+pub struct StringBufferId(Unalign<u32, 2>);
+
+impl StringBufferId {
+    /// The stored ID needs only two-byte alignment; callers receive an ordinary u32.
+    pub const fn new(value: u32) -> Self {
+        Self(Unalign::new(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+// Keep IDs compact without exposing an unaligned u32 reference to consumers.
+const _: () = {
+    assert!(size_of::<StringBufferId>() == 4);
+    assert!(align_of::<StringBufferId>() == 2);
+};
 
 /// Buffer IDs are absolute indexes: removing old buffers does not renumber survivors.
 /// The owner decides when to rotate and when no retained data refers to old buffers.
@@ -409,19 +426,19 @@ pub struct BufferCollection {
 
 impl BufferCollection {
     pub fn active_index(&self) -> StringBufferId {
-        StringBufferId(
+        StringBufferId::new(
             u32::try_from(self.offset + self.compressed.len())
                 .expect("string buffer ID exceeds u32"),
         )
     }
 
     pub fn offset(&self) -> StringBufferId {
-        StringBufferId(self.offset as u32)
+        StringBufferId::new(self.offset as u32)
     }
 
     /// Iterate retained frozen IDs without exposing deque-relative indexes.
     pub fn archived_ids(&self) -> impl ExactSizeIterator<Item = StringBufferId> {
-        (self.offset as u32..self.active_index().0).map(StringBufferId)
+        (self.offset as u32..self.active_index().get()).map(StringBufferId::new)
     }
 
     /// Aggregate all retained buffers and collection storage, counting the
@@ -465,7 +482,7 @@ impl BufferCollection {
         if index == self.active_index() {
             return Some(Cow::Borrowed(&self.active));
         }
-        let Some(buffer) = (index.0 as usize)
+        let Some(buffer) = (index.get() as usize)
             .checked_sub(self.offset)
             .and_then(|i| self.compressed.get(i))
         else {
@@ -479,7 +496,7 @@ impl BufferCollection {
 
     /// Drop completed buffers before this ID. The active buffer is always retained.
     pub fn discard_before(&mut self, index: StringBufferId) {
-        let count = (index.0 as usize)
+        let count = (index.get() as usize)
             .saturating_sub(self.offset)
             .min(self.compressed.len());
         self.compressed.drain(..count);
@@ -531,9 +548,12 @@ mod tests {
             assert_eq!(arch.data.ring[0].data.frame.len(), 2);
             assert_eq!(
                 arch.data.ring[0].data.metadata.string_buffer,
-                StringBufferId(0)
+                StringBufferId::new(0)
             );
-            assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId(1));
+            assert_eq!(
+                arch.data.active_metadata.string_buffer,
+                StringBufferId::new(1)
+            );
             assert_eq!(arch.strings.active.len(), 2);
             let mut rows = Vec::new();
             site.visit_rows(|row| rows.push(row.fields));
@@ -685,34 +705,34 @@ mod tests {
         // Typed iteration exposes absolute IDs, including after prefix eviction.
         assert_eq!(
             buffers.archived_ids().collect::<Vec<_>>(),
-            vec![StringBufferId(0), StringBufferId(1)]
+            vec![StringBufferId::new(0), StringBufferId::new(1)]
         );
         let before = buffers.compression_ratio();
         let removed = buffers.compressed[0].compression_ratio();
         let freed_bytes = buffers.compressed[0].byte_len();
-        buffers.discard_before(StringBufferId(1));
+        buffers.discard_before(StringBufferId::new(1));
         let after = buffers.compression_ratio();
         assert_eq!(before.data - after.data, removed.data);
         // The removed deque slot becomes spare; only its boxed payload is freed.
         let allocated = |s: CompressionStats| s.compressed + s.overhead + s.overalloc;
         assert_eq!(allocated(before) - allocated(after), freed_bytes);
-        assert_eq!(buffers.offset(), StringBufferId(1));
+        assert_eq!(buffers.offset(), StringBufferId::new(1));
         assert_eq!(
             buffers.archived_ids().collect::<Vec<_>>(),
-            vec![StringBufferId(1)]
+            vec![StringBufferId::new(1)]
         );
-        assert!(buffers.get(StringBufferId(0)).is_none());
-        let retained = buffers.get(StringBufferId(1)).unwrap();
+        assert!(buffers.get(StringBufferId::new(0)).is_none());
+        let retained = buffers.get(StringBufferId::new(1)).unwrap();
         assert_eq!(retained.get_index(0), Some("second"));
         drop(retained);
         // Even deleting all completed buffers must preserve the active ID.
-        buffers.discard_before(StringBufferId(u32::MAX));
+        buffers.discard_before(StringBufferId::new(u32::MAX));
         assert_eq!(buffers.archived_ids().len(), 0);
-        assert_eq!(buffers.active_index(), StringBufferId(2));
-        assert_eq!(buffers.rotate(true), StringBufferId(3));
-        assert!(buffers.get(StringBufferId(2)).unwrap().is_empty());
+        assert_eq!(buffers.active_index(), StringBufferId::new(2));
+        assert_eq!(buffers.rotate(true), StringBufferId::new(3));
+        assert!(buffers.get(StringBufferId::new(2)).unwrap().is_empty());
         assert!(matches!(
-            buffers.get(StringBufferId(3)),
+            buffers.get(StringBufferId::new(3)),
             Some(Cow::Borrowed(_))
         ));
     }
