@@ -69,6 +69,16 @@ impl AnyFrame<'_> {
                 **frame = BitCompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
             Self::Archived(block) => {
+                // Public archive rows contain reconstructed string indices. Encode
+                // them back using the unchanged footer before an in-place edit/rebuild.
+                let mut encoded;
+                let row = if block.string_index_starts().is_empty() {
+                    row
+                } else {
+                    encoded = StackVec::<128, u128>::new(row);
+                    block.string_index_starts().encode(&mut encoded, index);
+                    &encoded
+                };
                 if block.frame.try_write_row(index, row).is_ok() {
                     return;
                 }
@@ -157,12 +167,47 @@ impl<'a> Row<'a> {
             AnyFrame::Archived(block) => {
                 let slice = self.buffer.get_or_init(block.frame.unit());
                 if !self.init {
-                    block.frame.read_row(self.index, slice);
+                    block.read_row(self.index, slice);
                     self.init = true;
                 }
                 slice
             }
         }
+    }
+}
+
+/// Logical archive rows reconstruct string indices while reusing aligned inline
+/// scratch. The underlying frame iterator remains available for physical inspection.
+pub struct ArchivedBlockIter<'a> {
+    block: &'a ArchivedBlock,
+    buffer: StackVec<128, u128>,
+    yielded: usize,
+}
+
+impl<'a> ArchivedBlockIter<'a> {
+    pub fn new(block: &'a ArchivedBlock) -> Self {
+        Self {
+            block,
+            buffer: StackVec::new(block.frame.first()),
+            yielded: 0,
+        }
+    }
+}
+
+impl StreamingIterator for ArchivedBlockIter<'_> {
+    type Item = [u8];
+
+    fn advance(&mut self) {
+        if self.yielded < self.block.frame.len() {
+            self.block.read_row(self.yielded, &mut self.buffer);
+            self.yielded += 1;
+        } else {
+            self.yielded = self.block.frame.len() + 1;
+        }
+    }
+
+    fn get(&self) -> Option<&Self::Item> {
+        (self.yielded > 0 && self.yielded <= self.block.frame.len()).then(|| self.buffer.as_ref())
     }
 }
 

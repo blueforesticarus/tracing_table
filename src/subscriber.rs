@@ -13,6 +13,7 @@ use std::{
 };
 
 use parking_lot::{ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
+use smallvec::SmallVec;
 use tracing::{
     Level, Metadata,
     field::{FieldSet, Visit},
@@ -163,9 +164,13 @@ impl PerArchData {
             );
             // Temporary: chunks require a constant string buffer, so a forced
             // string-buffer rotation must also rotate the current chunk.
-            self.data.cycle();
+            self.data
+                .cycle_with_string_indices(&self.archetype.string_index_columns());
         }
-        self.data.cycle_if_needed();
+        if self.data.active.length == self.data.active.capacity() {
+            self.data
+                .cycle_if_needed_with_string_indices(&self.archetype.string_index_columns());
+        }
         // Only an empty chunk can change buffers, regardless of who cycled it.
         if self.data.active.length == 0 {
             let size = self.strings.active.byte_len();
@@ -596,6 +601,28 @@ pub struct Archetype {
 }
 
 impl Archetype {
+    /// Derive columns only at rollover. No retained schema pointer or vector is
+    /// needed in BlockCache; ordinary fields and template captures fit independently.
+    pub fn string_index_columns(&self) -> SmallVec<[u16; 4]> {
+        let args = self.template.unwrap_or(0);
+        let fields: usize = self.field_types.iter().flatten().map(ValueKind::unit).sum();
+        let mut offset = self.unit() - fields - args * self.string_storage.unit();
+        let mut columns = SmallVec::new();
+        for kind in self.field_types.iter().flatten() {
+            if *kind == ValueKind::BufferIndex {
+                columns.push(u16::try_from(offset).expect("string-index position exceeds u16"));
+            }
+            offset += kind.unit();
+        }
+        if self.string_storage == StringStorage::Index {
+            for _ in 0..args {
+                columns.push(u16::try_from(offset).expect("template-index position exceeds u16"));
+                offset += 2;
+            }
+        }
+        columns
+    }
+
     /// Full packed row width: header, metadata fields, then template string references.
     pub fn unit(&self) -> usize {
         let mut bytes = 0;

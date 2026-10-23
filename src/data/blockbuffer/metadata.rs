@@ -14,7 +14,14 @@ impl ArchivedBlock {
         metadata: CollocatedMetadata,
         trailer: &[u8],
     ) -> SmallBox<Self> {
-        super::ParentOffsets::new(trailer);
+        let (parents, starts) = super::string_indices::split(trailer);
+        super::ParentOffsets::new(parents);
+        for (offset, _) in starts.entries() {
+            assert!(
+                offset + 2 <= frame.unit,
+                "string-index footer column exceeds row"
+            );
+        }
         // SAFETY: ArchivedBlock is repr(C), with metadata followed by its DST frame.
         unsafe {
             SmallBox::with_header(
@@ -25,7 +32,31 @@ impl ArchivedBlock {
     }
 
     pub fn parent_offsets(&self) -> super::ParentOffsets<'_> {
-        super::ParentOffsets::new(self.frame.trailer())
+        super::ParentOffsets::new(super::string_indices::split(self.frame.trailer()).0)
+    }
+
+    /// Sparse column positions and starts live entirely after the packed rows.
+    pub fn string_index_starts(&self) -> super::StringIndexStarts<'_> {
+        super::string_indices::split(self.frame.trailer()).1
+    }
+
+    pub fn string_index_footer_bytes(&self) -> usize {
+        let starts = self.string_index_starts();
+        if starts.is_empty() {
+            0
+        } else {
+            starts.len() * super::StringIndexStarts::ENTRY_BYTES + super::StringIndexStarts::COUNT_BYTES
+        }
+    }
+
+    /// Reconstruct indices for readers; parent/timestamp decoding keeps its existing API.
+    pub fn read_row(&self, index: usize, output: &mut [u8]) {
+        self.frame.read_row(index, output);
+        self.string_index_starts().decode(output, index);
+    }
+
+    pub fn iter(&self) -> super::ArchivedBlockIter<'_> {
+        super::ArchivedBlockIter::new(self)
     }
 }
 
@@ -39,6 +70,8 @@ pub struct CollocatedMetadata {
     /// we only store the set of extra fields blocks associated with any row of this block.
     /// reader is responsible for rebuilding association if desired, this limits search space (likely to one block, if not zero)
     span_fields: Option<SmallBox<[SpanFieldsRef]>>,
+
+    /// index of the string buffer in this arch's collection which indices in this block refer to
     pub string_buffer: StringBufferId,
     /// Predicted increase across the existing frame length, in shifted ticks.
     /// Zero disables prediction and retains unsigned timestamp offsets.

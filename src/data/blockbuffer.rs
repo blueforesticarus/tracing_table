@@ -18,7 +18,10 @@ mod metadata;
 pub use metadata::CollocatedMetadata;
 mod parent_offsets;
 pub use parent_offsets::{CallsiteArchetype, ParentOffsetEntry, ParentOffsets};
+mod string_indices;
+pub use string_indices::StringIndexStarts;
 mod timestamps;
+pub use super::dataframe::ArchivedBlockIter;
 
 // Compile-time selection keeps both modes on the normal rollover/edit/read path.
 #[cfg(feature = "bit-compression")]
@@ -242,6 +245,12 @@ impl BlockCache {
     }
 
     pub fn cycle_if_needed(&mut self) {
+        self.cycle_if_needed_with_string_indices(&[]);
+    }
+
+    /// The subscriber supplies schema positions only at rollover, without retaining
+    /// another pointer/vector in every BlockCache or enlarging its padding.
+    pub fn cycle_if_needed_with_string_indices(&mut self, columns: &[u16]) {
         if self.active.capacity() == self.active.length {
             if self.active.capacity() < self.frame_size_max {
                 // starts at 1, jumps to 8, then double capacity untill max
@@ -253,13 +262,17 @@ impl BlockCache {
                 frame.length = self.active.length;
                 self.active = frame;
             } else {
-                self.cycle();
+                self.cycle_with_string_indices(columns);
             }
         }
     }
 
     /// Archive a populated chunk early when its owner must change string buffers.
     pub(crate) fn cycle(&mut self) {
+        self.cycle_with_string_indices(&[]);
+    }
+
+    pub(crate) fn cycle_with_string_indices(&mut self, columns: &[u16]) {
         if self.active.length == 0 {
             return;
         }
@@ -273,6 +286,9 @@ impl BlockCache {
                 usize::from(self.active_parent_row_offset),
             );
         }
+        // Reuse the transient parent scratch for the combined footer. The active
+        // dictionary is cleared below before it can be read or appended again.
+        string_indices::fit(&mut self.active, &mut self.active_parent_offsets, columns);
         let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
         // timestamp range and deferred references start fresh for the new frame.
@@ -490,7 +506,7 @@ impl BlockCache {
         self.ring
             .iter()
             .into_streaming_iter()
-            .flat_map(|frame| ArchivedFrameIter::new(&frame.data.frame))
+            .flat_map(|frame| frame.data.iter())
             .chain(self.active.iter().into_streaming_iter_ref())
     }
 
