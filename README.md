@@ -10,8 +10,8 @@ to restore byte-aligned packed rows. The constant does not affect byte compactio
 [Measured continuous-packing results](doc/continuous_packing_2026-10-22.md).
 
 Parent references store a u64 ZigZag index delta and a u16 dictionary index.
-Each block's collocated metadata stores a u16 entry count; its compacted frame
-ends with that many `(CallsiteArchetype, FloatU16 offset, FloatU16 stride)` entries,
+The parent-table portion of each compacted frame's footer stores
+`(CallsiteArchetype, FloatU16 offset, FloatU16 stride)` entries,
 8 bytes each. `CallsiteArchetype` packs a 20-bit callsite and a 12-bit archetype
 into one u32. All entries retain their identity, including singletons.
 Active blocks use a zero stride and an offset from the first matching parent.
@@ -30,6 +30,49 @@ The frame's existing allocation length and row layout imply the trailer's size.
 Both compaction formats preserve these predictors through archived edits without
 refitting. Readers return ordinary `SpanId` values.
 [Earlier offset-only storage comparison](doc/parent_dictionary_2026-10-22.md).
+
+String indices optionally use prediction at archival, independently for each
+ordinary string field and extracted template argument. Period zero uses
+`start + row`; periods 1–255 use `start + ((row + phase) % period)`, with a one-byte
+period and one-byte initial phase. A selected column stores exact u16 ZigZag
+residuals; modular arithmetic preserves every u16 index. Consecutive cycles can
+have zero residuals even when a block starts partway through the cycle. Arbitrary
+repeating patterns still need residuals. Constant and unprofitable columns keep
+their raw indices. Selection charges packed payload, footer and allocation padding.
+
+Selected starts live in the footer after the parent table: packed
+`(u16 column byte position, u16 start, u8 period, u8 phase)` entries followed by
+a u8 entry count. Noncyclic entries store period/phase `0, 0`. The predictor
+suffix costs `6 * count + 1` bytes with no entry padding. Its odd length is
+distinguishable from the eight-byte parent entry width after dictionaries are
+removed. Archived edits preserve coefficients and re-encode changed indices;
+block readers and iterators reconstruct ordinary string indices.
+[Earlier noncyclic measurements](doc/string_index_start_row_2026-10-23.md).
+
+Archive-only dictionaries additionally support up to 16, 32, or 64 distinct
+values per string column, using the actual count's address width. Values remain
+in first-occurrence order and store bit-packed unsigned residuals from their
+minimum. The minimum reuses the first-row column slot; physical rows store
+`minimum XOR encoded_dictionary_id` so ordinary frame packing remains unchanged. A
+dictionary is selected only when `(rows-1)*address_bits + count*value_bits +
+overhead`, rounded to the actual allocation layout, beats the current raw or
+predicted encoding; cyclic prediction of dictionary IDs can further reduce that
+row cost. Each dictionary header stores its own period and phase. Period zero
+keeps direct IDs, and a nonzero period selects ZigZag ID residuals against
+`((row + phase) % period) - phase`, whose first prediction is zero. There is no
+stored additive origin for dictionary IDs.
+
+Dictionary entries follow the parent/predictor prefix, then alignment padding,
+one backward halfword pointer per selected field, and the terminal u8 field mask.
+Pointers measure distance from that mask byte; their maximum value represents
+510 bytes. The farthest pointer locates the preceding predictor count, so both
+sections remain independently readable. The first eight string-field/template
+argument positions are eligible; wider schemas and dictionaries that exceed the
+shared 512-byte window retain their existing encoding. Zero masks cost one byte;
+generic frames with no strings or parents retain an empty footer. An edit to a
+new dictionary value or to row zero's dictionary ID rebuilds ordinary indices
+while retaining parent and offset/cycle coefficients.
+[Dictionary layout, measurements and verification](doc/string_dictionary_2026-10-24.md).
 
 Bit-compacted frames store the packed-row stride as `u16`: at most **65,535
 varying bits per row** with continuous packing, or **65,528 bits** with
@@ -842,3 +885,149 @@ TODO review codex changes
 # overhead reduction
 Added [Unalign<T, A> (line 74)](/home/user/files/projects/dev/util/tracing_table/src/data/unalign.rs:74) with safe get, set, replace, and into_inner methods. Used it for StringBufferId and the SmallBox pointer.
 The fixed archive header shrank 26 → 22 bytes, saving 34,392 bytes on the reference capture without changing payloads.
+
+# predictive string indices
+store string indices as residual on offset+row, since often there is one string per row.
+
+Adds one u16 per string field/arg to frame footer.
+
+| Storage | Before | After | Change |
+|---|---:|---:|---:|
+| String indices¹ | 746.920 | 645.935 | **−100.984 (−13.52%)** |
+| Predictor footer | 0 | 3.092 | +3.092 |
+| Container metadata | 565.175 | 565.146 | −0.028 |
+
+how many fallback to raw storage b/c its smaller **most!**
+| Template extraction | Prediction on | Prediction off, varying | Constant | Total |
+|---|---:|---:|---:|---:|
+| Enabled | **528 — 7.87%** | **5,658 — 84.37%** | **520 — 7.75%** | 6,706 |
+| Disabled | **724 — 15.93%** | **3,108 — 68.38%** | **713 — 15.69%** | 4,545 |
+
+---
+
+Fri Oct 23 10:25:12 PM EDT 2026
+
+it seems that many callsites have cycles in their string indices
+
+>37 callsites have an exact cycle in at least one archived string column, out of 87 callsites with varying string indices, with templates enabled.
+> I counted a cycle when a nonconstant pattern repeats at least twice and matches the entire block exactly.
+> 1,783 of 6,186 varying block/column pairs are cyclic (28.8%).
+> 26 callsites are cyclic in at least half their varying block/column pairs.
+> Allowing up to 5% mismatches raises the count to 39 callsites.
+> Examples include render-context systems (period 41), compute dispatch (85), bind-group setting (28), and vertex-buffer setting (16).
+> With templates disabled, 27 callsites have exact cycles.
+
+we store a one byte period and one byte phase in addition to the 2 byte offset
+we indicate noncyclic with period = 0
+
+| Storage | Nominal (KiB) | Bits/column value | Change | Share of archive after |
+|---|---:|---:|---:|---:|
+| String indices | 646.248 → 579.073 | 5.134 → 4.600 | −10.39% | 9.105% |
+| Predictor footer | 2.577 → 12.309 | 0.020 → 0.098 | +377.61% | 0.194% |
+| **Overall archive** | **6,417.023 → 6,359.602** | — | **−0.89%** | **100%** |
+
+predictive footer grows becaues many callsites that previously fell back to raw now use cyclic encoding.
+
+Across all archived blocks, counting each string field/argument once per block, with templates enabled:
+
+| Encoding | Count | Payload (KiB) | Bits/column value | % of archive |
+|---|---:|---:|---:|---:|
+| Cycle | 1,295 | 73.249 | 3.305 | 1.152% |
+| Offset | 512 | 9.622 | 0.839 | 0.151% |
+| Raw, varying | 4,379 | 506.478 | 6.150 | 7.964% |
+| Raw, constant | 520 | 2.031 | 0.205 | 0.032% |
+| **Total indices** | **6,706** | **591.381** | **4.698** | **9.299%** |
+
+---
+
+dictionarys.
+
+up to 64 values is 6 bit address. the values are minimum of 6 bits to be unique 
+
+at N rows direct storage is at least: Nx6 + VxVb + 6(value bit count up to 64 values) + 6(values count)
+vs direct: NxVb
+
+| Measure | Before | Now | Change |
+|---|---:|---:|---:|
+| Overall archive | 6,512,232 B | 6,443,134 B | **−69,098 B (−1.06%)** |
+| Payload, including strings and end tables | 5,933,620 B | 5,865,047 B | **−68,573 B (−1.16%)** |
+| Packed string-index bits | 4,526,831 | 3,651,640 | **−19.33%** |
+| Full index storage, including masks and footers | 591.38 KiB | 524.31 KiB | **−11.34%** |
+
+examples of string id encoding modes
+
+| Encoding | Callsite | Messages |
+|---|---|---:|
+| Raw | **70:** `adjusting {} handle [{}] -> [{:?}]` | 59,817 |
+| Offset residual | **137 / 283:** bind-group creation / drop — tied | 16,740 each |
+| Cycle residual | **210:** `RenderContextState::apply` — span, field `system` | 100,448 |
+| Dictionary | **70:** `adjusting {} handle [{}] -> [{:?}]` | 60,445 |
+| Dictionary + cycle | **238:** `set bind_group {}: {:?} ({:?})` | 8,949 |
+| Raw, constant | **223 / 268:** `Drop {}` for CommandEncoder / CommandBuffer — tied | 14,136 each |
+
+supporting cycles in dictionary did not do much
+> added two bytes to the footer entry for offset and period
+
+| Component | Change |
+|---|---:|
+| Packed row payload | −10,096 B |
+| Footers | +4,098 B |
+| **Net archive** | **−5,998 B (−0.093%)** |
+
+NOTE: this feature overall doesn't do much. string indices are already ~4bits average for templates. But dictionaries are a feature we want to support regardless.
+
+TODO: cleanup + merge offset, cycle and dictionary encoding into a Column struct
+
+# better string dedup
+
+We could 1/2 string storage with global dedup.
+
+| Arrangement | HC3 compressed bytes |
+|---|---:|
+| Original buffers | 1,129,976 |
+| Concatenated | 996,029 |
+| **Deduplicated across blocks within each archetype, then concatenated** | **868,289** |
+| Globally deduplicated, then concatenated | 583,266 |
+
+Most (98%) of the cross arch sharing is within crates (module top level) not between.
+
+IDEA: one buffer collection for each crate. 
+- **problem** we drop by chunk/buffer which is currently associated. if we did this, fast and slow logs get mixed into same string buffer. 
+  - would require total redesign of string storage: reference counting and indirection for moving strings without changing ids and so on.
+
+IDEA: for per arch cross buffer dedup: store a special buffer which contains any strings shared between two consequtive buffers. 
+- *complex* and theoretical max gain of ~10-20%
+
+Not really worth it.
+
+# more clever fingerprinting of columns
+Lets test how many unique strings columns actually have.
+
+| Distinct values | Fields/args | String occurrences |
+|---|---:|---:|
+| 1 | 48 | 7.9% |
+| 2–16 | 50 | 29.4% |
+| 17–255 | 36 | 24.9% |
+| 256+ | 38 | 37.8% |
+
+IDEA: try to enumize every field and then switch to string buffer after 256 values.
+
+# block dropping
+TODO make dropping blocks use only archived blocks in usage calculation
+
+# string conversion
+IDEA: convert any numeric strings to numbers.
+
+Hypothesis: conversion is actually worse because strings are deduped and compressed. 
+
+Testing allowing u64 is a wash: payload actually increases, strings decrease, metadata a mixed bag. 
+
+With u16.
+
+| Storage | Before, B | After, B | Change |
+|---|---:|---:|---:|
+| **Total** | **12,164,755** | **12,052,159** | **−112,596 (−0.93%)** |
+| Metadata | 1,198,444 | 1,139,418 | −59,026 |
+| Row payload | 6,315,113 | 6,301,495 | −13,618 |
+| Strings | 3,063,907 | 3,045,710 | −18,197 |
+| Unused capacity | 1,587,291 | 1,565,536 | −21,755 |
