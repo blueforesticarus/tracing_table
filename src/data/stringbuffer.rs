@@ -441,6 +441,13 @@ impl BufferCollection {
         (self.offset as u32..self.active_index().get()).map(StringBufferId::new)
     }
 
+    /// Inspect retained compressed bytes without decoding or recompressing.
+    /// Evicted IDs and the writable active ID have no compressed buffer.
+    pub fn get_compressed(&self, index: StringBufferId) -> Option<&CompressedBuffer> {
+        self.compressed
+            .get((index.get() as usize).checked_sub(self.offset)?)
+    }
+
     /// Aggregate all retained buffers and collection storage, counting the
     /// inline active buffer once and unused deque slots as over-allocation.
     /// Collection state and spare deque slots are charged to active storage once.
@@ -482,12 +489,7 @@ impl BufferCollection {
         if index == self.active_index() {
             return Some(Cow::Borrowed(&self.active));
         }
-        let Some(buffer) = (index.get() as usize)
-            .checked_sub(self.offset)
-            .and_then(|i| self.compressed.get(i))
-        else {
-            return None;
-        };
+        let buffer = self.get_compressed(index)?;
         let decompressed = buffer
             .decompress()
             .expect("compressed data should not be corrupted");
@@ -710,6 +712,15 @@ mod tests {
         let before = buffers.compression_ratio();
         let removed = buffers.compressed[0].compression_ratio();
         let freed_bytes = buffers.compressed[0].byte_len();
+        // Absolute IDs work across eviction; reading sizes never expands LZ4.
+        assert_eq!(
+            buffers
+                .get_compressed(StringBufferId::new(0))
+                .unwrap()
+                .byte_len(),
+            freed_bytes
+        );
+        assert!(buffers.get_compressed(buffers.active_index()).is_none());
         buffers.discard_before(StringBufferId::new(1));
         let after = buffers.compression_ratio();
         assert_eq!(before.data - after.data, removed.data);
@@ -722,6 +733,8 @@ mod tests {
             vec![StringBufferId::new(1)]
         );
         assert!(buffers.get(StringBufferId::new(0)).is_none());
+        assert!(buffers.get_compressed(StringBufferId::new(0)).is_none());
+        assert!(buffers.get_compressed(StringBufferId::new(1)).is_some());
         let retained = buffers.get(StringBufferId::new(1)).unwrap();
         assert_eq!(retained.get_index(0), Some("second"));
         drop(retained);

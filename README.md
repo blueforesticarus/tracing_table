@@ -957,6 +957,7 @@ vs direct: NxVb
 examples of string id encoding modes
 
 | Encoding | Callsite | Messages |
+
 |---|---|---:|
 | Raw | **70:** `adjusting {} handle [{}] -> [{:?}]` | 59,817 |
 | Offset residual | **137 / 283:** bind-group creation / drop — tied | 16,740 each |
@@ -1031,3 +1032,5 @@ With u16.
 | Row payload | 6,315,113 | 6,301,495 | −13,618 |
 | Strings | 3,063,907 | 3,045,710 | −18,197 |
 | Unused capacity | 1,587,291 | 1,565,536 | −21,755 |
+
+CONCLUSION: this is too finicky to bother with. better direction is patching tracing. **I have reverted numeric string conversion, as well as dictionaries, cycles, and string cardinality metrics.** They are preserved in experiment/numeric-u16-2026-10-24 commit d596c59
