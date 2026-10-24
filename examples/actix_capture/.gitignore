@@ -1,0 +1,2 @@
+# The standalone workspace builds HTTP dependencies into its own target tree.
+/target/

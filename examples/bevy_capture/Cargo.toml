@@ -1,0 +1,28 @@
+[package]
+name = "tracing_table_bevy_capture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep graphics dependencies outside root library and storage-report builds.
+[workspace]
+
+# Capture library callsites through the same tracing types as the recorder.
+[patch.crates-io]
+tracing = { path = "../../vendor/tracing/tracing" }
+tracing-core = { path = "../../vendor/tracing/tracing-core" }
+tracing-attributes = { path = "../../vendor/tracing/tracing-attributes" }
+log = { path = "../../vendor/log" }
+
+[dependencies]
+tracing_table = { path = "../.." }
+# Rendering and detailed tracing are the purpose of this example, so enable them
+# directly. No window backend or interactive overlay dependencies are needed.
+bevy = { version = "0.19", default-features = false, features = ["default_app", "3d_bevy_render", "ui_bevy_render", "scene", "default_font", "multi_threaded", "trace", "detailed_trace"] }
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+debug = 2
+strip = false

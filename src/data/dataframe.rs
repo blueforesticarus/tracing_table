@@ -1,22 +1,12 @@
 use std::{
     alloc::Layout,
-    clone,
-    collections::{HashMap, HashSet},
-    default,
-    hash::{DefaultHasher, Hash, Hasher},
     mem::MaybeUninit,
-    ops::{Add, Deref, DerefMut, Range},
+    ops::{Deref, DerefMut, Range},
     ptr, slice,
-    sync::{Arc, Weak},
 };
 
 use bytemuck::Pod;
-use smallvec::SmallVec;
 use streaming_iterator::StreamingIterator;
-use tracing::{
-    callsite::Identifier,
-    field::{self, Visit},
-};
 
 use super::CompressionStats;
 use super::blockbuffer::ArchivedBlock;
@@ -817,52 +807,6 @@ pub fn is_aligned_to<T: ?Sized>(reference: &T, alignment: usize) -> bool {
     let ptr = reference as *const T as *const () as usize;
     ptr % alignment == 0
 }
-
-// TODO implement StreamingIteratorMut
-// it will need to have a type like bevy Mut to avoid needless copying.
-
-// future things to profile:
-// - mask bitwise or bytewise. (could have 1 bit per byte, but need to consider alignment)
-// - store first row whole or seperate constants (I think storing whole is faster for reconstruction.)
-
-// enum ValueKind {
-//     F64,
-//     I64,
-//     U64,
-//     I128,
-//     U128,
-//     Bool,
-//     Str,
-// }
-
-// struct FieldKey {
-//     field: usize,
-//     kind: ValueKind,
-// }
-
-// struct Archetype {
-//     callsite: Identifier,
-//     fields: [FieldKey],
-// }
-
-// struct RowCollector<'a> {
-//     fields: Vec<ValueKind>,
-//     cache: &'a mut StringStorage,
-// }
-
-// impl<'a> Visit for RowCollector<'a> {
-//     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {}
-
-//     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-//         let s = self.cache.get(value);
-//         // NOTE: instead of the ArcOrTinyStr we *could* use string size in the archetype.
-//         // budget for packed string (or duplicate arc): 8(ArcOrTinyStr)
-//         // budget for arc string. 8(ArcOrTinyStr) | 8(hash) + 8(weak_ptr) + 16(arc counts) + len(string) + overhead of empty hashmap bins
-//         // if all out strings are dups or less than 8 chars, this is best. if the opposite is true
-//         // a normal smartstring: 8(ptr) + 8(len) + 8(capacity) + len(string) would be better.
-//         // which can hold strings up to length 24 inside itself.
-//     }
-// }
 
 #[cfg(test)]
 mod test {

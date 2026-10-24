@@ -1,5 +1,5 @@
 //! Collect storage chart evidence into one CSV on stdout.
-//! STRING_COMPRESSION_LEVEL=3 cargo bench --offline --bench archived_storage -- FIXTURE 10 > storage.csv
+//! Defaults to the Bevy + Actix captures; use FIXTURE [SHIFT] for a single run.
 //! See doc/storage_chart.md; the CSV is the only interface to the renderer.
 
 #[cfg(not(feature = "bit-compression"))]
@@ -317,6 +317,7 @@ mod collect {
     // Every field is quoted: captures can contain commas, quotes and newlines.
     const COLUMNS: &[&str] = &[
         "record",
+        "run",
         "templates",
         "callsite",
         "record_kind",
@@ -340,21 +341,29 @@ mod collect {
         "format",
         "fields",
     ];
-    struct Csv<W: Write>(W);
+    struct Csv<W: Write> {
+        writer: W,
+        // Run names scope every callsite/archetype/block ID in combined evidence.
+        run: String,
+    }
     impl<W: Write> Csv<W> {
         fn row(&mut self, identity: &[(&str, String)], cells: &[(&str, String)]) -> io::Result<()> {
             for (index, column) in COLUMNS.iter().enumerate() {
                 if index != 0 {
-                    write!(self.0, ",")?;
+                    write!(self.writer, ",")?;
                 }
-                let value = cells
-                    .iter()
-                    .chain(identity)
-                    .find(|(key, _)| key == column)
-                    .map_or("", |(_, value)| value.as_str());
-                write!(self.0, "\"{}\"", value.replace('"', "\"\""))?;
+                let value = if *column == "run" {
+                    self.run.as_str()
+                } else {
+                    cells
+                        .iter()
+                        .chain(identity)
+                        .find(|(key, _)| key == column)
+                        .map_or("", |(_, value)| value.as_str())
+                };
+                write!(self.writer, "\"{}\"", value.replace('"', "\"\""))?;
             }
-            writeln!(self.0)
+            writeln!(self.writer)
         }
         fn counter(
             &mut self,
@@ -376,25 +385,91 @@ mod collect {
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Cargo adds --bench even for targets with the benchmark harness disabled.
         let mut args = std::env::args().skip(1).filter(|arg| arg != "--bench");
-        let path = args
-            .next()
-            .ok_or("provide fixture path [timestamp shift] [--min-block-rows N]")?;
         let settings = RecordingLayer::new();
         let mut shift = settings.timestamp_bit_shift;
         let mut min_rows = settings.message_block_min_rows;
-        let mut args = args.peekable();
+        let mut inputs = Vec::new();
+        let mut args = args.by_ref().peekable();
+        // Preserve the historical FIXTURE [SHIFT] invocation for investigations.
         if args.peek().is_some_and(|arg| !arg.starts_with("--")) {
-            shift = args.next().unwrap().parse()?;
+            let path = args.next().unwrap();
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .split('.')
+                .next()
+                .unwrap()
+                .trim_end_matches("_reference")
+                .to_owned();
+            inputs.push((name, path));
+            if args.peek().is_some_and(|arg| !arg.starts_with("--")) {
+                shift = args.next().unwrap().parse()?;
+            }
         }
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--min-block-rows" => min_rows = args.next().ok_or("missing row count")?.parse()?,
+                "--timestamp-shift" => {
+                    shift = args.next().ok_or("missing timestamp shift")?.parse()?
+                }
+                "--fixture" => {
+                    let value = args.next().ok_or("missing RUN=PATH")?;
+                    let (run, path) = value.split_once('=').ok_or("expected RUN=PATH")?;
+                    if run.is_empty() || path.is_empty() {
+                        return Err("expected nonempty RUN=PATH".into());
+                    }
+                    inputs.push((run.to_owned(), path.to_owned()));
+                }
                 _ => return Err(format!("unexpected argument: {arg}").into()),
             }
+        }
+        if inputs.is_empty() {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            inputs = ["bevy", "actix"]
+                .map(|run| {
+                    (
+                        run.to_owned(),
+                        root.join(format!("doc/{run}_reference.msgpack.lz4"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .to_vec();
+        }
+        let mut names = BTreeSet::new();
+        for (run, path) in &inputs {
+            if !names.insert(run) {
+                return Err(format!("duplicate run: {run}").into());
+            }
+            // Fail before writing partial evidence if a default capture is missing.
+            File::open(path)?;
         }
         MESSAGE_BLOCK_MIN_ROWS.store(min_rows, Ordering::Relaxed);
         // Preserve the reference experiment's policy independently of environment.
         STRING_BUFFER_TARGET_SIZE.store(32768, Ordering::Relaxed);
+        let mut output = Csv {
+            writer: io::BufWriter::new(io::stdout().lock()),
+            run: String::new(),
+        };
+        writeln!(output.writer, "{}", COLUMNS.join(","))?;
+        for (run, path) in inputs {
+            eprintln!("collecting run={run}: {path}");
+            output.run = run;
+            collect_fixture(&mut output, &path, shift, min_rows)?;
+        }
+        output.writer.flush()?;
+        Ok(())
+    }
+
+    // Each fixture owns a fresh recorder and is dropped before the next replay;
+    // run identity belongs only to the CSV, never to the captured tracing IDs.
+    fn collect_fixture<W: Write>(
+        output: &mut Csv<W>,
+        path: &str,
+        shift: u8,
+        min_rows: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::load(BufReader::new(File::open(path)?))?;
         assert!(
             shift >= fixture.timestamp_bit_shift && shift <= 63,
@@ -404,9 +479,7 @@ mod collect {
             record.timestamp >>= shift - fixture.timestamp_bit_shift;
         }
         fixture.timestamp_bit_shift = shift;
-        let mut output = Csv(io::BufWriter::new(io::stdout().lock()));
-        writeln!(output.0, "{}", COLUMNS.join(","))?;
-        for (key, value) in [("schema", 1), ("timestamp_bit_shift", shift as usize)] {
+        for (key, value) in [("schema", 2), ("timestamp_bit_shift", shift as usize)] {
             output.row(
                 &[],
                 &[
@@ -444,7 +517,9 @@ mod collect {
                 ],
             )?;
         }
-        for templates in [false, true] {
+        // Chart evidence only measures the supported templates-on configuration.
+        {
+            let templates = true;
             let recorder = fixture.replay_with_options(templates, StringStorage::Index);
             let sites = recorder.callsites.read();
             for (callsite, source) in fixture.callsites.iter().enumerate() {
@@ -712,7 +787,6 @@ mod collect {
                 assert!(lifetime.archived_message_overhead >= ends);
             }
         }
-        output.0.flush()?;
         Ok(())
     }
 }

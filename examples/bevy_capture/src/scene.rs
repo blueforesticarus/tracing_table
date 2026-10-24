@@ -1,6 +1,6 @@
 //! Adapted from Bevy's MIT/Apache-2.0 `examples/transforms/transform.rs`:
 //! https://bevy.org/examples/transforms/transform/
-//! Scene geometry and motion live here so the overlay can stay a plain viewer.
+//! Procedural scene assets and motion are isolated from capture orchestration.
 use bevy::prelude::*;
 use std::f32::consts::PI;
 

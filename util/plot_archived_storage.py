@@ -1,12 +1,14 @@
 """Render storage pies and histograms from one measured CSV (requires pycairo).
 
-Run: python3 util/plot_archived_storage.py --prefix doc/bevy_reference_archived_storage
+Run: python3 util/plot_archived_storage.py --prefix doc/reference_archived_storage
 The collector is benches/archived_storage.rs. See doc/storage_chart.md for the
 CSV contract and statistical denominators. No replay is needed to tune a chart.
 """
 import argparse
 import csv
 import html
+import io
+import xml.etree.ElementTree as ET
 import math
 import statistics
 import textwrap
@@ -19,8 +21,21 @@ import cairo
 
 # Visual tuning: palette and shared radial geometry.
 ROOT = Path(__file__).resolve().parents[1]
-PREFIX = ROOT / "doc/bevy_reference_archived_storage"
+PREFIX = ROOT / "doc/reference_archived_storage"
 RADIUS = 180
+# Paired-pie tuning: satellite size and center relative to the main center.
+SMALL_PIE_SCALE = 0.33
+SMALL_PIE_DX = 245
+SMALL_PIE_DY = 195
+SMALL_PIE_LABEL_SIZE = 17
+SMALL_PIE_LABEL_GAP = 22
+PAIRED_KEY_X = 555
+# Dataset selectors occupy a new gutter; the existing chart shifts as one unit.
+DATASET_GUTTER = 220
+DATASET_PIE_X = 130
+# Left selectors can use more of the section height than the weighting pie.
+DATASET_PIE_SCALE = 0.5
+DATASET_PIE_Y = (250, 500)
 START_ANGLE = -math.pi / 2
 FONT_SIZE = 19
 SLICE_LABEL_MIN_PERCENT = 5.0
@@ -523,10 +538,13 @@ def macro_excerpt(lines, line):
 
 
 @lru_cache(maxsize=None)
-def resolve_source_path(filename):
+def resolve_source_path(filename, target=''):
     """Resolve relocated capture paths for both excerpts and SVG hyperlinks."""
     path = Path(filename)
-    candidates = [path, ROOT / path, ROOT / 'examples/bevy_viewer' / path]
+    # Both captures have src/main.rs and src/workload.rs; use the tracing target
+    # to avoid attributing an Actix callsite to a same-named Bevy source file.
+    packages = ('actix_capture', 'bevy_capture') if target.startswith('tracing_table_actix_capture') else ('bevy_capture', 'actix_capture')
+    candidates = [path, ROOT / path, *(ROOT / 'examples' / package / path for package in packages)]
     # Captures may use a different CARGO_HOME; retain the exact package version.
     if '/registry/src/' in filename:
         suffix = filename.split('/registry/src/', 1)[1].split('/', 1)[1]
@@ -538,9 +556,9 @@ def resolve_source_path(filename):
 
 
 @lru_cache(maxsize=None)
-def source_text(filename, line):
+def source_text(filename, line, target=''):
     """Read the macro at its original metadata line, when local source exists."""
-    path = resolve_source_path(filename)
+    path = resolve_source_path(filename, target)
     if path is not None:
         lines = path.read_text().splitlines()
         if 0 < line <= len(lines):
@@ -549,7 +567,7 @@ def source_text(filename, line):
 
 
 def source_description(site):
-    return source_text(site['file'], int(site['line'])) or (
+    return source_text(site['file'], int(site['line']), site.get('target', '')) or (
         f"Captured format: {site['format']}\nFields: {site['fields']} [source unavailable]")
 
 
@@ -737,6 +755,10 @@ def make_panels(values, blocks, mode, bins, bucket_width, threshold,
     for owner, title in [(('span',), 'Span'), (('event', 'log'), 'Event / log')]:
         selected = [block for block in blocks if block['templates'] == mode and block['kind'] in owner]
         panels = []
+        # Small/custom captures may have no archived spans or no archived events.
+        if not selected:
+            columns.append((title, panels))
+            continue
         for index, (name, size, *_) in enumerate(component_breakdown(values, owner)):
             # Independently reconcile every slice, including those below cutoff.
             measured = sum(block['costs'][name] for block in selected)
@@ -920,10 +942,12 @@ def draw_extrema_column(ctx, x, y, width, panel, sites, source_links=None):
                 continue
             witness = witnesses[0]
             site = sites[witness['callsite']]
-            prefix = f"{rates} · #{witness['callsite']} · "
+            identity = witness['callsite']
+            display_id = f'{identity[0]} #{identity[1]}' if isinstance(identity, tuple) else f'#{identity}'
+            prefix = f"{rates} · {display_id} · "
             hist_label(ctx, x, baseline, prefix, 15)
             link_x = x + ctx.text_extents(prefix).x_advance
-            path = resolve_source_path(site['file'])
+            path = resolve_source_path(site['file'], site.get('target', ''))
             location = source_location(path or site['file'], site['line'])
             link_font = SOURCE_PATH_FONT
             ctx.set_font_size(link_font)
@@ -1002,7 +1026,7 @@ def write_evidence(prefix, modes, sites):
     with prefix.with_suffix('.callsite_extremes.csv').open('w', newline='') as output:
         writer = csv.writer(output)
         writer.writerow(['templates', 'kind', 'component', 'population', 'statistic', 'statistic_bits_per_row',
-                         'callsite', 'archetype', 'block_index', 'rows', 'block_count', 'witness_bits_per_row',
+                         'run', 'callsite', 'archetype', 'block_index', 'rows', 'block_count', 'witness_bits_per_row',
                          'file', 'line', 'target', 'captured_format', 'source'])
         for mode, columns in modes.items():
             for title, panels in columns:
@@ -1012,11 +1036,11 @@ def write_evidence(prefix, modes, sites):
                             # No positive samples means no valid min/median
                             # witness; retain an explicit empty statistic row.
                             if not witnesses:
-                                writer.writerow([mode, title, panel['name'], population, stat, ''] + [''] * 11)
+                                writer.writerow([mode, title, panel['name'], population, stat, ''] + [''] * 12)
                             for witness in witnesses:
                                 site = sites[witness['callsite']]
                                 writer.writerow([mode, title, panel['name'], population, stat, value,
-                                                 witness['callsite'], witness.get('archetype', ''), witness.get('block_index', ''),
+                                                 site.get('run', ''), site['callsite'], witness.get('archetype', ''), witness.get('block_index', ''),
                                                  witness.get('rows', ''), witness.get('block_count', 1), witness['value'],
                                                  site['file'], site['line'], site['target'], site['format'], source_description(site)])
     with prefix.with_suffix('.callsite_histograms.csv').open('w', newline='') as output:
@@ -1049,24 +1073,29 @@ def write_evidence(prefix, modes, sites):
 
 
 def pie_layout(groups, style):
-    """Measure complete keys so unused right margins never separate paired pies."""
+    """Fit either key in the shared slot when paired pies can swap."""
     ctx = cairo.Context(cairo.RecordingSurface(cairo.CONTENT_COLOR_ALPHA, None))
     columns, offset = [], 0
     styles = ('rows', 'callsites') if style == 'both' else (style,)
+    legend_x = PAIRED_KEY_X if style == 'both' else LEGEND_X
     for current in styles:
         widest = 0
         for group in groups:
-            for row in group[current]:
-                for line, size in zip(key_lines(group, current, row),
-                                      (LEGEND_NAME_SIZE, LEGEND_RATE_SIZE, LEGEND_BREAKDOWN_SIZE)):
-                    ctx.select_font_face('sans-serif')
-                    ctx.set_font_size(size)
-                    widest = max(widest, ctx.text_extents(line).x_advance)
-        width = math.ceil(LEGEND_X + 22 + widest + KEY_RIGHT_MARGIN)
-        columns.append(dict(style=current, pie_x=offset + PIE_CENTER_X, key_x=offset + LEGEND_X))
-        offset += width + PIE_COLUMN_GAP
+            for variant in group.get('datasets', {'combined': group}).values():
+                for row in variant[current]:
+                    for line, size in zip(key_lines(variant, current, row),
+                                          (LEGEND_NAME_SIZE, LEGEND_RATE_SIZE, LEGEND_BREAKDOWN_SIZE)):
+                        ctx.select_font_face('sans-serif')
+                        ctx.set_font_size(size)
+                        widest = max(widest, ctx.text_extents(line).x_advance)
+        width = math.ceil(legend_x + 22 + widest + KEY_RIGHT_MARGIN)
+        columns.append(dict(style=current, pie_x=PIE_CENTER_X if style == 'both' else offset + PIE_CENTER_X,
+                            key_x=legend_x if style == 'both' else offset + legend_x))
+        offset = max(offset, width + PIE_COLUMN_GAP) if style == 'both' else offset + width + PIE_COLUMN_GAP
     width = offset - PIE_COLUMN_GAP
-    return dict(width=max(width, SINGLE_PIE_MIN_WIDTH) if style != 'both' else width,
+    if any(group.get('datasets') for group in groups):
+        width += DATASET_GUTTER
+    return dict(width=max(width, SINGLE_PIE_MIN_WIDTH),
                 columns=columns)
 
 
@@ -1162,6 +1191,57 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
             for key, title, slices, denominator, note in definitions]
 
 
+def build_dataset_groups(sites):
+    """Re-pool measured callsites per capture before applying either weighting."""
+    result = {}
+    runs = sorted({identity[0] for identity in sites if isinstance(identity, tuple)},
+                  key=lambda run: (run != 'bevy', run))
+    if len(runs) < 2:
+        return result
+    for run in runs:
+        selected = {identity: site for identity, site in sites.items() if identity[0] == run}
+        values = leaf_map()
+        for site in selected.values():
+            for key, leaf in site['leaves'].items():
+                for metric, value in leaf.items():
+                    values[key][metric] += value
+        def counters(key):
+            return sum(site['values'].get(key, 0) for site in selected.values())
+        kinds = dict(span_starts=counters('span_starts'),
+                     events=sum(site['values']['archived_rows'] for site in selected.values() if site['kind'] == 'event'),
+                     logs=sum(site['values']['archived_rows'] for site in selected.values() if site['kind'] == 'log'))
+        metadata = {key: counters('metadata.' + key) for key in OVERHEAD_LABELS}
+        lifetime = {key: counters('lifetime.' + key) for key in LIFETIME_LABELS}
+        lifetime['active_rows'] = counters('active_rows')
+        result[run] = build_groups(values, counters('archived_rows'), kinds, metadata, lifetime, selected)
+    return result
+
+
+def dataset_choices(group, dataset):
+    """Offer the two datasets not currently shown in the main pie."""
+    variants = group.get('datasets', {})
+    # Keeping both alternatives also permits direct Bevy-to-Actix swaps.
+    return [key for key in variants if key != dataset]
+
+
+def draw_dataset_content(ctx, group, current, top, key_x, paired, dataset='combined'):
+    """Shift the established main chart intact and add dataset selectors on the left."""
+    variants = group.get('datasets')
+    selected = variants[dataset] if variants else group
+    ctx.save()
+    if variants:
+        ctx.translate(DATASET_GUTTER, 0)
+    draw_pie_content(ctx, selected, current, top, key_x, paired,
+                     dataset.capitalize() if dataset != 'combined' else '')
+    ctx.restore()
+    if variants:
+        choices = dataset_choices(group, dataset)
+        for index, choice in enumerate(choices):
+            y = DATASET_PIE_Y[index] if len(choices) > 1 else PIE_CENTER_Y
+            draw_mini_pie(ctx, variants[choice], current, DATASET_PIE_X, top + y,
+                          choice.capitalize(), scale=DATASET_PIE_SCALE)
+
+
 def field_labels():
     """Main-line field rates remain separate from metadata's split-cost rates."""
     return {LABELS['non_string_fields'], *(LABELS[key] for key in INDEX_GROUPS)}
@@ -1216,6 +1296,8 @@ def legend_step(group, style, row):
 
 def group_height(group):
     # Paired keys can have different zero-cost entries; fit the taller partner.
+    if group.get('datasets'):
+        return max(group_height(variant) for variant in group['datasets'].values())
     key_height = max(sum(legend_step(group, style, row) for row in (group.get(style) or []))
                      for style in ('rows', 'callsites'))
     return max(ROW_MIN_HEIGHT, LEGEND_TOP + key_height + 45)
@@ -1238,10 +1320,145 @@ def draw_pie_key(ctx, group, style, x, top):
         y += legend_step(group, style, row)
 
 
-def draw_pie_groups(ctx, groups, mode, style, layout):
-    """Isolate paired procedural pies; each partner carries its own full key."""
+def draw_pie_content(ctx, group, current, top, key_x, paired=False, dataset_label=''):
+    """Keep procedural chart geometry together for raster and vector states."""
+    x = PIE_CENTER_X
+    slices = group[current]
+    denominator = group['denominator'] if current == 'rows' else 1
+    heading = 'Row weighted' if current == 'rows' else 'Equal callsite'
+    if dataset_label:
+        heading = f'{dataset_label} - {heading.lower()}'
+    text(ctx, x, top + 120, heading, size=24, bold=True, center=True)
+    if group['nonfield'] is not None:
+        nonfield = group['nonfield'][current]
+        total = sum(row[1] for row in slices)
+        text(ctx, x, top + NONFIELD_TOP,
+                 f'Nonfield data: {100 * nonfield / total:.2f}% · {per_row(8 * nonfield, denominator)} bits/row',
+                 size=NONFIELD_FONT_SIZE, center=True)
+    radial_component_pie(ctx, x, top + PIE_CENTER_Y, slices, denominator)
+    rate = 8 * sum(row[1] for row in slices) / denominator
+    text(ctx, x, top + 570, f'{format_rate(rate)} bits/row', size=23, bold=True, center=True)
+    population = (f"{group['denominator']:,} rows · {kib(sum(row[1] for row in slices))} KiB"
+                  if current == 'rows' else f"{group['callsite_count']:,} equally weighted callsites")
+    text(ctx, x, top + 603, population, size=18, center=True)
+    draw_pie_key(ctx, group, current, key_x, top)
+    if paired:
+        draw_small_pie(ctx, group, current, top)
+
+
+def draw_small_pie(ctx, group, current, top):
+    """Add the alternative view without moving the main pie or its labels."""
+    other = 'callsites' if current == 'rows' else 'rows'
+    draw_mini_pie(ctx, group, other, PIE_CENTER_X + SMALL_PIE_DX,
+                  top + PIE_CENTER_Y + SMALL_PIE_DY,
+                  'Equal callsite' if other == 'callsites' else 'Row weighted')
+
+
+def draw_mini_pie(ctx, group, current, x, y, label, scale=SMALL_PIE_SCALE):
+    """Share radius and label geometry between weighting and dataset selectors."""
+    denominator = group['denominator'] if current == 'rows' else 1
+    radius = RADIUS * scale
+    text(ctx, x, y - radius - SMALL_PIE_LABEL_GAP, label,
+         size=SMALL_PIE_LABEL_SIZE, bold=True, center=True)
+    ctx.save()
+    ctx.translate(x, y)
+    ctx.scale(scale, scale)
+    radial_component_pie(ctx, 0, 0, group[current], denominator)
+    ctx.restore()
+    rate = 8 * sum(row[1] for row in group[current]) / denominator
+    text(ctx, x, y + radius + SMALL_PIE_LABEL_GAP,
+         f'{format_rate(rate)} bits/row',
+         size=SMALL_PIE_LABEL_SIZE, bold=True, center=True)
+
+
+def pie_controls(group, dataset, weighting):
+    """Describe native controls and their destination state in one place."""
+    shift = DATASET_GUTTER if group.get('datasets') else 0
+    other = 'callsites' if weighting == 'rows' else 'rows'
+    controls = [('weight', (dataset, other), PIE_CENTER_X + SMALL_PIE_DX + shift,
+                 PIE_CENTER_Y + SMALL_PIE_DY, 'Swap weighting for all pies and keys')]
+    choices = dataset_choices(group, dataset)
+    for index, choice in enumerate(choices):
+        y = DATASET_PIE_Y[index] if len(choices) > 1 else PIE_CENTER_Y
+        controls.append(('select' + choice, (choice, weighting), DATASET_PIE_X, y,
+                         f'Show {choice} in all main pies and keys'))
+    return controls
+
+
+def pie_control_id(index, dataset, weighting, action):
+    # Simple alphanumeric IDs avoid Chromium's SMIL timing offset parsing.
+    return f'pie{index}{dataset}{weighting}{action}'
+
+
+def append_interactive_pies(path, groups, layout):
+    """Synchronize every pie with native SMIL click events; no script needed."""
+    ns = 'http://www.w3.org/2000/svg'
+    ET.register_namespace('', ns)
+    # Source-link hitboxes appended later use this established prefix.
+    ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
+    root = ET.parse(path).getroot()
+    datasets = tuple(groups[0].get('datasets', {'combined': None}))
+    states = [(dataset, weighting) for dataset in datasets for weighting in ('rows', 'callsites')]
+    # Destination event lists are shared by every section. Dataset and weighting
+    # form one global state, so either kind of click updates all main pies/keys.
+    events = {state: [] for state in states}
+    for index, group in enumerate(groups):
+        for dataset, weighting in states:
+            for action, destination, *_ in pie_controls(group, dataset, weighting):
+                events[destination].append(pie_control_id(index, dataset, weighting, action) + '.click')
+    top = HEADER_HEIGHT
+    for index, group in enumerate(groups):
+        for dataset, current in states:
+            state = dataset, current
+            prefix = f'pie{index}{dataset}{current}'
+            buffer = io.BytesIO()
+            surface = cairo.SVGSurface(buffer, layout['width'], top + group_height(group))
+            draw_dataset_content(cairo.Context(surface), group, current, top, PAIRED_KEY_X, True, dataset)
+            surface.finish()
+            fragment = ET.fromstring(buffer.getvalue())
+            # Cairo reuses glyph IDs in each surface; namespace every reference.
+            mapping = {node.attrib['id']: f'{prefix}-{node.attrib["id"]}'
+                       for node in fragment.iter() if 'id' in node.attrib}
+            for node in fragment.iter():
+                for key, value in list(node.attrib.items()):
+                    if key == 'id':
+                        node.set(key, mapping[value])
+                    else:
+                        for original, replacement in mapping.items():
+                            value = value.replace(f'#{original})', f'#{replacement})')
+                            if value == f'#{original}':
+                                value = f'#{replacement}'
+                        node.set(key, value)
+            layer = ET.SubElement(root, f'{{{ns}}}g',
+                display='inline' if state == ('combined', 'rows') else 'none',
+                **{'data-section': group['key'], 'data-dataset': dataset, 'data-weighting': current})
+            for child in fragment:
+                layer.append(child)
+            for action, destination, x, y, label in pie_controls(group, dataset, current):
+                trigger = ET.SubElement(layer, f'{{{ns}}}circle',
+                    id=pie_control_id(index, dataset, current, action),
+                    cx=str(x), cy=str(top + y),
+                    # Match each hitbox to its independently tunable pie radius.
+                    r=str(RADIUS * (DATASET_PIE_SCALE if action.startswith('select') else SMALL_PIE_SCALE)),
+                    fill='transparent', style='cursor:pointer', role='button',
+                    **{'pointer-events': 'all', 'aria-label': label, 'data-action': action})
+                ET.SubElement(trigger, f'{{{ns}}}title').text = label
+            # One show and one hide animation per layer. Both restart on every
+            # matching event, allowing arbitrarily repeated cross-section swaps.
+            for visible in (True, False):
+                begin = ';'.join(event for destination, triggers in events.items()
+                                 if (destination == state) == visible for event in triggers)
+                ET.SubElement(layer, f'{{{ns}}}set', attributeName='display',
+                              to='inline' if visible else 'none', begin=begin, fill='freeze')
+        top += group_height(group) + ROW_GAP
+    ET.ElementTree(root).write(path, encoding='unicode', xml_declaration=True)
+
+
+def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
+    """Draw shared headings and the default main/satellite arrangement."""
     text(ctx, MARGIN, 55, 'Where recorded storage goes', size=35, bold=True)
-    text(ctx, MARGIN, 91, f"Bevy reference · template extraction {'on' if mode == 'true' else 'off'} · {timestamp_settings()[2]} ns ticks", size=22)
+    runs = ' + '.join(name.capitalize() for name in SETTINGS.get('runs', ('bevy',)))
+    text(ctx, MARGIN, 91, f"{runs} reference · template extraction {'on' if mode == 'true' else 'off'} · {timestamp_settings()[2]} ns ticks", size=22)
     # The lifetime snapshot partitions into archive-only and active-only totals.
     # Absolute sizing summaries share that partition for every pie style.
     by_key = {group['key']: group for group in groups}
@@ -1268,25 +1485,10 @@ def draw_pie_groups(ctx, groups, mode, style, layout):
         ctx.fill()
         text(ctx, MARGIN, top + 40, group['title'], size=27, bold=True)
         text(ctx, MARGIN, top + 71, group['note'], size=18)
-        for column in layout['columns']:
-            current, x = column['style'], column['pie_x']
-            slices = group[current]
-            denominator = group['denominator'] if current == 'rows' else 1
-            heading = 'Row weighted' if current == 'rows' else 'Equal callsite'
-            text(ctx, x, top + 120, heading, size=24, bold=True, center=True)
-            if group['nonfield'] is not None:
-                nonfield = group['nonfield'][current]
-                total = sum(row[1] for row in slices)
-                text(ctx, x, top + NONFIELD_TOP,
-                         f'Nonfield data: {100 * nonfield / total:.2f}% · {per_row(8 * nonfield, denominator)} bits/row',
-                         size=NONFIELD_FONT_SIZE, center=True)
-            radial_component_pie(ctx, x, top + PIE_CENTER_Y, slices, denominator)
-            rate = 8 * sum(row[1] for row in slices) / denominator
-            text(ctx, x, top + 570, f'{format_rate(rate)} bits/row', size=23, bold=True, center=True)
-            population = (f"{group['denominator']:,} rows · {kib(sum(row[1] for row in slices))} KiB"
-                          if current == 'rows' else f"{group['callsite_count']:,} equally weighted callsites")
-            text(ctx, x, top + 603, population, size=18, center=True)
-            draw_pie_key(ctx, group, current, column['key_x'], top)
+        if not interactive:
+            current = 'rows' if style == 'both' else style
+            draw_dataset_content(ctx, group, current, top,
+                             PAIRED_KEY_X if style == 'both' else LEGEND_X, style == 'both')
         top += group_height(group) + ROW_GAP
 
 
@@ -1367,10 +1569,26 @@ def load_evidence(prefix):
         raise ValueError('empty evidence CSV')
     unified = 'record' in rows[0]
     if unified:
-        settings = {row['key']: int(row['value']) for row in rows if row['record'] == 'setting'}
-        if settings.get('schema') != 1:
+        settings = {}
+        run_settings = defaultdict(dict)
+        for row in rows:
+            if row['record'] != 'setting':
+                continue
+            key, value = row['key'], int(row['value'])
+            if key in settings and settings[key] != value:
+                raise ValueError(f'incompatible storage settings across runs: {key}')
+            settings[key] = value
+            run_settings[row.get('run', '')][key] = value
+        if settings.get('schema') not in (1, 2):
             raise ValueError('unsupported storage CSV schema')
+        if settings['schema'] == 2:
+            # Reject partial/mixed inputs rather than silently merging unnamed IDs.
+            if any(not row.get('run') for row in rows):
+                raise ValueError('schema 2 requires a run on every record')
+            if any(run_settings[row['run']] != settings for row in rows):
+                raise ValueError('missing or incompatible settings for run')
         SETTINGS = settings
+        SETTINGS['runs'] = tuple(sorted(run_settings)) if settings['schema'] == 2 else ('bevy',)
         configure_labels()
         counters = [row for row in rows if row['record'] == 'counter']
         sources = [row for row in rows if row['record'] == 'source']
@@ -1392,8 +1610,13 @@ def load_evidence(prefix):
         for row in counters:
             row.update(key=row['metric'])
     sites = {mode: {} for mode in ('true', 'false')}
+    def site_id(row):
+        # Old single-capture files retain integer keys for historical callers.
+        callsite = int(row['callsite'])
+        return (row['run'], callsite) if row.get('run') else callsite
+
     for row in counters:
-        site = sites[row['templates']].setdefault(int(row['callsite']),
+        site = sites[row['templates']].setdefault(site_id(row),
             dict(kind=row['record_kind'], values={}, leaves=leaf_map()))
         key = row['key']
         if key not in ('metadata.parent_tables', 'metadata.string_starts'):
@@ -1402,7 +1625,7 @@ def load_evidence(prefix):
     blocks = {}
     metadata_components = {leaf: key for key, members in METADATA_COMPONENTS.items() for leaf in members}
     for row in leaves:
-        mode, callsite = row['templates'], int(row['callsite'])
+        mode, callsite = row['templates'], site_id(row)
         component = measurement_component(row)
         group = component if row['group'] == 'strings' else row['group']
         key = row['record_kind'], group, component
@@ -1435,7 +1658,7 @@ def load_evidence(prefix):
         assert len(selected) == sum(site['values']['archived_blocks'] for site in members.values())
         archive = sum(lifetimes[mode][key] for key in ('archived_messages', 'archived_strings'))
         assert math.isclose(total(data[mode]) + sum(metadata[mode].values()), archive, abs_tol=2e-5)
-    return data, counts, kinds, metadata, lifetimes, sites, list(blocks.values()), {int(row['callsite']): row for row in sources}
+    return data, counts, kinds, metadata, lifetimes, sites, list(blocks.values()), {site_id(row): row for row in sources}
 
 
 def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sources):
@@ -1444,9 +1667,16 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
     need_histograms = args.view != 'pies'
     need_callsites = need_histograms or args.pie_style != 'rows'
     modes, histogram_modes = {}, {}
-    for mode in ('true', 'false'):
+    # Historical inputs may contain both modes; publish templates-on evidence only.
+    for mode in ('true',):
         groups = build_groups(data[mode], counts[mode], kinds[mode], metadata[mode], lifetime[mode],
                               sites[mode] if need_callsites else None)
+        if need_pies and args.pie_style == 'both':
+            datasets = build_dataset_groups(sites[mode])
+            if datasets:
+                for index, group in enumerate(groups):
+                    group['datasets'] = dict(combined=group.copy(),
+                                             **{run: variants[index] for run, variants in datasets.items()})
         layout = pie_layout(groups, args.pie_style) if need_pies else None
         modes[mode] = groups
         shares = {group['key']: {name: 100 * cost / sum(row[1] for row in group['callsites'])
@@ -1472,12 +1702,12 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
             hist_asset = cairo.RecordingSurface(cairo.CONTENT_COLOR_ALPHA, (0, 0, PAGE_WIDTH, hist_height))
             hist_render(hist_asset, columns, sources, mode, args.min_percent, source_links)
 
-        def draw(surface):
+        def draw(surface, interactive=False):
             ctx = cairo.Context(surface)
             ctx.set_source_rgb(1, 1, 1)
             ctx.paint()
             if need_pies:
-                draw_pie_groups(ctx, groups, mode, args.pie_style, layout)
+                draw_pie_groups(ctx, groups, mode, args.pie_style, layout, interactive)
             if hist_asset is not None:
                 ctx.save()
                 ctx.rectangle(hist_x, hist_y, PAGE_WIDTH, hist_height)
@@ -1488,17 +1718,20 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
 
         suffix = '' if args.view == 'consolidated' else (
             '_histograms' if args.view == 'histograms' else '_' + args.pie_style + '_pies')
-        suffix += '_templates_off' if mode == 'false' else ''
         path = PREFIX.parent / (PREFIX.name + suffix)
         svg = cairo.SVGSurface(str(path.with_suffix('.svg')), width, height)
-        draw(svg)
+        interactive = need_pies and args.pie_style == 'both'
+        draw(svg, interactive)
         svg.finish()
+        if interactive:
+            append_interactive_pies(path.with_suffix('.svg'), groups, layout)
         if need_histograms:
             append_svg_source_links(path.with_suffix('.svg'), source_links, hist_x, hist_y)
         png = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
         draw(png)
         png.write_to_png(str(path.with_suffix('.png')))
-        print(f'{args.view} templates={mode}: {path.with_suffix(".png")} ({width} × {height})')
+        # Report both artifacts so successful vector output is visible to callers.
+        print(f'{args.view} templates={mode}: {path.with_suffix(".svg")} and {path.with_suffix(".png")} ({width} × {height})')
     if need_pies:
         evidence_prefix = (PREFIX if args.view == 'consolidated' else
                            PREFIX.parent / (PREFIX.name + '_' + args.pie_style + '_pies'))

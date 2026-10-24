@@ -1,4 +1,4 @@
-use std::{any::TypeId, mem::ManuallyDrop};
+use std::mem::ManuallyDrop;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,53 +93,6 @@ impl WriteValue for ValueData {
             ValueData::BufferOffset(offset) => packer.write_any_value(offset, aligned),
             ValueData::BufferIndex(index) => packer.write_any_value(index, aligned),
         }
-    }
-}
-
-/// Write data into a byte buffer and take it out again
-/// Supports Pod safely
-/// Supports any Unpin type unsafely
-
-pub struct Columns {
-    columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Column {
-    type_id: TypeId,
-    size: usize,
-    align: usize,
-    offset: Option<usize>,
-}
-
-pub struct ColumnMetadata {
-    min: usize,
-    max: usize,
-    sorted: bool,
-}
-
-pub struct RefMut<'a> {
-    column: Column,
-    data: &'a mut [u8],
-}
-
-impl Column {
-    fn for_type<T: 'static>() -> Self {
-        return Self {
-            type_id: TypeId::of::<T>(),
-            size: std::mem::size_of::<T>(),
-            align: align_of::<T>(),
-            offset: None,
-        };
-    }
-
-    fn for_val<T: 'static>(v: &T) -> Self {
-        return Self {
-            type_id: TypeId::of::<T>(),
-            size: std::mem::size_of_val(v),
-            align: align_of_val(v),
-            offset: None,
-        };
     }
 }
 

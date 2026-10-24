@@ -2,6 +2,16 @@ THIS FILE UNFORTIONATELY MIXES CODEX GENERATED DOCS AND HUMAN DOCS
 
 This crate implements an memory-efficient cache for tracing logs, with support for per-callsite rollover. 
 
+The default storage report now combines the Bevy and Actix Web reference captures.
+The [Bevy example](examples/bevy_capture/README.md) is a standalone offscreen
+dump generator; run it with `make capture-bevy`.
+The [Actix example](examples/actix_capture/README.md) uses tracing middleware and
+concurrent mock service work, targeting 100 MiB of MessagePack before LZ4, like Bevy.
+Generate it with `make capture-actix`, then run `make storage-charts` to compute
+`doc/reference_archived_storage.csv` and its SVG/PNG charts from both dumps.
+CSV rows retain `run=bevy` or `run=actix`; chart statistics pool both populations.
+See the [storage pipeline](doc/storage_chart.md) for single-run overrides and tuning.
+
 Archived frames use bit compaction by default. Build with `--no-default-features`
 to use byte compaction, or set `default-features = false` on the dependency.
 Bit frames pack varying bits continuously across row boundaries by default.
@@ -395,7 +405,8 @@ the block which is selected is the one with the largest CompressedSize/Timestamp
 ie. larger blocks and more frequent blocks are given less retention priority.
 # Capture/replay benchmarking
 
-The [benchmark standard](doc/benchmarking.md) describes streaming LZ4/MessagePack capture, deterministic replay with original timestamps, and per-callsite timing/storage reports.
+The [storage pipeline](doc/storage_chart.md) describes the Bevy and Actix test
+dumps, MessagePack/LZ4 capture, deterministic replay, and storage charts.
 
 Set `RecordingLayer::string_compression_level` before recording: `Some(3)` is
 the default (HC3), `Some(1..=12)` selects native LZ4 HC, and `None` selects
@@ -539,9 +550,9 @@ codex test implementation gives 3% overall reduction. defer for now
 
 ---
 
-![Archived storage pie charts](doc/bevy_reference_archived_storage.png)
+![Bevy and Actix archived storage charts](doc/reference_archived_storage.png)
 
-[SVG](doc/bevy_reference_archived_storage.svg) · [Storage breakdown and methodology](doc/bevy_reference_archived_storage.md)
+[SVG](doc/reference_archived_storage.svg) · [Storage breakdown and methodology](doc/storage_chart.md)
    
 # lz4 sanity check
 

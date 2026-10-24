@@ -671,26 +671,6 @@ pub const PLACE_HOLDER: SpanId = SpanId {
     archetype: 0,
 };
 
-// pub struct EventData {
-//     pub timestamp: u64,
-//     pub parent: Option<SpanId>,
-//     pub fields: Vec<ValueData>,
-// }
-
-// pub struct SpanData {
-//     pub id: SpanId, //stored as index
-//     pub timestamp: u64,
-//     pub end_ts: u64,
-//     pub parent: Option<SpanId>,
-//     pub follows_from: Option<SpanId>,
-//     pub fields: Vec<ValueData>,
-// }
-
-// pub struct SpanEndData {
-//     pub id: SpanId,
-//     pub fields: Vec<ValueData>,
-// }
-
 // TODO: Support multiple follows-from predecessors per span; storage currently
 // retains only the latest predecessor, including during dump replay.
 struct FollowFrom(SpanId);
@@ -1533,7 +1513,10 @@ mod test {
         arch.data = BlockCache::new(arch.archetype.unit(), 2, 2);
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.prepare_chunk(recorder.string_compression_level);
-        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId::new(0));
+        assert_eq!(
+            arch.data.active_metadata.string_buffer,
+            StringBufferId::new(0)
+        );
         arch.data.push(&vec![0; arch.archetype.unit()], 0);
         arch.data.cycle_if_needed();
         assert_eq!(arch.data.active.length, 0);
@@ -1543,7 +1526,10 @@ mod test {
             arch.data.ring[0].data.metadata.string_buffer,
             StringBufferId::new(0)
         );
-        assert_eq!(arch.data.active_metadata.string_buffer, StringBufferId::new(1));
+        assert_eq!(
+            arch.data.active_metadata.string_buffer,
+            StringBufferId::new(1)
+        );
         let old = arch.strings.get(StringBufferId::new(0)).unwrap();
         assert_eq!(old.get_index(0), Some(text.as_str()));
     }

@@ -3,12 +3,21 @@ name = "tracing_table"
 version = "0.1.0"
 edition = "2024"
 
-# Build the library and scanner together; keep the Bevy app independent.
+# Build the library and scanner together; keep dump generators independent.
 [workspace]
 members = ["tracing_scan_elf"]
 default-members = [".", "tracing_scan_elf"]
-exclude = ["examples/bevy_viewer"]
+# Vendored repositories retain their own upstream workspace configuration.
+exclude = ["examples/bevy_capture", "examples/actix_capture", "vendor/tracing", "vendor/log"]
 resolver = "3"
+
+# Patch the tracing family together so direct and transitive users share types.
+# The standalone Bevy workspace mirrors these paths in its own manifest.
+[patch.crates-io]
+tracing = { path = "vendor/tracing/tracing" }
+tracing-core = { path = "vendor/tracing/tracing-core" }
+tracing-attributes = { path = "vendor/tracing/tracing-attributes" }
+log = { path = "vendor/log" }
 
 [features]
 # Archive varying bits by default; --no-default-features retains byte compaction.
@@ -35,27 +44,7 @@ lz4 = "1"
 foldhash = "0.2"
 hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
 
-[dev-dependencies]
-libloading = "0.8.9"
-# Shared semantic preextraction and template-related regex helpers.
-regex = "1.12"
-
-# Preserve the command name when the example's sources live in their own folder.
-[[example]]
-name = "dump_message_compression"
-path = "examples/dump_messsage_compression/main.rs"
-
-# TSV inspector using the existing LZ4 dependency for storage estimates.
-[[example]]
-name = "print_strings_mdl"
-path = "examples/dump_messsage_compression/print_strings_mdl.rs"
-
-# Keep the focused dedup benchmark independent of the retired viewer readers.
+# Measurement collector has its own CLI and emits CSV rather than benchmark timings.
 [[bench]]
-name = "string_dedup"
-harness = false
-
-# Replay complete captured inputs; disk IO and semantic validation are untimed.
-[[bench]]
-name = "replay"
+name = "archived_storage"
 harness = false

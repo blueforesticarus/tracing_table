@@ -13,9 +13,6 @@ pub mod stringbuffer;
 // Explicit alignment wrappers keep packed field access inside a reusable utility.
 pub mod unalign;
 
-// The experimental smartstring implementation remains disabled.
-// pub mod smartstring;
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompressionStats {
     pub data: usize,       // this is the size of the actual data before compression
@@ -26,7 +23,7 @@ pub struct CompressionStats {
 
 impl CompressionStats {
     /// Fraction of row bytes removed by compression (excluding overhead and
-    /// unused capacity). Empty storage has no savings; multiply by 100 for UI.
+    /// unused capacity). Empty storage has no savings; multiply by 100 for percent.
     pub fn ratio(&self) -> f64 {
         if self.data == 0 {
             0.0

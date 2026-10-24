@@ -1,0 +1,25 @@
+[package]
+name = "tracing_table_actix_capture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep HTTP dependencies out of the library and its storage benchmarks.
+[workspace]
+
+# Match the root workspace so middleware and the recorder share tracing types.
+[patch.crates-io]
+tracing = { path = "../../vendor/tracing/tracing" }
+tracing-core = { path = "../../vendor/tracing/tracing-core" }
+tracing-attributes = { path = "../../vendor/tracing/tracing-attributes" }
+log = { path = "../../vendor/log" }
+
+[dependencies]
+tracing_table = { path = "../.." }
+actix-web = { version = "4", default-features = false, features = ["macros"] }
+tracing-actix-web = { version = "0.7", default-features = false }
+awc = { version = "3", default-features = false }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = "0.3"
