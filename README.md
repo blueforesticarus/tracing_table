@@ -2,6 +2,25 @@ THIS FILE UNFORTIONATELY MIXES CODEX GENERATED DOCS AND HUMAN DOCS
 
 This crate implements an memory-efficient cache for tracing logs, with support for per-callsite rollover. 
 
+The subscriber captures the tracing patch's `Visit::visit_format` arguments
+without rendering and reverse-parsing the complete message. Format recipes live
+on the callsite; rows store primitive arguments in typed columns and custom
+values as strings rendered with each placeholder's actual trait and options.
+Reading reconstructs the exact field text, including dynamic counts, repeated
+arguments, and adjacent placeholders. This also supports formatted span fields
+and deferred updates. Primitive widths and `f32` identity remain in the recipe.
+The vendored `log` macros use the same inspectable path at every native log level.
+
+The default `tracing_patched` feature avoids scanner/source lookup for directly
+captured formats. Prebuilt `fmt::Arguments` resolve a vendor template lazily on
+their first rendered message. Compatibility events built from preexisting
+`log::Record`s also use vendor fallback templates; older dumps
+retain the rendered-message matcher. Disable this feature with
+`--no-default-features --features bit-compression` to enable scanner/source
+fallback; direct format capture remains available with either storage mode.
+Check linked callsite coverage with
+`cargo test -p tracing_table --test patched_callsites -- --nocapture`.
+
 The default storage report now combines the Bevy and Actix Web reference captures.
 The [Bevy example](examples/bevy_capture/README.md) is a standalone offscreen
 dump generator; run it with `make capture-bevy`.
@@ -1051,7 +1070,29 @@ CONCLUSION: this is too finicky to bother with. better direction is patching tra
 2. [x] store templates directly
 3. [x] look up source code text (nice for display/debug) 
 4. [x] patch logging to redirect to tracing
-   - [ ] identify what does not work and falls back to log
+   - [x] identify what does not work and falls back to log
      - dynamic keys in kv
      - explicit `logger:` (shouldn't redirect anyway)
-5. [ ] replace fmt::Arguments with something inspectible
+     - no logs used by bevy_capture fall back to log
+5. [x] replace fmt::Arguments with something inspectible
+   - what we have is in theory 100% compatible with format_args!
+
+We can now access fmt args as primitive types and archetype on that.
+This does not reduce storage currently.
+
+| Component | Legacy B/row | `Format` B/row | Δ B/row | Change |
+|---|---:|---:|---:|---:|
+| Strings | 0.7797 | 0.7731 | −0.0066 | −0.84% |
+| String indices: args + fields | 0.3924 | 0.3256 | −0.0668 | −17.03% |
+| Non-string fields | 0.7089 | 0.7836 | +0.0746 | +10.52% |
+| Metadata / structural overhead¹ | 3.6240 | 3.6549 | +0.0308 | +0.85% |
+| **Overall archived** | **5.5050** | **5.5371** | **+0.0320** | **+0.58%** |
+
+| Count | Legacy | `Format` | Nominal change | Change |
+|---|---:|---:|---:|---:|
+| Stored string entries² | 214,143 | 210,065 | −4,078 | −1.90% |
+| String-index schema columns | 210 | 166 | −44 | −20.95% |
+| Non-string schema columns | 49 | 96 | +47 | +95.92% |
+| **All field schema columns** | **259** | **262** | **+3** | **+1.16%** |
+| String-index values across rows | 2,330,065 | 2,046,809 | −283,256 | −12.16% |
+| Non-string values across rows | 1,200,199 | 1,487,659 | +287,460 | +23.95% |

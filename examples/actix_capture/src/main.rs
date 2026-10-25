@@ -50,11 +50,12 @@ async fn main() -> Result<()> {
         &format!(
             "requests={}\n\
          middleware_requests={middleware_requests}\n\
-         concurrency={}\nworkers={workers}\n\
+         concurrency={}\nworkers={workers}\nduration_secs={}\n\
          batches={}\ncpu_rounds={}\nio_micros={}\n\
          max_requests={}\nstatuses={:?}\n",
             traffic.requests,
             load.concurrency,
+            load.duration_secs,
             work.batches,
             work.cpu_rounds,
             work.io_micros,

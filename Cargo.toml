@@ -20,12 +20,16 @@ tracing-attributes = { path = "vendor/tracing/tracing-attributes" }
 log = { path = "vendor/log" }
 
 [features]
-# Archive varying bits by default; --no-default-features retains byte compaction.
-default = ["bit-compression"]
+# Default to bit compaction and vendored callsite templates for now.
+default = ["bit-compression", "tracing_patched"]
+# Resolve runtime templates from vendored tracing records, without scanner/source lookup.
+tracing_patched = []
 # Choose archived message layout at compile time; active rows and string LZ4 stay identical.
 bit-compression = []
 
 [dependencies]
+# Share owned formatting recipes with the vendored tracing bridge.
+introspect-fmt = { path = "introspect-fmt/introspect-fmt", features = ["nightly"] }
 # Import the scanner's public types and artifact readers from root code.
 tracing_scan_elf = { path = "tracing_scan_elf" }
 bytemuck = { version = "1.23.0", features = ["derive"] }
@@ -48,3 +52,9 @@ hashbrown = { version = "0.17", default-features = false, features = ["inline-mo
 [[bench]]
 name = "archived_storage"
 harness = false
+
+[dev-dependencies]
+# Compare the linked test binary against independent DWARF discovery.
+object = "0.39"
+# Exercise log macros redirected into native tracing records by the vendor patch.
+log = "0.4"

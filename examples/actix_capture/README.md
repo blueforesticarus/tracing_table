@@ -20,6 +20,14 @@ Some requests produce intentional inventory conflicts (409) and upstream errors
 (503); the driver checks every response status and consumes every body.
 There are no external databases, queues, or services.
 
+The recorded timeline spans approximately **10 minutes** without waiting that
+long. The driver advances the capture clock between drained request batches,
+distributing idle gaps according to progress toward the byte target. It waits
+for all captured spans to close before each jump, preserving real request and
+child-span durations. A final request starts at the 10-minute mark; its normal
+execution and server shutdown add a small tail. The optional live storage
+comparison uses the same simulated clock.
+
 The default output is `doc/actix_reference.msgpack.lz4`. An optional positional
 argument selects another path. Default paths resolve from the repository, regardless
 of the working directory. Both examples share capture setup, size validation and
@@ -39,12 +47,14 @@ Tuning variables:
 | `TRACING_CAPTURE_MIB` | 100 | Minimum MessagePack size, before LZ4 |
 | `TRACING_CAPTURE_CONCURRENCY` | 32 | Concurrent requests per drained batch |
 | `TRACING_CAPTURE_WORKERS` | 4 | Actix server workers |
+| `TRACING_CAPTURE_DURATION_SECS` | 600 | Simulated timeline through the final request's start |
 | `TRACING_CAPTURE_BATCHES` | 8 | CPU partitions and mock database pages per request |
 | `TRACING_CAPTURE_CPU_ROUNDS` | 4096 | CPU mixing iterations per partition |
 | `TRACING_CAPTURE_IO_MICROS` | 100 | Mock cache/database delay (runtime timer resolution applies) |
 | `TRACING_CAPTURE_MAX_REQUESTS` | 1000000 | Fail if the target is not reached by this limit |
 
-All settings must be positive integers. For quick iteration:
+All settings must be positive integers; `TRACING_CAPTURE_MAX_REQUESTS` must be at
+least 2 and includes the final request. For quick iteration:
 
 ```sh
 TRACING_CAPTURE_MIB=1 cargo run --release --locked \

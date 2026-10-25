@@ -2836,6 +2836,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
 
 [[package]]
+name = "introspect-fmt"
+version = "0.1.0"
+dependencies = [
+ "introspect-fmt-macros",
+]
+
+[[package]]
+name = "introspect-fmt-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4475,8 +4491,10 @@ dependencies = [
 name = "tracing"
 version = "0.1.44"
 dependencies = [
+ "introspect-fmt",
  "pin-project-lite",
  "tracing-attributes",
+ "tracing-callsite-source",
  "tracing-core",
 ]
 
@@ -4492,11 +4510,17 @@ dependencies = [
 [[package]]
 name = "tracing-callsite-source"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "tracing-core"
 version = "0.1.36"
 dependencies = [
+ "introspect-fmt",
  "tracing-callsite-source",
  "valuable",
 ]
@@ -4587,6 +4611,7 @@ dependencies = [
  "bytemuck",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
+ "introspect-fmt",
  "lz4",
  "lz4_flex",
  "parking_lot",
@@ -4605,6 +4630,7 @@ name = "tracing_table_bevy_capture"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "streaming-iterator",
  "tracing",
  "tracing-log",
  "tracing-subscriber",

@@ -3,6 +3,18 @@ use std::mem::ManuallyDrop;
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueKind {
+    // Preserve Format primitive widths in both active and archived layouts.
+    I8,
+    I16,
+    I32,
+    Isize,
+    U8,
+    U16,
+    U32,
+    Usize,
+    F32,
+    Char,
+
     F64,
     I64,
     U64,
@@ -23,6 +35,16 @@ impl From<ValueData> for ValueKind {
 impl From<&ValueData> for ValueKind {
     fn from(value: &ValueData) -> Self {
         match value {
+            ValueData::I8(_) => ValueKind::I8,
+            ValueData::I16(_) => ValueKind::I16,
+            ValueData::I32(_) => ValueKind::I32,
+            ValueData::Isize(_) => ValueKind::Isize,
+            ValueData::U8(_) => ValueKind::U8,
+            ValueData::U16(_) => ValueKind::U16,
+            ValueData::U32(_) => ValueKind::U32,
+            ValueData::Usize(_) => ValueKind::Usize,
+            ValueData::F32(_) => ValueKind::F32,
+            ValueData::Char(_) => ValueKind::Char,
             ValueData::F64(_) => ValueKind::F64,
             ValueData::I64(_) => ValueKind::I64,
             ValueData::U64(_) => ValueKind::U64,
@@ -39,6 +61,16 @@ impl ValueKind {
     // Exposed so the example can derive packed field ranges.
     pub fn unit(&self) -> usize {
         match self {
+            ValueKind::I8 => size_of::<i8>(),
+            ValueKind::I16 => size_of::<i16>(),
+            ValueKind::I32 => size_of::<i32>(),
+            ValueKind::Isize => size_of::<isize>(),
+            ValueKind::U8 => size_of::<u8>(),
+            ValueKind::U16 => size_of::<u16>(),
+            ValueKind::U32 => size_of::<u32>(),
+            ValueKind::Usize => size_of::<usize>(),
+            ValueKind::F32 => size_of::<f32>(),
+            ValueKind::Char => size_of::<char>(),
             ValueKind::F64 => size_of::<f64>(),
             ValueKind::I64 => size_of::<i64>(),
             ValueKind::U64 => size_of::<u64>(),
@@ -54,6 +86,18 @@ impl ValueKind {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ValueData {
+    // These payloads are packed at their native widths, without enum padding.
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    Isize(isize),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    Usize(usize),
+    F32(f32),
+    Char(char),
+
     F64(f64),
     I64(i64),
     U64(u64),
@@ -84,6 +128,16 @@ impl WriteValue for ValueData {
     fn write_to(self, packer: &mut BytePacker<'_>, aligned: bool) {
         // Encode only the payload: the enum itself can contain uninitialized padding.
         match self {
+            ValueData::I8(v) => packer.write_any_value(v, aligned),
+            ValueData::I16(v) => packer.write_any_value(v, aligned),
+            ValueData::I32(v) => packer.write_any_value(v, aligned),
+            ValueData::Isize(v) => packer.write_any_value(v, aligned),
+            ValueData::U8(v) => packer.write_any_value(v, aligned),
+            ValueData::U16(v) => packer.write_any_value(v, aligned),
+            ValueData::U32(v) => packer.write_any_value(v, aligned),
+            ValueData::Usize(v) => packer.write_any_value(v, aligned),
+            ValueData::F32(v) => packer.write_any_value(v, aligned),
+            ValueData::Char(v) => packer.write_any_value(v as u32, aligned),
             ValueData::F64(v) => packer.write_any_value(v, aligned),
             ValueData::I64(v) => packer.write_any_value(v, aligned),
             ValueData::U64(v) => packer.write_any_value(v, aligned),
@@ -235,6 +289,18 @@ impl<'a> BytePacker<'a> {
     pub unsafe fn read_value(&mut self, kind: ValueKind, aligned: bool) -> ValueData {
         unsafe {
             match kind {
+                ValueKind::I8 => ValueData::I8(*self.read_any(aligned)),
+                ValueKind::I16 => ValueData::I16(*self.read_any(aligned)),
+                ValueKind::I32 => ValueData::I32(*self.read_any(aligned)),
+                ValueKind::Isize => ValueData::Isize(*self.read_any(aligned)),
+                ValueKind::U8 => ValueData::U8(*self.read_any(aligned)),
+                ValueKind::U16 => ValueData::U16(*self.read_any(aligned)),
+                ValueKind::U32 => ValueData::U32(*self.read_any(aligned)),
+                ValueKind::Usize => ValueData::Usize(*self.read_any(aligned)),
+                ValueKind::F32 => ValueData::F32(*self.read_any(aligned)),
+                ValueKind::Char => ValueData::Char(
+                    char::from_u32(*self.read_any::<u32>(aligned)).expect("stored char"),
+                ),
                 ValueKind::F64 => ValueData::F64(*self.read_any(aligned)),
                 ValueKind::I64 => ValueData::I64(*self.read_any(aligned)),
                 ValueKind::U64 => ValueData::U64(*self.read_any(aligned)),

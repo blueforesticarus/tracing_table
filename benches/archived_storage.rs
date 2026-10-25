@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "bit-compression")]
-mod collect {
+pub mod collect {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs::File,
@@ -87,10 +87,26 @@ mod collect {
             entry("metadata", "parent.index", 8, false);
             entry("metadata", "parent.table_index", 2, false);
         }
-        for kind in arch.field_types.iter().flatten() {
+        let argument_start = arch
+            .formats
+            .iter()
+            .map(|(_, _, start)| *start)
+            .min()
+            .unwrap_or(usize::MAX);
+        for (index, kind) in arch
+            .field_types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kind)| kind.as_ref().map(|kind| (index, kind)))
+        {
             match kind {
                 ValueKind::BufferIndex => {
-                    entry("string_field_index", "string_field_index", 2, true)
+                    let group = if index >= argument_start {
+                        "format_args_index"
+                    } else {
+                        "string_field_index"
+                    };
+                    entry(group, group, 2, true)
                 }
                 ValueKind::BufferOffset => panic!("indexed replay required"),
                 _ => entry(
@@ -167,7 +183,8 @@ mod collect {
             let raw = arch.strings.active.byte_len();
             let schema =
                 size_of::<PerArchData>() - size_of::<BlockCache>() - size_of::<BufferCollection>()
-                    + arch.archetype.field_types.capacity() * size_of::<Option<ValueKind>>();
+                    + arch.archetype.field_types.capacity() * size_of::<Option<ValueKind>>()
+                    + arch.archetype.formats.capacity() * size_of::<(usize, usize, usize)>();
             self.resident_container_bytes += block_total + string_total + schema;
             self.writable_source_raw += raw;
             if arch.data.ring.is_empty() {
@@ -278,8 +295,9 @@ mod collect {
         // remaining archetype/schema header, so inline bytes are never repeated.
         let archetype_structs =
             size_of::<PerArchData>() - size_of::<BlockCache>() - size_of::<BufferCollection>();
-        let archetype_fields =
-            arch.archetype.field_types.capacity() * size_of::<Option<ValueKind>>();
+        let archetype_fields = arch.archetype.field_types.capacity()
+            * size_of::<Option<ValueKind>>()
+            + arch.archetype.formats.capacity() * size_of::<(usize, usize, usize)>();
         let parts = BTreeMap::from([
             ("block_cache_structs", size_of::<BlockCache>()),
             ("block_scratch", block_scratch),
@@ -480,6 +498,42 @@ mod collect {
             record.timestamp >>= shift - fixture.timestamp_bit_shift;
         }
         fixture.timestamp_bit_shift = shift;
+        let recorder = fixture.replay_with_options(true, StringStorage::Index);
+        collect_recording(output, &fixture, &recorder, min_rows, None)
+    }
+
+    /// Export live and replayed recorders through the same storage accounting.
+    pub fn write_recording<W: Write>(
+        writer: W,
+        run: &str,
+        fixture: &Fixture,
+        recorder: &RecordingLayer,
+        ids: Option<&std::collections::HashMap<usize, u64>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = Csv {
+            writer,
+            run: run.into(),
+        };
+        writeln!(output.writer, "{}", COLUMNS.join(","))?;
+        collect_recording(
+            &mut output,
+            fixture,
+            recorder,
+            recorder.message_block_min_rows,
+            ids,
+        )?;
+        output.writer.flush()?;
+        Ok(())
+    }
+
+    fn collect_recording<W: Write>(
+        output: &mut Csv<W>,
+        fixture: &Fixture,
+        recorder: &RecordingLayer,
+        min_rows: usize,
+        ids: Option<&std::collections::HashMap<usize, u64>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let shift = fixture.timestamp_bit_shift;
         for (key, value) in [("schema", 2), ("timestamp_bit_shift", shift as usize)] {
             output.row(
                 &[],
@@ -499,7 +553,10 @@ mod collect {
                 ],
                 &[
                     // Capture provenance distinguishes bridged log events from tracing.
-                    ("framework", if source.is_log { "log" } else { "tracing" }.into()),
+                    (
+                        "framework",
+                        if source.is_log { "log" } else { "tracing" }.into(),
+                    ),
                     ("file", metadata.file().unwrap_or("").into()),
                     ("line", metadata.line().unwrap_or(0).to_string()),
                     ("target", metadata.target().into()),
@@ -523,10 +580,17 @@ mod collect {
         // Chart evidence only measures the supported templates-on configuration.
         {
             let templates = true;
-            let recorder = fixture.replay_with_options(templates, StringStorage::Index);
             let sites = recorder.callsites.read();
             for (callsite, source) in fixture.callsites.iter().enumerate() {
-                let Some(site) = sites.get(&(source.metadata as *const _ as usize)) else {
+                let key = if let Some(ids) = ids {
+                    *ids.iter()
+                        .find(|(_, id)| **id == callsite as u64)
+                        .expect("captured callsite identity")
+                        .0
+                } else {
+                    source.metadata as *const _ as usize
+                };
+                let Some(site) = sites.get(&key) else {
                     continue;
                 };
                 let site = site.read();
@@ -542,7 +606,10 @@ mod collect {
                     ("callsite", callsite.to_string()),
                     ("record_kind", kind.into()),
                     // Shared identity propagates provenance to every measurement row.
-                    ("framework", if source.is_log { "log" } else { "tracing" }.into()),
+                    (
+                        "framework",
+                        if source.is_log { "log" } else { "tracing" }.into(),
+                    ),
                 ];
                 // Per-callsite counters are the common denominator for both weighted
                 // pies. Active-only sites still participate in the row-weighted view.
@@ -551,6 +618,10 @@ mod collect {
                 let (mut archived_rows, mut active_rows, mut blocks, mut span_starts) =
                     (0, 0, 0, 0);
                 let (mut message_bytes, mut string_bytes) = (0, 0);
+                // Count stored entries once per retained buffer, rather than
+                // counting repeated row references or globally distinct text.
+                let mut archived_string_entries = 0;
+                let mut archived_field_columns = BTreeMap::<&str, usize>::new();
                 for arch in &site.cache {
                     active_rows += arch.data.active.length;
                     let parts = components(&arch.archetype);
@@ -562,6 +633,11 @@ mod collect {
                     if arch.data.ring.is_empty() {
                         lifetime.observe_active(arch, &ranges);
                         continue;
+                    }
+                    // Schema column counts are separate from the row-weighted
+                    // column_values already exported by each physical leaf.
+                    for part in &parts {
+                        *archived_field_columns.entry(part.group).or_default() += 1;
                     }
                     let mut buffers = BTreeSet::new();
                     let mut active_indices = BTreeSet::new();
@@ -668,17 +744,19 @@ mod collect {
                                 );
                             }
                             assert_eq!(filtered.len(), active_indices.len());
+                            archived_string_entries += filtered.len();
                             let packed = filtered
                                 .compress_with_level(false, recorder.string_compression_level);
                             assert!(!packed.has_index());
                             lifetime.writable_archived_compressed += packed.byte_len();
                             packed.byte_len()
                         } else {
-                            let bytes = arch
+                            let buffer = arch
                                 .strings
                                 .get_compressed(id)
-                                .expect("retained string buffer")
-                                .byte_len();
+                                .expect("retained string buffer");
+                            archived_string_entries += buffer.decompress()?.len();
+                            let bytes = buffer.byte_len();
                             frozen_bytes += bytes;
                             bytes
                         };
@@ -732,6 +810,28 @@ mod collect {
                         *metadata.entry(key).or_insert(0usize) += bytes;
                     }
                 }
+                // Recipes are per-callsite metadata. Charge their actual retained
+                // capacities once, rather than once per row or archetype.
+                let recipes = site.formats.capacity()
+                    * size_of::<std::sync::Arc<tracing_table::subscriber::format::Format>>()
+                    + site
+                        .formats
+                        .iter()
+                        .map(|recipe| {
+                            size_of_val(&**recipe) + 2 * size_of::<usize>() + recipe.heap_bytes()
+                        })
+                        .sum::<usize>()
+                    + site
+                        .template
+                        .as_ref()
+                        .map_or(0, |recipe| recipe.heap_bytes());
+                lifetime.resident_container_bytes += recipes;
+                if blocks > 0 {
+                    lifetime.archived_message_overhead += recipes;
+                    metadata.insert("format_recipes", recipes);
+                } else {
+                    lifetime.active_message_overhead += recipes;
+                }
                 let ends = metadata.get("parent_tables").copied().unwrap_or(0)
                     + metadata.get("string_starts").copied().unwrap_or(0);
                 assert_eq!(
@@ -759,6 +859,7 @@ mod collect {
                         + lifetime.writable_active_raw
                 );
                 for (key, value) in [
+                    ("archived_string_entries", archived_string_entries),
                     ("archived_rows", archived_rows),
                     ("active_rows", active_rows),
                     ("archived_blocks", blocks),
@@ -781,6 +882,9 @@ mod collect {
                     ),
                 ] {
                     output.counter(&identity, key, value)?;
+                }
+                for (group, count) in archived_field_columns {
+                    output.counter(&identity, &format!("archived_columns.{group}"), count)?;
                 }
                 // Trailer bytes are payload, never container overhead. Their exact
                 // per-block leaves above replace the old stderr reclassification.

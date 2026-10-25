@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     sync::{Arc, OnceLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{Metadata, Subscriber, field::FieldSet};
 use tracing_core::{Callsite, Kind, callsite::Identifier};
@@ -44,6 +44,17 @@ fn encode_value(value: &Option<InputValue>) -> Mp {
         return Mp::Nil;
     };
     let (tag, payload) = match value {
+        // Width-specific tags extend v2 while keeping existing tags readable.
+        InputValue::I8(v) => ("i8", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::I16(v) => ("i16", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::I32(v) => ("i32", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::Isize(v) => ("isize", Mp::Binary((*v as i64).to_le_bytes().to_vec())),
+        InputValue::U8(v) => ("u8", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::U16(v) => ("u16", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::U32(v) => ("u32", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::Usize(v) => ("usize", Mp::Binary((*v as u64).to_le_bytes().to_vec())),
+        InputValue::F32(v) => ("f32", Mp::Binary(v.to_le_bytes().to_vec())),
+        InputValue::Char(v) => ("char", Mp::Binary((*v as u32).to_le_bytes().to_vec())),
         InputValue::F64(v) => ("f64", Mp::Binary(v.to_le_bytes().to_vec())),
         InputValue::I64(v) => ("i64", Mp::Binary(v.to_le_bytes().to_vec())),
         InputValue::U64(v) => ("u64", Mp::Binary(v.to_le_bytes().to_vec())),
@@ -94,6 +105,25 @@ fn decode_value(value: &Mp) -> io::Result<Option<InputValue>> {
         return Err(invalid("invalid value"));
     }
     Ok(Some(match string(&v[0])? {
+        "i8" => InputValue::I8(i8::from_le_bytes(binary(&v[1])?)),
+        "i16" => InputValue::I16(i16::from_le_bytes(binary(&v[1])?)),
+        "i32" => InputValue::I32(i32::from_le_bytes(binary(&v[1])?)),
+        "isize" => InputValue::Isize(
+            isize::try_from(i64::from_le_bytes(binary(&v[1])?))
+                .map_err(|_| invalid("pointer-sized integer out of range"))?,
+        ),
+        "u8" => InputValue::U8(u8::from_le_bytes(binary(&v[1])?)),
+        "u16" => InputValue::U16(u16::from_le_bytes(binary(&v[1])?)),
+        "u32" => InputValue::U32(u32::from_le_bytes(binary(&v[1])?)),
+        "usize" => InputValue::Usize(
+            usize::try_from(u64::from_le_bytes(binary(&v[1])?))
+                .map_err(|_| invalid("pointer-sized integer out of range"))?,
+        ),
+        "f32" => InputValue::F32(u32::from_le_bytes(binary(&v[1])?)),
+        "char" => InputValue::Char(
+            char::from_u32(u32::from_le_bytes(binary(&v[1])?))
+                .ok_or_else(|| invalid("invalid char"))?,
+        ),
         "f64" => InputValue::F64(u64::from_le_bytes(binary(&v[1])?)),
         "i64" => InputValue::I64(i64::from_le_bytes(binary(&v[1])?)),
         "u64" => InputValue::U64(u64::from_le_bytes(binary(&v[1])?)),
@@ -111,6 +141,51 @@ fn decode_value(value: &Mp) -> io::Result<Option<InputValue>> {
 }
 fn decode_fields(value: &Mp) -> io::Result<Vec<Option<InputValue>>> {
     items(value)?.iter().map(decode_value).collect()
+}
+
+#[cfg(test)]
+mod scalar_width_tests {
+    use super::*;
+
+    #[test]
+    fn width_tags_preserve_extremes_and_float_bits() {
+        // Cover portable capture encoding independently of text reconstruction:
+        // two different NaN payloads must survive even though both print NaN.
+        for value in [
+            InputValue::I8(i8::MIN),
+            InputValue::I16(i16::MIN),
+            InputValue::I32(i32::MIN),
+            InputValue::I64(i64::MIN),
+            InputValue::I128(i128::MIN),
+            InputValue::Isize(isize::MIN),
+            InputValue::U8(u8::MAX),
+            InputValue::U16(u16::MAX),
+            InputValue::U32(u32::MAX),
+            InputValue::U64(u64::MAX),
+            InputValue::U128(u128::MAX),
+            InputValue::Usize(usize::MAX),
+            InputValue::F32(0x7fc01234),
+            InputValue::F32((-0.0f32).to_bits()),
+            InputValue::F64(0x7ff8000000001234),
+            InputValue::Char('🦀'),
+            InputValue::Bool(true),
+            InputValue::Text("text".into()),
+            InputValue::Bytes(vec![0, 255]),
+        ] {
+            let expected = Some(value);
+            assert_eq!(decode_value(&encode_value(&expected)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_widths_and_characters_are_rejected() {
+        // Captures are untrusted input: validate narrow payload sizes and
+        // Unicode scalar values before they can enter packed row storage.
+        let short_u32 = array(["u32".into(), Mp::Binary(vec![1, 2])]);
+        assert!(decode_value(&short_u32).is_err());
+        let surrogate = array(["char".into(), Mp::Binary(0xd800u32.to_le_bytes().to_vec())]);
+        assert!(decode_value(&surrogate).is_err());
+    }
 }
 
 struct CountWriter<W> {
@@ -169,10 +244,22 @@ struct CaptureState<W: Write> {
     records: u64,
     next_span: u64,
     started: Instant,
+    // Virtual idle time is added between workloads; live span clocks never jump.
+    idle_nanos: u64,
+    open_spans: usize,
     shift: u8,
     error: Option<String>,
     finished_bytes: u64,
     sampled_timestamp: u64,
+    // Optional comparison recorder shares capture's sequence and sampled clock.
+    recording: Option<Arc<RecordingLayer>>,
+    recording_spans: HashMap<u64, RecordingSpan>,
+}
+struct RecordingSpan {
+    metadata: &'static Metadata<'static>,
+    stored: SpanId,
+    fields: FieldValues,
+    follows: Option<SpanId>,
 }
 impl<W: Write> CaptureState<W> {
     fn write(&mut self, value: Mp) -> io::Result<()> {
@@ -186,12 +273,7 @@ impl<W: Write> CaptureState<W> {
         }
         let id = self.sites.len() as u64;
         let template = if metadata.is_event() && metadata.fields().field("message").is_some() {
-            super::template::lookup(
-                metadata.file().unwrap_or("<unknown>"),
-                metadata.line().unwrap_or(0),
-                is_log,
-                metadata.module_path(),
-            )
+            super::template::lookup_metadata(metadata, is_log)
         } else {
             None
         };
@@ -239,10 +321,14 @@ impl<W: Write + Send> Capture<W> {
             records: 0,
             next_span: 1,
             started: Instant::now(),
+            idle_nanos: 0,
+            open_spans: 0,
             shift: timestamp_bit_shift,
             error: None,
             finished_bytes: 0,
             sampled_timestamp: 0,
+            recording: None,
+            recording_spans: HashMap::new(),
         };
         let origin = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -259,13 +345,53 @@ impl<W: Write + Send> Capture<W> {
             state: Arc::new(Mutex::new(state)),
         })
     }
+    /// Mirror original borrowed values into a recorder using the capture clock.
+    /// Enable before dispatch; capture files intentionally remain version-2 text inputs.
+    pub fn enable_recording(&self, recording: Arc<RecordingLayer>) {
+        let mut state = self.state.lock();
+        assert_eq!(state.records, 0, "enable recording before dispatch");
+        assert_eq!(recording.timestamp_bit_shift, state.shift);
+        state.recording = Some(recording);
+    }
+    /// Diagnostic mapping from original metadata addresses to fixture callsite IDs.
+    pub fn callsite_ids(&self) -> HashMap<usize, u64> {
+        self.state.lock().sites.clone()
+    }
+    /// Advance the capture clock to at least `elapsed` without sleeping.
+    /// Returns `WouldBlock` if advancing while any captured span is open, so idle
+    /// time cannot inflate span durations. The recording mirror shares this clock.
+    pub fn advance_time_to(&self, elapsed: Duration) -> io::Result<()> {
+        let target = u64::try_from(elapsed.as_nanos())
+            .map_err(|_| invalid("simulated capture time exceeds u64 nanoseconds"))?;
+        let mut state = self.state.lock();
+        if let Some(error) = &state.error {
+            return Err(io::Error::other(error.clone()));
+        }
+        if state.output.is_none() {
+            return Err(io::Error::other("capture is finished"));
+        }
+        let actual = state.started.elapsed().as_nanos();
+        if actual + u128::from(state.idle_nanos) >= u128::from(target) {
+            return Ok(()); // Earlier targets must never move the clock backwards.
+        }
+        if state.open_spans != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "capture spans still open",
+            ));
+        }
+        state.idle_nanos = target - actual as u64;
+        Ok(())
+    }
     fn capture(&self, write: impl FnOnce(&mut CaptureState<W>) -> io::Result<()>) {
         let mut state = self.state.lock();
         if state.output.is_none() || state.error.is_some() {
             return;
         }
         // Match live timestamp semantics: sample before field formatting and lookup.
-        state.sampled_timestamp = (state.started.elapsed().as_nanos() as u64) >> state.shift;
+        state.sampled_timestamp = ((state.started.elapsed().as_nanos()
+            + u128::from(state.idle_nanos)) as u64)
+            >> state.shift;
         if let Err(error) = write(&mut state) {
             state.error = Some(error.to_string());
         }
@@ -327,7 +453,21 @@ where
         self.capture(|state| {
             let site = state.site(metadata, event.is_log())?;
             let mut visitor = InputVisitor::new(metadata.fields().len(), event.is_log());
+            visitor.capture_formats = state.recording.is_some();
             event.record(&mut visitor);
+            if let Some(recording) = &state.recording {
+                let parent = parent.map(|id| state.recording_spans[&id].stored);
+                recording.record_start(
+                    metadata,
+                    Time {
+                        value: state.sampled_timestamp,
+                        shift: state.shift,
+                    },
+                    parent,
+                    event.is_log(),
+                    |recorder| visitor.record_into(metadata, recorder),
+                );
+            }
             state.operation(
                 "event",
                 [
@@ -348,9 +488,37 @@ where
         self.capture(|state| {
             let site = state.site(attrs.metadata(), false)?;
             let mut visitor = InputVisitor::new(attrs.metadata().fields().len(), false);
+            visitor.capture_formats = state.recording.is_some();
             attrs.record(&mut visitor);
             let captured = state.next_span;
             state.next_span += 1;
+            if let Some(recording) = &state.recording {
+                let metadata = attrs.metadata();
+                let parent = parent.map(|id| state.recording_spans[&id].stored);
+                let stored = recording.record_start(
+                    metadata,
+                    Time {
+                        value: state.sampled_timestamp,
+                        shift: state.shift,
+                    },
+                    parent,
+                    false,
+                    |recorder| visitor.record_into(metadata, recorder),
+                );
+                state.recording_spans.insert(
+                    captured,
+                    RecordingSpan {
+                        metadata,
+                        stored,
+                        fields: FieldValues::new(
+                            metadata.fields().len(),
+                            0,
+                            recording.string_storage,
+                        ),
+                        follows: None,
+                    },
+                );
+            }
             state.operation(
                 "span",
                 [
@@ -364,6 +532,7 @@ where
                 .unwrap()
                 .extensions_mut()
                 .insert(CapturedSpan(captured));
+            state.open_spans += 1;
             Ok(())
         });
     }
@@ -378,7 +547,16 @@ where
         if let Some(captured) = captured {
             self.capture(|state| {
                 let mut visitor = InputVisitor::new(span.fields().len(), false);
+                visitor.capture_formats = state.recording.is_some();
                 values.record(&mut visitor);
+                if state.recording.is_some() {
+                    state
+                        .recording_spans
+                        .get_mut(&captured.0)
+                        .unwrap()
+                        .fields
+                        .record(|recorder| visitor.record_into(span.metadata(), recorder));
+                }
                 state.operation(
                     "record",
                     [captured.0.into(), encode_fields(&visitor.values)],
@@ -399,7 +577,13 @@ where
             .span(follows)
             .and_then(|s| s.extensions().get::<CapturedSpan>().copied());
         if let (Some(a), Some(b)) = (a, b) {
-            self.capture(|s| s.operation("follows", [a.0.into(), b.0.into()]));
+            self.capture(|s| {
+                if s.recording.is_some() {
+                    let follows = s.recording_spans[&b.0].stored;
+                    s.recording_spans.get_mut(&a.0).unwrap().follows = Some(follows);
+                }
+                s.operation("follows", [a.0.into(), b.0.into()])
+            });
         }
     }
     fn on_close(&self, id: tracing_core::span::Id, ctx: Context<'_, S>) {
@@ -407,7 +591,23 @@ where
             .span(&id)
             .and_then(|s| s.extensions().get::<CapturedSpan>().copied())
         {
-            self.capture(|s| s.operation("close", [captured.0.into()]));
+            self.capture(|s| {
+                if let Some(recording) = &s.recording {
+                    let mut span = s.recording_spans.remove(&captured.0).unwrap();
+                    recording.close_span(
+                        span.metadata,
+                        span.stored,
+                        Time {
+                            value: s.sampled_timestamp,
+                            shift: s.shift,
+                        },
+                        span.follows,
+                        Some(&mut span.fields),
+                    );
+                }
+                s.open_spans -= 1;
+                s.operation("close", [captured.0.into()])
+            });
         }
     }
 }

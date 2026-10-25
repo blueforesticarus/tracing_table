@@ -34,10 +34,11 @@ use crate::data::{
 
 // Portable capture/loading is opt-in; live recording does not depend on its state.
 pub mod dump;
+pub mod format;
 pub mod read;
 mod value;
 pub use value::InputValue;
-// Templates resolve once per callsite, with a source fallback during development.
+// Rendered-message fallback templates resolve once; inspectable formats capture directly.
 pub mod template;
 
 /// Uncompressed bytes per archetype block; the reference comparison favors 4 KiB.
@@ -63,13 +64,18 @@ pub use crate::data::blockbuffer::SpanFieldsRef;
 pub struct PerCallsiteData {
     pub id: u64,
     pub metadata: &'static Metadata<'static>,
-    /// Resolve once on registration; retain None so failed lookups don't repeat.
+    /// Legacy rendered-message matcher; native inspectable formats use `formats`.
     pub template: Option<template::CompiledTemplate>,
+    /// Directly captured formatting schemas, shared by every row at this callsite.
+    pub formats: Vec<Arc<format::Format>>,
     /// Fixed at registration so previously stored rows keep their interpretation.
     pub string_storage: StringStorage,
 
     // Reuse each field's string capacity across recordings.
     field_value_scratchpad: FieldValues,
+    // Native Format callbacks bypass lookup. A rendered-only message resolves
+    // the fallback once, including a cached miss; replay controls its own templates.
+    template_pending: bool,
     last_archetype: Archetype,
 
     call_count: usize,
@@ -383,18 +389,25 @@ impl RecordingLayer {
         &self,
         metadata: &'static Metadata<'static>,
     ) -> ArcRwLockWriteGuard<RawRwLock, PerCallsiteData> {
-        self.register_with_template(metadata, || {
+        let mut pending = false;
+        let mut site = self.register_with_template(metadata, || {
             if metadata.is_event() && metadata.fields().field("message").is_some() {
-                template::lookup(
-                    metadata.file().unwrap_or("<unknown>"),
-                    metadata.line().unwrap_or(0),
-                    metadata.name() == "compat:log",
-                    metadata.module_path(),
-                )
+                if cfg!(feature = "tracing_patched") && metadata.name() != "compat:log" {
+                    pending = true;
+                    None
+                } else {
+                    template::lookup_metadata(metadata, metadata.name() == "compat:log")
+                }
             } else {
                 None
             }
-        })
+        });
+        // The resolver only runs for a newly registered callsite, so explicit
+        // dump replay templates (including disabled extraction) retain control.
+        if pending {
+            site.template_pending = true;
+        }
+        site
     }
 
     // seperated out so benchmark log replay can provide stored template.
@@ -430,8 +443,10 @@ impl RecordingLayer {
                         id,
                         metadata,
                         template,
+                        formats: Vec::new(),
                         string_storage: self.string_storage,
                         field_value_scratchpad: fields,
+                        template_pending: false,
                         cache: Default::default(),
                         lookup: Default::default(),
                         call_count: 0,
@@ -442,6 +457,7 @@ impl RecordingLayer {
                             follows_from: false,
                             field_types: vec![None; vcount],
                             template: None,
+                            formats: Vec::new(),
                             string_storage: self.string_storage,
                             extra_hash: 0,
                             is_span_end: false,
@@ -595,6 +611,9 @@ pub struct Archetype {
 
     /// Matched template argument count; Some(0) represents a matched literal message.
     pub template: Option<usize>,
+    /// (metadata field, callsite recipe, first argument column). Argument columns
+    /// follow metadata fields in field_types and use the ordinary packed encoding.
+    pub formats: Vec<(usize, usize, usize)>,
     /// Template captures use the same reference width as ordinary string fields.
     pub string_storage: StringStorage,
     extra_hash: usize,
@@ -790,13 +809,18 @@ impl RecordingLayer {
         time: Time,
         parent: Option<SpanId>,
         is_log_compat: bool,
-        record: impl FnOnce(&mut dyn Visit),
+        record: impl FnOnce(&mut ValueRecorder<'_>),
     ) -> SpanId {
         let is_event = metadata.is_event();
         let mut guard = self.register(metadata);
         let site = guard.deref_mut();
         site.call_count += 1;
+        // Discard the previous row's argument columns while retaining capacities.
+        site.field_value_scratchpad
+            .values
+            .truncate(metadata.fields().len());
         site.field_value_scratchpad.values.fill(None);
+        site.field_value_scratchpad.formats.clear();
         let mut visitor = ValueRecorder {
             data: &mut site.field_value_scratchpad,
             is_log_compat,
@@ -806,9 +830,38 @@ impl RecordingLayer {
                 None
             },
             template_arg_count: None,
+            formats: Some(&mut site.formats),
         };
         record(&mut visitor);
-        site.last_archetype.template = visitor.template_arg_count;
+        let mut template_count = visitor.template_arg_count;
+        drop(visitor);
+        if site.template_pending
+            && site.template.is_none()
+            && let Some(field) = metadata.fields().field("message")
+            && matches!(
+                site.field_value_scratchpad.values[field.index()],
+                Some(ValueData::BufferIndex(_) | ValueData::BufferOffset(_))
+            )
+        {
+            site.template_pending = false;
+            site.template = template::lookup_metadata(metadata, is_log_compat);
+            if let Some(template) = &site.template {
+                let fields = &mut site.field_value_scratchpad;
+                fields
+                    .template_args
+                    .resize_with(template.field_names.len(), String::new);
+                if let Some(captures) = template.captures_inline(&fields.strings[field.index()]) {
+                    for (capture, argument) in captures.into_iter().zip(&mut fields.template_args) {
+                        argument.clear();
+                        argument.push_str(capture);
+                    }
+                    fields.values[field.index()] = None;
+                    template_count = Some(template.field_names.len());
+                }
+            }
+        }
+        site.last_archetype.template = template_count;
+        site.last_archetype.formats = site.field_value_scratchpad.format_schema(&mut site.formats);
         site.last_archetype.field_types.clear();
         site.last_archetype.field_types.extend(
             site.field_value_scratchpad
@@ -907,18 +960,21 @@ impl RecordingLayer {
         // A follows-only span needs an update row too; absent fields consume no bytes.
         let has_fields = fields
             .as_ref()
-            .is_some_and(|f| f.values.iter().any(Option::is_some));
+            .is_some_and(|f| !f.formats.is_empty() || f.values.iter().any(Option::is_some));
         let extra_fields = if has_fields || follow_from.is_some() {
-            callsite_data.last_archetype.field_types.clear();
-            callsite_data
-                .last_archetype
-                .field_types
-                .extend((0..metadata.fields().len()).map(|index| {
-                    fields
-                        .as_ref()
-                        .and_then(|f| f.values[index].as_ref())
-                        .map(ValueKind::from)
-                }));
+            callsite_data.last_archetype.field_types = if let Some(fields) = fields.as_ref() {
+                fields
+                    .values
+                    .iter()
+                    .map(|v| v.as_ref().map(ValueKind::from))
+                    .collect()
+            } else {
+                vec![None; metadata.fields().len()]
+            };
+            callsite_data.last_archetype.formats =
+                fields.as_ref().map_or_else(Vec::new, |fields| {
+                    fields.format_schema(&mut callsite_data.formats)
+                });
             callsite_data.last_archetype.extra_hash = 0;
             callsite_data.last_archetype.follows_from = follow_from.is_some();
             callsite_data.last_archetype.template = None;
@@ -991,8 +1047,46 @@ struct FieldValues {
     strings: Vec<String>,
     // Rendered captures are packed only when the selected archetype uses a template.
     template_args: Vec<String>,
+    // Deferred updates retain recipes until close; live rows share callsite Arcs.
+    formats: Vec<RecordedFormat>,
+}
+struct RecordedFormat {
+    field: usize,
+    recipe: Arc<format::Format>,
+    start: usize,
 }
 impl FieldValues {
+    // Drop stale argument columns when a span update overwrites a formatted field.
+    fn clear_format(&mut self, field: usize) {
+        if let Some(index) = self.formats.iter().position(|format| format.field == field) {
+            let format = self.formats.remove(index);
+            let end = format.start + format.recipe.template.value_count();
+            // Compact deferred updates instead of retaining dead argument columns
+            // after every overwrite of a long-lived span field.
+            self.values.drain(format.start..end);
+            self.strings.drain(format.start..end);
+            for remaining in &mut self.formats {
+                if remaining.start >= end {
+                    remaining.start -= end - format.start;
+                }
+            }
+        }
+    }
+    fn format_schema(&self, recipes: &mut Vec<Arc<format::Format>>) -> Vec<(usize, usize, usize)> {
+        self.formats
+            .iter()
+            .map(|format| {
+                let recipe = recipes
+                    .iter()
+                    .position(|r| Arc::ptr_eq(r, &format.recipe) || **r == *format.recipe)
+                    .unwrap_or_else(|| {
+                        recipes.push(format.recipe.clone());
+                        recipes.len() - 1
+                    });
+                (format.field, recipe, format.start)
+            })
+            .collect()
+    }
     /// Events, span starts and deferred updates share reference encoding.
     /// Scratch strings stay textual until the destination buffer is selected.
     fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer) {
@@ -1011,12 +1105,13 @@ impl FieldValues {
             }
         }
     }
-    fn record(&mut self, record: impl FnOnce(&mut dyn Visit)) {
+    fn record(&mut self, record: impl FnOnce(&mut ValueRecorder<'_>)) {
         record(&mut ValueRecorder {
             data: self,
             is_log_compat: false,
             template: None,
             template_arg_count: None,
+            formats: None,
         });
     }
 
@@ -1027,6 +1122,7 @@ impl FieldValues {
             values: vec![None; vcount],
             strings: vec![String::new(); vcount],
             template_args: vec![String::new(); arg_count],
+            formats: Vec::new(),
         }
     }
 }
@@ -1037,15 +1133,86 @@ struct ValueRecorder<'a> {
     template: Option<&'a template::CompiledTemplate>,
     // Preserve a successful zero-argument match without storing the message field index.
     template_arg_count: Option<usize>,
+    formats: Option<&'a mut Vec<Arc<format::Format>>>,
 }
 
 impl ValueRecorder<'_> {
+    // The comparison capture snapshots user formatting once, then shares the
+    // owned arguments with this same packing path used by visit_format.
+    fn record_format(
+        &mut self,
+        field: &tracing_core::Field,
+        recipe: Arc<format::Format>,
+        values: Vec<InputValue>,
+    ) {
+        if let Some(recipes) = &mut self.formats {
+            if !recipes
+                .iter()
+                .any(|r| Arc::ptr_eq(r, &recipe) || **r == *recipe)
+            {
+                recipes.push(recipe.clone());
+            }
+        }
+        self.data.clear_format(field.index());
+        self.data.values[field.index()] = None;
+        let start = self.data.values.len();
+        // Arguments share ordinary typed columns; strings are interned only after
+        // selecting the destination archetype and its current buffer.
+        for value in values {
+            let (value, text) = match value {
+                // Capture the actual primitive layout before choosing block capacity.
+                InputValue::I8(v) => (ValueData::I8(v), String::new()),
+                InputValue::I16(v) => (ValueData::I16(v), String::new()),
+                InputValue::I32(v) => (ValueData::I32(v), String::new()),
+                InputValue::Isize(v) => (ValueData::Isize(v), String::new()),
+                InputValue::U8(v) => (ValueData::U8(v), String::new()),
+                InputValue::U16(v) => (ValueData::U16(v), String::new()),
+                InputValue::U32(v) => (ValueData::U32(v), String::new()),
+                InputValue::Usize(v) => (ValueData::Usize(v), String::new()),
+                InputValue::F32(v) => (ValueData::F32(f32::from_bits(v)), String::new()),
+                InputValue::Char(v) => (ValueData::Char(v), String::new()),
+                InputValue::F64(v) => (ValueData::F64(f64::from_bits(v)), String::new()),
+                InputValue::I64(v) => (ValueData::I64(v), String::new()),
+                InputValue::U64(v) => (ValueData::U64(v), String::new()),
+                InputValue::I128(v) => (ValueData::I128(v), String::new()),
+                InputValue::U128(v) => (ValueData::U128(v), String::new()),
+                InputValue::Bool(v) => (ValueData::Bool(v), String::new()),
+                InputValue::Text(v) => (
+                    match self.data.string_storage {
+                        StringStorage::Offset => ValueData::BufferOffset(0),
+                        StringStorage::Index => ValueData::BufferIndex(0),
+                    },
+                    v,
+                ),
+                InputValue::Bytes(_) => unreachable!("format arguments are primitive or textual"),
+            };
+            let index = self.data.values.len();
+            self.data.values.push(Some(value));
+            if let Some(scratch) = self.data.strings.get_mut(index) {
+                scratch.clear();
+                scratch.push_str(&text);
+            } else {
+                self.data.strings.push(text);
+            }
+        }
+        self.data.formats.push(RecordedFormat {
+            field: field.index(),
+            recipe,
+            start,
+        });
+        // Direct capture takes precedence over reverse matching of message text.
+        if field.name() == "message" {
+            self.template_arg_count = None;
+        }
+    }
+
     fn record_text(&mut self, field: &tracing_core::Field, value: impl std::fmt::Display) {
         use std::fmt::Write;
         if self.is_log_compat && field.name() != "message" {
             return; // tracing_log metadata is fields, but we already extracted it
         }
 
+        self.data.clear_format(field.index());
         // Format once into scratch; physical offset/index references are assigned on write.
         let text = &mut self.data.strings[field.index()];
         text.clear();
@@ -1071,6 +1238,31 @@ impl ValueRecorder<'_> {
 }
 
 impl Visit for ValueRecorder<'_> {
+    fn visit_format(
+        &mut self,
+        field: &tracing_core::Field,
+        value: &tracing_core::field::Format<'_>,
+    ) {
+        if self.is_log_compat && field.name() != "message" {
+            return;
+        }
+        let cached = self
+            .formats
+            .as_ref()
+            .and_then(|recipes| recipes.iter().find(|recipe| recipe.template.matches(value)))
+            .cloned();
+        let (recipe, values) = if let Some(recipe) = cached {
+            let values = recipe.capture(value).expect("capturing format arguments");
+            (recipe, values)
+        } else {
+            let (recipe, values) =
+                format::Format::capture_new(value).expect("compiling format arguments");
+            let recipe = Arc::new(recipe);
+            (recipe, values)
+        };
+        self.record_format(field, recipe, values);
+    }
+
     fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
         self.record_text(field, value);
     }
@@ -1081,10 +1273,12 @@ impl Visit for ValueRecorder<'_> {
     }
 
     fn record_f64(&mut self, field: &tracing_core::Field, value: f64) {
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::F64(value));
     }
 
     fn record_i64(&mut self, field: &tracing_core::Field, value: i64) {
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::I64(value));
     }
 
@@ -1093,18 +1287,22 @@ impl Visit for ValueRecorder<'_> {
         if self.is_log_compat {
             return;
         }
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::U64(value));
     }
 
     fn record_i128(&mut self, field: &tracing_core::Field, value: i128) {
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::I128(value));
     }
 
     fn record_u128(&mut self, field: &tracing_core::Field, value: u128) {
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::U128(value));
     }
 
     fn record_bool(&mut self, field: &tracing_core::Field, value: bool) {
+        self.data.clear_format(field.index());
         self.data.values[field.index()] = Some(ValueData::Bool(value));
     }
 

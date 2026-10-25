@@ -8,13 +8,23 @@ use tracing_table::subscriber::dump::{Fixture, Operation};
 pub struct Settings {
     pub concurrency: u64,
     pub max_requests: u64,
+    pub duration_secs: u64,
 }
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let settings = Self {
             concurrency: setting("TRACING_CAPTURE_CONCURRENCY", 32)?,
             max_requests: setting("TRACING_CAPTURE_MAX_REQUESTS", 1_000_000)?,
-        })
+            duration_secs: setting("TRACING_CAPTURE_DURATION_SECS", 600)?,
+        };
+        if settings.max_requests < 2 {
+            return Err(
+                "TRACING_CAPTURE_MAX_REQUESTS must be at least 2 for spaced requests".into(),
+            );
+        }
+        u64::try_from(Duration::from_secs(settings.duration_secs).as_nanos())
+            .map_err(|_| "TRACING_CAPTURE_DURATION_SECS exceeds u64 nanoseconds")?;
+        Ok(settings)
     }
 }
 
@@ -29,12 +39,29 @@ pub async fn run(session: &Session, address: SocketAddr, settings: &Settings) ->
     let mut traffic = Traffic::default();
     let mut batches = 0;
     // Drain each batch before stopping; every request and middleware span completes.
-    while session.capture.uncompressed_bytes() < session.target {
-        let count = settings
-            .concurrency
-            .min(settings.max_requests - traffic.requests);
+    loop {
+        let bytes = session.capture.uncompressed_bytes();
+        // The byte target determines batch count at runtime. Reserve one final
+        // request at the end of the timeline so even tiny captures span ten minutes.
+        let final_batch = traffic.requests != 0 && bytes >= session.target;
+        let count = if final_batch {
+            1
+        } else {
+            settings
+                .concurrency
+                .min(settings.max_requests - traffic.requests - 1)
+        };
         if count == 0 {
             return Err("capture did not reach target before request limit".into());
+        }
+        if traffic.requests != 0 {
+            let elapsed = Duration::from_nanos(
+                (u128::from(settings.duration_secs)
+                    * 1_000_000_000
+                    * u128::from(bytes.min(session.target))
+                    / u128::from(session.target)) as u64,
+            );
+            space_next_batch(session, elapsed).await?;
         }
         let responses = join_all(
             (traffic.requests..traffic.requests + count)
@@ -46,11 +73,33 @@ pub async fn run(session: &Session, address: SocketAddr, settings: &Settings) ->
         }
         traffic.requests += count;
         batches += 1;
+        if final_batch {
+            break;
+        }
         if batches % 32 == 0 {
             session.progress(traffic.requests, "requests");
         }
     }
     Ok(traffic)
+}
+
+/// Body consumption can beat middleware's final span close on another worker.
+/// Wait for the capture's atomic idle check before jumping its shared clock.
+async fn space_next_batch(session: &Session, elapsed: Duration) -> Result<()> {
+    actix_web::rt::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match session.capture.advance_time_to(elapsed) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    actix_web::rt::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "capture spans did not close before simulated idle time")??;
+    Ok(())
 }
 
 async fn send_request(client: &Client, address: SocketAddr, id: u64) -> Result<u16> {

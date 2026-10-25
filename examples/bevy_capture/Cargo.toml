@@ -14,7 +14,14 @@ tracing-core = { path = "../../vendor/tracing/tracing-core" }
 tracing-attributes = { path = "../../vendor/tracing/tracing-attributes" }
 log = { path = "../../vendor/log" }
 
+[features]
+# The included storage collector reports bit-compacted frames.
+default = ["bit-compression"]
+bit-compression = ["tracing_table/bit-compression"]
+
 [dependencies]
+# Shared storage evidence collector iterates archived string-reference rows.
+streaming-iterator = "0.1.9"
 tracing_table = { path = "../.." }
 # Rendering and detailed tracing are the purpose of this example, so enable them
 # directly. No window backend or interactive overlay dependencies are needed.

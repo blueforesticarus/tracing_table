@@ -68,7 +68,8 @@ OVERHEAD_LABELS = {
     "string_descriptors": "Occupied compressed-buffer descriptors",
     "string_spare": "Spare compressed-buffer descriptor capacity",
     "archetype_structs": "PerArchData/schema headers excluding the two containers",
-    "archetype_fields": "Archetype field-type vector capacity",
+    "archetype_fields": "Archetype field-type and format-reference capacity",
+    "format_recipes": "Callsite format recipes",
 }
 BLOCK_OVERVIEW_LABELS = {
     "block_entries": "Block buffers: used descriptors",
@@ -101,19 +102,20 @@ OVERVIEW_COLORS = {
     "Metadata overhead": COLORS[2],
 }
 METADATA_PIE_LABELS = {
+    "format_recipes": "Callsite format recipes",
     **BLOCK_OVERVIEW_LABELS,
     "string_collection_structs": "String buffers: inline structs",
     "string_descriptors": "String buffers: used descriptors",
     "string_spare": "String buffers: spare descriptors",
     "archetype_structs": "Archetypes: schema headers",
-    "archetype_fields": "Archetypes: field-type capacity",
+    "archetype_fields": "Archetypes: field and format capacity",
 }
 OVERVIEW_COLORS.update({
     "String buffers: inline structs": (0.48, 0.33, 0.65),
     "String buffers: used descriptors": (0.64, 0.49, 0.77),
     "String buffers: spare descriptors": (0.76, 0.65, 0.85),
     "Archetypes: schema headers": (0.77, 0.27, 0.36),
-    "Archetypes: field-type capacity": (0.91, 0.53, 0.59),
+    "Archetypes: field and format capacity": (0.91, 0.53, 0.59),
 })
 LIFETIME_LABELS = {
     "archived_messages": "Messages: archived / compacted",

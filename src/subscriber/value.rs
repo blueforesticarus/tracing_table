@@ -5,6 +5,18 @@ use tracing_core::{Field, field::Visit};
 /// Portable values preserve numeric bits and distinguish text from absent fields.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InputValue {
+    // Float snapshots use raw bits so NaNs and signed zero remain lossless.
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    Isize(isize),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    Usize(usize),
+    F32(u32),
+    Char(char),
+
     F64(u64),
     I64(i64),
     U64(u64),
@@ -18,6 +30,16 @@ impl InputValue {
     /// Logical payload size excludes MessagePack framing and field/callsite metadata.
     pub fn bytes(&self) -> usize {
         match self {
+            Self::I8(_) => size_of::<i8>(),
+            Self::I16(_) => size_of::<i16>(),
+            Self::I32(_) => size_of::<i32>(),
+            Self::Isize(_) => size_of::<isize>(),
+            Self::U8(_) => size_of::<u8>(),
+            Self::U16(_) => size_of::<u16>(),
+            Self::U32(_) => size_of::<u32>(),
+            Self::Usize(_) => size_of::<usize>(),
+            Self::F32(_) => size_of::<f32>(),
+            Self::Char(_) => size_of::<char>(),
             Self::F64(_) | Self::I64(_) | Self::U64(_) => 8,
             Self::I128(_) | Self::U128(_) => 16,
             Self::Bool(_) => 1,
@@ -30,12 +52,32 @@ impl InputValue {
 pub(super) struct InputVisitor {
     pub values: Vec<Option<InputValue>>,
     pub is_log: bool,
+    pub capture_formats: bool,
+    formats: Vec<(
+        usize,
+        std::sync::Arc<super::format::Format>,
+        Vec<InputValue>,
+    )>,
 }
 impl InputVisitor {
     pub fn new(count: usize, is_log: bool) -> Self {
         Self {
             values: vec![None; count],
             is_log,
+            capture_formats: false,
+            formats: Vec::new(),
+        }
+    }
+    // Replay owned snapshots, never re-enter the original user's Display/Debug.
+    pub(super) fn record_into(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        visitor: &mut super::ValueRecorder<'_>,
+    ) {
+        visit_values(metadata, &self.values, visitor);
+        for (index, recipe, values) in &self.formats {
+            let field = metadata.fields().iter().nth(*index).unwrap();
+            visitor.record_format(&field, recipe.clone(), values.clone());
         }
     }
     fn set(&mut self, field: &Field, value: InputValue) {
@@ -46,6 +88,24 @@ impl InputVisitor {
     }
 }
 impl Visit for InputVisitor {
+    fn visit_format(&mut self, field: &Field, value: &tracing_core::field::Format<'_>) {
+        if !self.capture_formats {
+            self.set(
+                field,
+                InputValue::Text(value.render().expect("rendering input format")),
+            );
+            return;
+        }
+        let (recipe, values) =
+            super::format::Format::capture_new(value).expect("capturing input format");
+        let text = recipe
+            .render(&values.iter().cloned().map(Some).collect::<Vec<_>>())
+            .expect("rendering captured input");
+        self.set(field, InputValue::Text(text));
+        self.formats
+            .push((field.index(), std::sync::Arc::new(recipe), values));
+    }
+
     fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
         self.set(f, InputValue::Text(format!("{v:?}")));
     }
@@ -88,6 +148,18 @@ pub(super) fn visit_values(
     for (field, value) in metadata.fields().iter().zip(values) {
         match value {
             None => {}
+            // Ordinary Visit methods normalize widths; format arguments use
+            // record_format directly and never pass through this boundary.
+            Some(InputValue::I8(v)) => visitor.record_i64(&field, *v as i64),
+            Some(InputValue::I16(v)) => visitor.record_i64(&field, *v as i64),
+            Some(InputValue::I32(v)) => visitor.record_i64(&field, *v as i64),
+            Some(InputValue::Isize(v)) => visitor.record_i64(&field, *v as i64),
+            Some(InputValue::U8(v)) => visitor.record_u64(&field, *v as u64),
+            Some(InputValue::U16(v)) => visitor.record_u64(&field, *v as u64),
+            Some(InputValue::U32(v)) => visitor.record_u64(&field, *v as u64),
+            Some(InputValue::Usize(v)) => visitor.record_u64(&field, *v as u64),
+            Some(InputValue::F32(v)) => visitor.record_f64(&field, f64::from(f32::from_bits(*v))),
+            Some(InputValue::Char(v)) => visitor.record_str(&field, &v.to_string()),
             Some(InputValue::F64(v)) => visitor.record_f64(&field, f64::from_bits(*v)),
             Some(InputValue::I64(v)) => visitor.record_i64(&field, *v),
             Some(InputValue::U64(v)) => visitor.record_u64(&field, *v),

@@ -14,7 +14,14 @@ tracing-core = { path = "../../vendor/tracing/tracing-core" }
 tracing-attributes = { path = "../../vendor/tracing/tracing-attributes" }
 log = { path = "../../vendor/log" }
 
+[features]
+# The included storage collector reports bit-compacted frames.
+default = ["bit-compression"]
+bit-compression = ["tracing_table/bit-compression"]
+
 [dependencies]
+# Shared storage evidence collector iterates archived string-reference rows.
+streaming-iterator = "0.1.9"
 tracing_table = { path = "../.." }
 actix-web = { version = "4", default-features = false, features = ["macros"] }
 tracing-actix-web = { version = "0.7", default-features = false }

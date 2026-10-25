@@ -523,6 +523,13 @@ impl<'a, R: Reader> Decoder<'a, R> {
             .option(memory, line)?
             .ok_or("tracing metadata has no line")?;
         let line = u32::try_from(self.number(memory, line)?)?;
+        // Patched log_enabled! registers EVENT metadata for filtering only,
+        // without a recording-table entry. Its generated name distinguishes it
+        // from emitted events; tracing's own hint callsites have HINT_BIT=4.
+        let name = self.member(value.clone(), "name")?;
+        if bits == 1 && self.string(memory, name)? == format!("enabled {file}:{line}") {
+            return Ok(None);
+        }
         let module = self.member(value, "module_path")?;
         let module = self
             .option(memory, module)?

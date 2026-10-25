@@ -910,6 +910,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "introspect-fmt"
+version = "0.1.0"
+dependencies = [
+ "introspect-fmt-macros",
+]
+
+[[package]]
+name = "introspect-fmt-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1579,9 +1595,11 @@ dependencies = [
 name = "tracing"
 version = "0.1.44"
 dependencies = [
+ "introspect-fmt",
  "log",
  "pin-project-lite",
  "tracing-attributes",
+ "tracing-callsite-source",
  "tracing-core",
 ]
 
@@ -1610,11 +1628,17 @@ dependencies = [
 [[package]]
 name = "tracing-callsite-source"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "tracing-core"
 version = "0.1.36"
 dependencies = [
+ "introspect-fmt",
  "tracing-callsite-source",
  "valuable",
 ]
@@ -1668,6 +1692,7 @@ dependencies = [
  "bytemuck",
  "foldhash",
  "hashbrown",
+ "introspect-fmt",
  "lz4",
  "lz4_flex",
  "parking_lot",
@@ -1688,6 +1713,7 @@ dependencies = [
  "actix-web",
  "awc",
  "futures-util",
+ "streaming-iterator",
  "tracing",
  "tracing-actix-web",
  "tracing-log",

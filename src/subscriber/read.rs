@@ -242,6 +242,34 @@ impl PerCallsiteData {
                     for kind in &a.field_types {
                         row.fields.push(kind.as_ref().map(|kind| {
                             match kind {
+                                // Decode precisely the width selected by the format schema.
+                                ValueKind::I8 => InputValue::I8(i8::from_ne_bytes(reader.bytes())),
+                                ValueKind::I16 => {
+                                    InputValue::I16(i16::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::I32 => {
+                                    InputValue::I32(i32::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::Isize => {
+                                    InputValue::Isize(isize::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::U8 => InputValue::U8(u8::from_ne_bytes(reader.bytes())),
+                                ValueKind::U16 => {
+                                    InputValue::U16(u16::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::U32 => {
+                                    InputValue::U32(u32::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::Usize => {
+                                    InputValue::Usize(usize::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::F32 => {
+                                    InputValue::F32(u32::from_ne_bytes(reader.bytes()))
+                                }
+                                ValueKind::Char => InputValue::Char(
+                                    char::from_u32(u32::from_ne_bytes(reader.bytes()))
+                                        .expect("stored char"),
+                                ),
                                 ValueKind::F64 => InputValue::F64(reader.u64()),
                                 ValueKind::I64 => {
                                     InputValue::I64(i64::from_ne_bytes(reader.bytes()))
@@ -265,6 +293,17 @@ impl PerCallsiteData {
                             }
                         }));
                     }
+                    // Reconstruct every formatted field from its callsite recipe
+                    // before hiding the appended physical argument columns.
+                    for &(field, recipe, start) in &a.formats {
+                        let recipe = &self.formats[recipe];
+                        let count = recipe.template.value_count();
+                        let text = recipe
+                            .render(&row.fields[start..start + count])
+                            .expect("stored format arguments");
+                        row.fields[field] = Some(InputValue::Text(text));
+                    }
+                    row.fields.truncate(self.metadata.fields().len());
                     if let Some(count) = a.template {
                         // Common templates fit inline, matching the ingestion path.
                         let captures: SmallVec<[&str; 4]> = (0..count)

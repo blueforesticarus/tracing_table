@@ -1,5 +1,5 @@
 //! CODEX GENERATED, minimally reviewed
-//! Embedded templates with a development fallback to the scanner's source parser.
+//! Vendor-table runtime templates, plus legacy scanner/source lookup.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -32,6 +32,30 @@ static TEMPLATES: LazyLock<Mutex<Templates>> = LazyLock::new(|| {
         .or_else(|| project_root(&std::env::current_exe().ok()?));
     Mutex::new(Templates::new(root, load_embedded_section().ok()))
 });
+
+// Keep identity-based vendor lookup separate from legacy scanner/source resolution.
+#[cfg(feature = "tracing_patched")]
+mod patched;
+
+/// Resolve runtime metadata using the selected callsite table implementation.
+pub fn lookup_metadata(
+    metadata: &'static tracing::Metadata<'static>,
+    is_log: bool,
+) -> Option<CompiledTemplate> {
+    #[cfg(feature = "tracing_patched")]
+    {
+        patched::lookup(metadata, is_log)
+    }
+    #[cfg(not(feature = "tracing_patched"))]
+    {
+        lookup(
+            metadata.file().unwrap_or("<unknown>"),
+            metadata.line().unwrap_or(0),
+            is_log,
+            metadata.module_path(),
+        )
+    }
+}
 
 /// Find a template at a one-based line, using the runtime framework/module metadata.
 ///
@@ -265,17 +289,14 @@ mod tests {
         let (metadata, template_address) = {
             let sites = recorder.callsites.read();
             let site = sites.values().next().unwrap().read();
-            let template = site.template.as_ref().unwrap();
-            assert_eq!(template.format, "cached subscriber template");
-            (site.metadata, std::ptr::from_ref(template))
+            let template = &site.formats[0];
+            assert_eq!(template.template.source(), "cached subscriber template");
+            (site.metadata, Arc::as_ptr(template))
         };
         for _ in 0..3 {
-            // Re-registration retains the matcher owned by this callsite.
+            // Re-registration retains the directly captured callsite recipe.
             let site = recorder.register(metadata);
-            assert_eq!(
-                template_address,
-                std::ptr::from_ref(site.template.as_ref().unwrap())
-            );
+            assert_eq!(template_address, Arc::as_ptr(&site.formats[0]));
         }
     }
 
@@ -519,6 +540,17 @@ pub struct CompiledTemplate {
 }
 
 impl CompiledTemplate {
+    /// Heap capacity retained by the legacy reverse-matching recipe.
+    pub fn heap_bytes(&self) -> usize {
+        self.format.capacity()
+            + (self.field_names.capacity() + self.literals.capacity()) * size_of::<String>()
+            + self
+                .field_names
+                .iter()
+                .chain(&self.literals)
+                .map(String::capacity)
+                .sum::<usize>()
+    }
     /// Captures already contain rendered formatting. Concatenate without formatting again.
     pub fn render(&self, captures: &[&str]) -> String {
         assert_eq!(captures.len(), self.field_names.len());
@@ -831,7 +863,7 @@ mod matcher_tests {
 
     #[test]
     fn lookup_returns_a_compiled_matcher_with_field_names() {
-        // A real callsite confirms the compiled object is stored at registration.
+        // Explicit fallback lookup remains available independently of direct capture.
         use crate::subscriber::{LocalRecordingLayer, RecordingLayer};
         use std::sync::Arc;
         use tracing_subscriber::{Registry, layer::SubscriberExt};
@@ -844,7 +876,7 @@ mod matcher_tests {
         );
         let sites = recorder.callsites.read();
         let site = sites.values().next().unwrap().read();
-        let compiled = site.template.as_ref().unwrap();
+        let compiled = lookup_metadata(site.metadata, false).unwrap();
         assert_eq!(compiled.field_names, ["name", "0"]);
         assert_eq!(
             compiled.captures("compiled example 42").unwrap(),
