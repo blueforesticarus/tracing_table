@@ -1045,3 +1045,13 @@ With u16.
 | Unused capacity | 1,587,291 | 1,565,536 | −21,755 |
 
 CONCLUSION: this is too finicky to bother with. better direction is patching tracing. **I have reverted numeric string conversion, as well as dictionaries, cycles, and string cardinality metrics.** They are preserved in experiment/numeric-u16-2026-10-24 commit d596c59
+
+# patching tracing and log
+1. [x] patch tracing to emit callsites directly 
+2. [x] store templates directly
+3. [x] look up source code text (nice for display/debug) 
+4. [x] patch logging to redirect to tracing
+   - [ ] identify what does not work and falls back to log
+     - dynamic keys in kv
+     - explicit `logger:` (shouldn't redirect anyway)
+5. [ ] replace fmt::Arguments with something inspectible

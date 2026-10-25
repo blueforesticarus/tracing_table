@@ -11,6 +11,11 @@ use tracing_actix_web::TracingLogger;
 
 #[actix_web::main]
 async fn main() -> Result<()> {
+    // Export before initializing a renderer, server, or capture subscriber.
+    if capture_support::export_callsites()? {
+        return Ok(());
+    }
+
     let load = driver::Settings::from_env()?;
     let work = workload::Workload::from_env()?;
     let workers = usize::try_from(setting("TRACING_CAPTURE_WORKERS", 4)?)?;

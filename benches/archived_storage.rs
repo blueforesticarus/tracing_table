@@ -340,6 +340,7 @@ mod collect {
         "name",
         "format",
         "fields",
+        "framework",
     ];
     struct Csv<W: Write> {
         writer: W,
@@ -497,6 +498,8 @@ mod collect {
                     ("callsite", callsite.to_string()),
                 ],
                 &[
+                    // Capture provenance distinguishes bridged log events from tracing.
+                    ("framework", if source.is_log { "log" } else { "tracing" }.into()),
                     ("file", metadata.file().unwrap_or("").into()),
                     ("line", metadata.line().unwrap_or(0).to_string()),
                     ("target", metadata.target().into()),
@@ -538,6 +541,8 @@ mod collect {
                     ("templates", templates.to_string()),
                     ("callsite", callsite.to_string()),
                     ("record_kind", kind.into()),
+                    // Shared identity propagates provenance to every measurement row.
+                    ("framework", if source.is_log { "log" } else { "tracing" }.into()),
                 ];
                 // Per-callsite counters are the common denominator for both weighted
                 // pies. Active-only sites still participate in the row-weighted view.

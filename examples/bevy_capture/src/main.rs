@@ -47,6 +47,11 @@ impl Settings {
 }
 
 fn main() -> Result<()> {
+    // Export before initializing a renderer, server, or capture subscriber.
+    if capture_support::export_callsites()? {
+        return Ok(());
+    }
+
     let settings = Settings::from_env()?;
     let session = Session::start("bevy")?;
     let mut app = build_app(settings.scene);

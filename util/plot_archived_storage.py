@@ -82,7 +82,9 @@ BLOCK_OVERVIEW_LABELS = {
 OVERVIEW_COLORS = {
     "Span payload": COLORS[0],
     "Span rows + strings": COLORS[0],
-    "Event/log payload": COLORS[1],
+    # Tune event and bridged-log hues independently in the archive overview.
+    "Event payload": COLORS[1],
+    "Log payload": (0.02, 0.32, 0.30),
     "Event/log rows + strings": COLORS[1],
     "Block buffers: used descriptors": (0.82, 0.39, 0.10),
     "Block buffers: heap headers": (0.95, 0.59, 0.20),
@@ -284,12 +286,12 @@ def per_row(value, rows):
 
 
 def overview_slices(values, metadata):
-    # User-requested presentation contract: keep exactly the span, event/log,
-    # and metadata slices. Add further overview categories only when asked.
+    # Keep event and bridged-log ownership separate in the second pie.
     # Attribute each end table to the same owner as its rows and strings.
     # Detailed span/event pies expose table and padding costs separately.
     slices = [("Span payload", total(values, owner=("span",))),
-              ("Event/log payload", total(values, owner=("event", "log")))]
+              ("Event payload", total(values, owner=("event",))),
+              ("Log payload", total(values, owner=("log",)))]
     # Consolidate metadata here; its disjoint measured leaves get a separate pie.
     slices.append(("Metadata overhead", sum(metadata[key] for key in OVERHEAD_LABELS)))
     assert math.isclose(sum(value for _, value in slices),

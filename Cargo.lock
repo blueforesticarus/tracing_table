@@ -322,6 +322,9 @@ dependencies = [
 [[package]]
 name = "log"
 version = "0.4.34"
+dependencies = [
+ "tracing-core",
+]
 
 [[package]]
 name = "lz4"
@@ -677,14 +680,18 @@ version = "0.1.31"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.101",
+ "syn 3.0.9",
 ]
+
+[[package]]
+name = "tracing-callsite-source"
+version = "0.1.0"
 
 [[package]]
 name = "tracing-core"
 version = "0.1.36"
 dependencies = [
- "once_cell",
+ "tracing-callsite-source",
  "valuable",
 ]
 
