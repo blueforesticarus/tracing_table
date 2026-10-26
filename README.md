@@ -1222,6 +1222,16 @@ actually choose stride minimizing mask
 
 Using float_u16 for stride loses only 72 B in bevy capture (from imprecision, compared to full u64). while saving 27,566 B of overhead.
 
+---
+
+Add optimisitic float32 storage of float64 when it fits exactly.
+
+> 14.25 KiB saved in archived message storage.
+> 17.19 KiB saved including used active rows and layout metadata, excluding spare capacity.
+> 9 of 11 logical float columns narrowed to f32, using 8 physical columns after sharing. The other 2 promoted to f64.
+> 29,727 logical values narrowed, representing 23,907 physical values after column sharing.
+> 24 physical values remain at eight bytes following promotion.
+
 # delta encoding ts
 delta or delta of delta encoding ts could reduce size more than stride
 
@@ -1232,3 +1242,5 @@ delta or delta of delta encoding ts could reduce size more than stride
 | Choose current/delta per block | −6.12% | −14.23% |
 
 conclusion: not worth it
+
+# string crunching
