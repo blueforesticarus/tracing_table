@@ -10,10 +10,11 @@ use std::{
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
 use super::CompressionStats;
+use super::column::physical::PhysicalLayout;
 use super::column::{self, Layout as ColumnLayout};
 use super::dataframe::{AnyFrame, Frame, Row, RowBuffer};
-use super::util::smallbox::SmallBox;
 use super::stringbuffer::StringBufferId;
+use super::util::smallbox::SmallBox;
 
 mod metadata;
 pub use metadata::CollocatedMetadata;
@@ -35,6 +36,8 @@ pub use super::dataframe::{CompactFrame as ArchivedFrame, CompactFrameIter as Ar
 // Public storage views let the standalone example inspect without library helpers.
 pub struct BlockCache {
     unit: usize,
+    /// Shared per-archetype history; no layout ID/width is added to any block.
+    pub layouts: smallvec::SmallVec<[PhysicalLayout; 1]>,
 
     // This is a very simple way to reduce the size of rare or one-off logs.
     // The starter frame is allocated with a smaller amount of space, and once full is reallocated.
@@ -168,6 +171,7 @@ impl BlockCache {
     pub fn new(unit: usize, start_cap: usize, max_cap: usize) -> Self {
         BlockCache {
             unit,
+            layouts: smallvec::SmallVec::new(),
             frame_size_max: max_cap,
             active: Frame::new(unit, start_cap),
             ring: VecDeque::new(),
@@ -182,6 +186,77 @@ impl BlockCache {
             active_parent_row_offsets: smallvec::SmallVec::new(),
             active_timestamp_header: false,
         }
+    }
+
+    pub fn configure_layout(&mut self, layout: PhysicalLayout, max_cap: usize) {
+        assert!(self.ring.is_empty() && self.active.length == 0 && self.layouts.is_empty());
+        self.unit = layout.unit();
+        self.active = Frame::new(layout.unit(), self.active.capacity());
+        self.frame_size_max = max_cap;
+        self.edit_buffer.resize(layout.logical_unit(), 0);
+        self.layouts.push(layout);
+    }
+
+    pub fn layout_for_block(&self, index: usize) -> Option<&PhysicalLayout> {
+        self.layouts
+            .iter()
+            .rev()
+            .find(|layout| layout.block_index <= index)
+    }
+
+    pub fn columns_for_block<'a>(
+        &'a self,
+        index: usize,
+        fallback: &'a [ColumnLayout],
+    ) -> &'a [ColumnLayout] {
+        self.layout_for_block(index)
+            .map_or(fallback, |layout| layout.columns.as_slice())
+    }
+
+    pub fn layouts_heap_bytes(&self) -> usize {
+        usize::from(self.layouts.spilled()) * self.layouts.capacity() * size_of::<PhysicalLayout>()
+            + self
+                .layouts
+                .iter()
+                .map(PhysicalLayout::heap_bytes)
+                .sum::<usize>()
+    }
+
+    /// Convert every active row in one pass. The descriptor, span references,
+    /// parent dictionary and all archived allocations remain untouched.
+    pub fn promote(&mut self, logical: &[u8], min_rows: usize) -> bool {
+        let Some(old) = self.layouts.last() else {
+            return false;
+        };
+        let Some(mut next) = old.promoted(
+            logical,
+            self.active_descriptor.index == 1 && self.active.length == 0,
+        ) else {
+            return false;
+        };
+        next.block_index = self.offset + self.ring.len();
+        let capacity = self.active.capacity();
+        let mut converted = Frame::new(next.unit(), capacity);
+        let mut row = smallvec::SmallVec::<[u8; 256]>::from_elem(0, old.logical_unit());
+        let mut packed = smallvec::SmallVec::<[u8; 256]>::from_elem(0, next.unit());
+        for previous in self.active.iter() {
+            old.unpack(previous, &mut row);
+            next.pack(&row, &mut packed);
+            converted.push(&packed);
+        }
+        // Preserve structural edit locks; payload masks are rebuilt at their new positions.
+        converted.buffer[..next.header()].copy_from_slice(&self.active.mask()[..next.header()]);
+        self.unit = next.unit();
+        self.frame_size_max = (crate::subscriber::MESSAGE_BLOCK_TARGET_SIZE / next.unit())
+            .max(min_rows)
+            .max(1);
+        self.active = converted;
+        if self.layouts.last().unwrap().block_index == next.block_index {
+            *self.layouts.last_mut().unwrap() = next;
+        } else {
+            self.layouts.push(next);
+        }
+        true
     }
 
     pub fn active_parent_offsets(&self) -> ParentOffsets<'_> {
@@ -293,6 +368,10 @@ impl BlockCache {
         }
         // Reuse the transient parent scratch for the combined footer. The active
         // dictionary is cleared below before it can be read or appended again.
+        let columns = self
+            .layouts
+            .last()
+            .map_or(columns, |layout| layout.columns.as_slice());
         column::fit(&mut self.active, &mut self.active_parent_offsets, columns);
         let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
@@ -408,30 +487,63 @@ impl BlockCache {
         index: usize,
         columns: &'a [ColumnLayout],
     ) -> Option<(&'a Descriptor, Row<'a>)> {
+        self.get_mut_inner(index, columns, true)
+    }
+
+    /// Span closes edit only fixed structural bytes. Keep that common path
+    /// direct for active rows and reuse physical scratch for archived rows.
+    pub fn get_mut_physical<'a>(
+        &'a mut self,
+        index: usize,
+        columns: &'a [ColumnLayout],
+    ) -> Option<(&'a Descriptor, Row<'a>)> {
+        self.get_mut_inner(index, columns, false)
+    }
+
+    fn get_mut_inner<'a>(
+        &'a mut self,
+        index: usize,
+        columns: &'a [ColumnLayout],
+        logical: bool,
+    ) -> Option<(&'a Descriptor, Row<'a>)> {
         if index >= self.active_descriptor.index {
             if index - self.active_descriptor.index >= self.active.length {
                 return None;
             }
             let row = Row {
                 init: false, // we aren't copying the data, just providing the buffer
-                buffer: RowBuffer::Owned(Box::default()),
+                buffer: RowBuffer::Borrowed(&mut self.edit_buffer),
                 index: index - self.active_descriptor.index,
                 frame: crate::data::dataframe::AnyFrame::Frame(&mut self.active),
+                projection: if logical { self.layouts.last() } else { None },
             };
             Some((&self.active_descriptor, row))
         } else {
-            let Some(data) = self.ring.iter_mut().rev().find(|d| {
+            // Late closes most often target recent blocks; retain the reverse
+            // search while also recovering the absolute layout boundary.
+            let ordinal = self.ring.iter().rposition(|d| {
                 d.descriptor.index <= index && index - d.descriptor.index < d.data.frame.len()
-            }) else {
-                return None;
+            })?;
+            let projection = self
+                .layouts
+                .iter()
+                .rev()
+                .find(|p| p.block_index <= self.offset + ordinal);
+            let columns = projection.map_or(columns, |p| p.columns.as_slice());
+            let data = &mut self.ring[ordinal];
+            let size = if logical {
+                projection.map_or(data.data.frame.unit(), |p| p.logical_unit())
+            } else {
+                data.data.frame.unit()
             };
 
             let frame = AnyFrame::Archived(&mut data.data, columns);
             let row = Row {
                 init: false, // Decode only if the caller accesses the archived row.
-                buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
+                buffer: RowBuffer::Borrowed(&mut self.edit_buffer[..size]),
                 index: index - data.descriptor.index,
                 frame,
+                projection: if logical { projection } else { None },
             };
             Some((&data.descriptor, row))
         }
@@ -517,9 +629,21 @@ impl BlockCache {
     ) -> impl StreamingIterator<Item = [u8]> + 'a {
         self.ring
             .iter()
+            .enumerate()
             .into_streaming_iter()
-            .flat_map(move |frame| frame.data.iter(columns))
-            .chain(self.active.iter().into_streaming_iter_ref())
+            .flat_map(move |(i, frame)| {
+                let projection = self.layout_for_block(self.offset + i);
+                let columns = projection.map_or(columns, |p| p.columns.as_slice());
+                super::dataframe::ProjectedIter::new(frame.data.iter(columns), projection)
+            })
+            .chain(self.active_rows())
+    }
+
+    pub fn active_rows(&self) -> impl StreamingIterator<Item = [u8]> + '_ {
+        super::dataframe::ProjectedIter::new(
+            self.active.iter().into_streaming_iter_ref(),
+            self.layouts.last(),
+        )
     }
 
     /// Active frame, descriptor and shared cache/scratch state; no archived traversal.
@@ -532,6 +656,7 @@ impl BlockCache {
                     - size_of::<Descriptor>()
                     - size_of::<CollocatedMetadata>()
                     + self.edit_buffer.len()
+                    + self.layouts_heap_bytes()
                     + self.active_parent_offsets.len()
                     + if self.active_parent_row_offsets.spilled() {
                         self.active_parent_row_offsets.len() * size_of::<u16>()

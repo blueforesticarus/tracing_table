@@ -168,7 +168,8 @@ pub mod collect {
                     arch.data.active_metadata.string_buffer,
                     arch.strings.active_index()
                 );
-                for row in frame.iter() {
+                let mut rows = arch.data.active_rows();
+                while let Some(row) = rows.next() {
                     for range in ranges {
                         active.insert(
                             u16::from_ne_bytes(row[range.clone()].try_into().unwrap()) as usize
@@ -255,25 +256,31 @@ pub mod collect {
             .data
             .ring
             .iter()
-            .map(|block| {
+            .enumerate()
+            .map(|(ordinal, block)| {
                 block
                     .data
-                    .parent_offsets(&arch.archetype.column_layout())
+                    .parent_offsets(arch.data.columns_for_block(
+                        arch.data.offset + ordinal,
+                        &arch.archetype.column_layout(),
+                    ))
                     .len()
                     * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
             })
             .sum();
         // Preserve the historical CSV key; its payload now includes all field codecs.
-        let string_starts: usize = arch
-            .data
-            .ring
-            .iter()
-            .map(|block| {
-                block
-                    .data
-                    .column_footer_bytes(&arch.archetype.column_layout())
-            })
-            .sum();
+        let string_starts: usize =
+            arch.data
+                .ring
+                .iter()
+                .enumerate()
+                .map(|(ordinal, block)| {
+                    block.data.column_footer_bytes(arch.data.columns_for_block(
+                        arch.data.offset + ordinal,
+                        &arch.archetype.column_layout(),
+                    ))
+                })
+                .sum();
         let frame_padding = frame_overhead - frame_headers - parent_tables - string_starts;
         let block_entries = arch.data.ring.len() * size_of::<Data>();
         let block_spare = (arch.data.ring.capacity() - arch.data.ring.len()) * size_of::<Data>();
@@ -438,16 +445,19 @@ pub mod collect {
         }
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--format-args" | "--templates" => {
+                "--format-args" | "--templates" | "--column-sharing" | "--integer-widths"
+                | "--float-widths" => {
                     let enabled = match args.next().as_deref() {
                         Some("on") => true,
                         Some("off") => false,
                         _ => return Err(format!("{arg} expects on or off").into()),
                     };
-                    if arg == "--format-args" {
-                        replay.format_args = enabled;
-                    } else {
-                        replay.extract_templates = enabled;
+                    match arg.as_str() {
+                        "--format-args" => replay.format_args = enabled,
+                        "--templates" => replay.extract_templates = enabled,
+                        "--column-sharing" => replay.layout_policy.sharing = enabled,
+                        "--integer-widths" => replay.layout_policy.integers = enabled,
+                        _ => replay.layout_policy.floats = enabled,
                     }
                 }
                 "--min-block-rows" => min_rows = args.next().ok_or("missing row count")?.parse()?,
@@ -566,6 +576,9 @@ pub mod collect {
             ("min_block_rows", min_rows),
             ("format_args", usize::from(replay.format_args)),
             ("extract_templates", usize::from(replay.extract_templates)),
+            ("column_sharing", usize::from(replay.layout_policy.sharing)),
+            ("integer_widths", usize::from(replay.layout_policy.integers)),
+            ("float_widths", usize::from(replay.layout_policy.floats)),
         ] {
             output.row(
                 &[],
@@ -653,6 +666,9 @@ pub mod collect {
                 // Count stored entries once per retained buffer, rather than
                 // counting repeated row references or globally distinct text.
                 let mut archived_string_entries = 0;
+                // Natural metadata units include each retained writable buffer,
+                // whose inline header is charged alongside frozen descriptors.
+                let (mut archived_archetypes, mut string_buffers) = (0, 0);
                 let mut archived_field_columns = BTreeMap::<&str, usize>::new();
                 for arch in &site.cache {
                     active_rows += arch.data.active.length;
@@ -668,13 +684,37 @@ pub mod collect {
                     }
                     // Schema column counts are separate from the row-weighted
                     // column_values already exported by each physical leaf.
+                    archived_archetypes += 1;
+                    string_buffers += arch.strings.archived_ids().len() + 1;
                     for part in &parts {
                         *archived_field_columns.entry(part.group).or_default() += 1;
                     }
                     let mut buffers = BTreeSet::new();
                     let mut active_indices = BTreeSet::new();
                     let mut arch_block_bytes = 0;
-                    for block in &arch.data.ring {
+                    for (ordinal, block) in arch.data.ring.iter().enumerate() {
+                        // Costs cover unique stored columns; logical ranges remain
+                        // available separately for reconstructed string references.
+                        let projection = arch.data.layout_for_block(arch.data.offset + ordinal);
+                        let physical_parts: Vec<_> = parts
+                            .iter()
+                            .filter_map(|part| {
+                                let range = projection.map_or_else(
+                                    || Some(part.range.clone()),
+                                    |p| p.physical_range(part.range.clone()),
+                                )?;
+                                Some(Component {
+                                    group: part.group,
+                                    name: part.name.clone(),
+                                    range,
+                                    string_reference: part.string_reference,
+                                })
+                            })
+                            .collect();
+                        let fallback = arch.archetype.column_layout();
+                        let columns = arch
+                            .data
+                            .columns_for_block(arch.data.offset + ordinal, &fallback);
                         let frame = &block.data.frame;
                         let rows = frame.len();
                         let block_identity = [
@@ -706,7 +746,7 @@ pub mod collect {
                             span_starts += rows;
                         }
                         let mut attributed_bits = 0;
-                        for part in &parts {
+                        for part in &physical_parts {
                             let part_bits: usize = frame.mask()[part.range.clone()]
                                 .iter()
                                 .map(|byte| byte.count_ones() as usize)
@@ -734,14 +774,9 @@ pub mod collect {
                             )?;
                         }
                         assert_eq!(attributed_bits, bits);
-                        let ends = block
-                            .data
-                            .parent_offsets(&arch.archetype.column_layout())
-                            .len()
+                        let ends = block.data.parent_offsets(columns).len()
                             * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
-                            + block
-                                .data
-                                .column_footer_bytes(&arch.archetype.column_layout());
+                            + block.data.column_footer_bytes(columns);
                         output.row(
                             &block_identity,
                             &[
@@ -753,8 +788,10 @@ pub mod collect {
                         if !ranges.is_empty() {
                             buffers.insert(block.data.metadata.string_buffer);
                             if block.data.metadata.string_buffer == arch.strings.active_index() {
-                                let columns = arch.archetype.column_layout();
-                                let mut iter = block.data.iter(&columns);
+                                let mut iter = tracing_table::data::dataframe::ProjectedIter::new(
+                                    block.data.iter(columns),
+                                    projection,
+                                );
                                 while let Some(row) = iter.next() {
                                     for range in &ranges {
                                         active_indices.insert(u16::from_ne_bytes(
@@ -901,6 +938,8 @@ pub mod collect {
                     ("archived_rows", archived_rows),
                     ("active_rows", active_rows),
                     ("archived_blocks", blocks),
+                    ("archived_archetypes", archived_archetypes),
+                    ("string_buffers", string_buffers),
                     ("span_starts", span_starts),
                     (
                         "lifetime.archived_messages",

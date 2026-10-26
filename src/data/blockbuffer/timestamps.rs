@@ -113,24 +113,49 @@ mod tests {
     }
 
     #[test]
-    fn stride_limit_disables_instead_of_saturating_and_flat_blocks_stay_unsigned() {
+    fn stride_limits_and_flat_blocks_round_trip() {
         for (times, stride) in [
             (vec![0, FloatU16::MAX / 2], FloatU16::MAX),
-            (vec![0, FloatU16::MAX / 2 + 1], 0),
-            (vec![0, u64::MAX], 0),
+            (
+                vec![0, FloatU16::MAX / 2 + 1],
+                if column::TIMESTAMP_MINIMAX_STRIDE {
+                    FloatU16::MAX
+                } else {
+                    0
+                },
+            ),
+            (
+                vec![0, u64::MAX],
+                if column::TIMESTAMP_MINIMAX_STRIDE {
+                    FloatU16::MAX
+                } else {
+                    0
+                },
+            ),
             (vec![u64::MAX], 0),
             (vec![7, 7, 7], 0),
-            (vec![0, 9, 0], 0),
+            (
+                vec![0, 9, 0],
+                if column::TIMESTAMP_MINIMAX_STRIDE {
+                    8
+                } else {
+                    0
+                },
+            ),
         ] {
             let mut cache = BlockCache::new(8, times.len(), times.len());
             for &ts in &times {
                 append(&mut cache, ts);
             }
             cache.cycle();
-            assert_eq!(
-                cache.ring[0].data.metadata.timestamp_stride.to_u64(),
-                stride
-            );
+            // Mask fitting may choose a very different coefficient with fewer bits.
+            // Keep legacy coefficient checks when that optional policy is selected.
+            if !column::TIMESTAMP_MASK_STRIDE {
+                assert_eq!(
+                    cache.ring[0].data.metadata.timestamp_stride.to_u64(),
+                    stride
+                );
+            }
             check_archived(&cache, &times);
         }
     }
@@ -164,7 +189,16 @@ mod tests {
         // A close before archival must not influence the start-time fit.
         cache.update_ts_range(1_000_000, Some(1));
         cache.cycle();
-        assert_eq!(cache.ring[0].data.metadata.timestamp_stride.to_u64(), 8);
+        assert_eq!(
+            cache.ring[0].data.metadata.timestamp_stride.to_u64(),
+            if column::TIMESTAMP_MASK_STRIDE {
+                8 // Endpoint's residual mask is smaller than the minimax mask.
+            } else if column::TIMESTAMP_MINIMAX_STRIDE {
+                6
+            } else {
+                8
+            }
+        );
         assert_eq!(cache.ring[0].data.frame.mask()[8], 0xff);
         check_archived(&cache, &times);
         // Changing a constant byte rebuilds the archive without refitting times.

@@ -8,7 +8,10 @@ use std::{
     ops::Range,
 };
 use streaming_iterator::StreamingIterator;
+mod layouts;
+pub use layouts::write_layouts;
 
+#[derive(Clone)]
 struct Field {
     name: String,
     role: &'static str,
@@ -16,6 +19,8 @@ struct Field {
     range: Range<usize>,
     raw_width: usize,
     record: Option<usize>,
+    stored: Option<Range<usize>>,
+    alias: Option<usize>,
 }
 
 // All reference columns have a 16-byte logical baseline and 10-byte physical row.
@@ -34,6 +39,8 @@ fn fields(arch: &Archetype, names: &[String]) -> Vec<Field> {
             range: offset..offset + width,
             raw_width,
             record: None,
+            stored: Some(offset..offset + width),
+            alias: None,
         });
         offset += width;
     };
@@ -82,6 +89,8 @@ fn fields(arch: &Archetype, names: &[String]) -> Vec<Field> {
             range: offset..offset + kind.unit(),
             raw_width: kind.unit(),
             record,
+            stored: Some(offset..offset + kind.unit()),
+            alias: None,
         });
         offset += kind.unit();
     }
@@ -95,6 +104,8 @@ fn fields(arch: &Archetype, names: &[String]) -> Vec<Field> {
             range: offset..offset + width,
             raw_width: width,
             record,
+            stored: Some(offset..offset + width),
+            alias: None,
         });
         offset += width;
     }
@@ -126,20 +137,48 @@ pub fn write_recording(
             .map(|field| field.name().to_owned())
             .collect();
         for arch in &site.cache {
-            let layout = arch.archetype.column_layout();
-            let fields = fields(&arch.archetype, &names);
-            for block in &arch.data.ring {
+            let fallback = arch.archetype.column_layout();
+            let logical_fields = fields(&arch.archetype, &names);
+            for (ordinal, block) in arch.data.ring.iter().enumerate() {
+                let projection = arch.data.layout_for_block(arch.data.offset + ordinal);
+                let layout = arch
+                    .data
+                    .columns_for_block(arch.data.offset + ordinal, &fallback);
+                let fields: Vec<_> = logical_fields
+                    .iter()
+                    .cloned()
+                    .map(|mut field| {
+                        if let Some(p) = projection {
+                            field.stored = p.physical_range(field.range.clone());
+                            field.record = field
+                                .stored
+                                .as_ref()
+                                .and_then(|range| layout.iter().position(|c| c.range() == *range));
+                            if field.stored.is_none() {
+                                let f = p
+                                    .fields
+                                    .iter()
+                                    .find(|f| f.logical.range() == field.range)
+                                    .unwrap();
+                                let source = p.fields[usize::from(f.source)].logical.range();
+                                field.alias = logical_fields.iter().position(|f| f.range == source);
+                            }
+                        }
+                        field
+                    })
+                    .collect();
                 let frame = &block.data.frame;
                 let records: Vec<_> = block
                     .data
-                    .column_metadata(&layout)
+                    .column_metadata(layout)
                     .entries()
                     .map(|(_, record)| record)
                     .collect();
-                let parents = block.data.parent_offsets(&layout);
+                let parents = block.data.parent_offsets(layout);
                 let mut first = vec![0; fields.len()];
                 let mut masks = vec![0u128; fields.len()];
-                let mut rows = block.data.iter(&layout);
+                let mut rows =
+                    crate::data::dataframe::ProjectedIter::new(block.data.iter(layout), projection);
                 let mut row_index = 0;
                 while let Some(row) = rows.next() {
                     for (index, field) in fields.iter().enumerate() {
@@ -184,7 +223,9 @@ pub fn write_recording(
                 let mut raw_row_bits = 0;
                 for (index, field) in fields.iter().enumerate() {
                     let record = field.record.map_or(&[][..], |index| records[index]);
-                    let encoding = if field.name == "start_ts" {
+                    let encoding = if field.alias.is_some() {
+                        "alias"
+                    } else if field.name == "start_ts" {
                         if block.data.metadata.timestamp_stride.to_u64() == 0 {
                             "offset"
                         } else {
@@ -199,6 +240,22 @@ pub fn write_recording(
                         }
                     } else {
                         encoding(record)
+                    };
+                    // Projection decodes ZigZag for the logical baselines above;
+                    // label the physical transform even when no codec was fitted.
+                    let zigzag = projection.is_some_and(|p| {
+                        p.fields
+                            .iter()
+                            .any(|f| f.logical.range() == field.range && f.signed)
+                    });
+                    let encoding = if zigzag && field.alias.is_none() {
+                        if encoding == "raw" {
+                            "zigzag".to_owned()
+                        } else {
+                            format!("zigzag+{encoding}")
+                        }
+                    } else {
+                        encoding.to_owned()
                     };
                     let identity = [
                         run.to_owned(),
@@ -238,8 +295,9 @@ pub fn write_recording(
                             identity.iter().chain(cells.iter()).chain(source.iter()),
                         )
                     };
-                    let retained_width = field.range.len();
-                    let retained_bits: usize = frame.mask()[field.range.clone()]
+                    let retained_range = field.stored.clone().unwrap_or(0..0);
+                    let retained_width = retained_range.len();
+                    let retained_bits: usize = frame.mask()[retained_range]
                         .iter()
                         .map(|byte| {
                             if cfg!(feature = "bit-compression") {
@@ -260,6 +318,9 @@ pub fn write_recording(
                         field.raw_width * 8,
                         field.raw_width * 8,
                     )?;
+                    if let Some(source) = field.alias {
+                        emit("alias_source", Some(source), 0, 0, 0, 0)?;
+                    }
                     emit("mask", None, 0, retained_width * 8, field.raw_width * 8, 0)?;
                     emit(
                         "varying_rows",
@@ -423,7 +484,14 @@ mod tests {
                     span.follows_from(predecessor.id());
                     span.record("later", row);
                     let _entered = span.enter();
-                    tracing::info!(value = row % 17, flag = row % 2 == 0);
+                    // Aliases keep logical value counts but must not repeat
+                    // physical bytes in the reconciliation below.
+                    tracing::info!(
+                        value = row % 17,
+                        copy = row % 17,
+                        flag = row % 2 == 0,
+                        signed = if row % 2 == 0 { 1i64 } else { -1i64 }
+                    );
                 }
             },
         );
@@ -453,15 +521,28 @@ mod tests {
         write_recording(&mut output, "unit", &recorder, None).unwrap();
         assert_eq!(snapshot(), before);
         let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("\"alias\""));
         let mut retained = 0;
+        let mut signed_seen = false;
         for row in text.lines().skip(1) {
             // Fixture source labels intentionally contain no commas or line breaks.
             let cells: Vec<_> = row.split(',').map(|cell| cell.trim_matches('"')).collect();
             assert_eq!(cells.len(), 18);
             assert!(!cells[1].is_empty(), "every leaf retains its callsite");
             assert_ne!(cells[8], "total");
+            if cells[4] == "field.signed" && cells[8] == "varying_rows" {
+                // Keep the baseline in logical two's-complement form even
+                // though retained columns use ZigZag before any fitted codec.
+                assert!(cells[7].starts_with("zigzag"));
+                assert_eq!(
+                    cells[12].parse::<usize>().unwrap(),
+                    cells[10].parse::<usize>().unwrap() * 63
+                );
+                signed_seen = true;
+            }
             retained += cells[11].parse::<usize>().unwrap();
         }
+        assert!(signed_seen);
         assert_eq!(retained, before.0);
     }
 }

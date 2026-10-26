@@ -117,8 +117,11 @@ impl PerCallsiteData {
                 (id.callsite, id.archetype, id.index) == (span.callsite, span.archetype, span.index)
             };
             if let Some(frame) = update.data.ring.get(block) {
-                let layout = update.archetype.column_layout();
-                let dictionary = frame.data.parent_offsets(&layout);
+                let fallback = update.archetype.column_layout();
+                let layout = update
+                    .data
+                    .columns_for_block(update.data.offset + block, &fallback);
+                let dictionary = frame.data.parent_offsets(layout);
                 let mut rows = ArchivedFrameIter::new(&frame.data.frame);
                 let mut index = 0;
                 while let Some(row) = rows.next() {
@@ -170,12 +173,16 @@ impl PerCallsiteData {
                 .data
                 .ring
                 .iter()
-                .map(|b| {
+                .enumerate()
+                .map(|(ordinal, b)| {
                     (
                         b.data.frame.len(),
                         &b.descriptor,
                         &b.data.metadata,
-                        b.data.parent_offsets(&columns),
+                        b.data.parent_offsets(
+                            arch.data
+                                .columns_for_block(arch.data.offset + ordinal, &columns),
+                        ),
                     )
                 })
                 .chain(std::iter::once((

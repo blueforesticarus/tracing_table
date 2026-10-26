@@ -11,6 +11,15 @@ arguments, and adjacent placeholders. This also supports formatted span fields
 and deferred updates. Primitive widths and `f32` identity remain in the recipe.
 The vendored `log` macros use the same inspectable path at every native log level.
 
+Logical `f64` fields and format arguments optimistically use four-byte `f32`
+payloads. The first value whose `f64 -> f32 -> f64` round trip changes any bits
+promotes that column to eight bytes, rebuilding the active block through the
+same layout history as integer widening. Previously archived blocks retain their
+layouts; reads still return the original `f64` type and bits. Signed zero and
+NaN payloads are checked bitwise. Disable this optimization with
+`LayoutPolicy::floats = false`, `--float-widths off` in storage/column reports,
+or `FLOAT_WIDTHS=off` when running `make storage-csv`.
+
 The default `tracing_patched` feature avoids scanner/source lookup for directly
 captured formats. Prebuilt `fmt::Arguments` resolve a vendor template lazily on
 their first rendered message. Compatibility events built from preexisting
@@ -1148,3 +1157,78 @@ the usize issues is less relevant: yes a usize of 0 gets stored as 8 bytes, but 
 
 # implement dictionary, offset, stride, cycles in unified way for all columns.
 bring back in changes from experiment/numeric-u16-2026-10-24
+
+strangely does not improve storage. perhaps encoding gains eaten by overhead.
+
+not going to look into this untill the code is cleaned up.
+
+---
+
+signed int stored zigzag
+- doesnt seem to be a problem currently why?
+  - because nothing stores non-constant signed ints -> added one to capture_actix (-1 or 1)
+  - ALSO auto solved by min+residual encoding selection
+
+| Configuration | Selected encoding | Storage | Bits/value |
+|---|---|---:|---:|
+| Integer narrowing enabled | Offset + ZigZag | 1,977.75 bytes | **2.028** |
+| Full-width i64 | Offset + ZigZag | 4,014.875 bytes | **4.118** |
+
+> Your concern shows up in raw bit compaction: +1 and -1 differ in 63 bits, so it saves almost nothing alone. Offset + ZigZag reduces the varying payload to 1–2 bits/value; first values, masks, and metadata account for the remainder. No dictionary was selected.
+
+switched to default encoding to zigzag for the hell of it anyway. 
+also fixed a bug with encoding selection heuristic
+
+> The ±1 column now selects ZigZag + offset: 2.317 → 1.525 bits/value, saving 34.2%.
+
+---
+
+duplicate columns: used in template and stored as fields
+- ex) /home/user/files/projects/dev/util/tracing_table/examples/bevy_capture/src/workload.rs
+```
+tracing::trace!(
+    entity, sample, /* other fields */
+    "entity {entity} transform sample {sample}"
+);
+```
+- store with single column, optimistically, promote whole active block to new format when assumption is invalidated. 
+
+| Capture | Feature | Archived saved | Active saved |
+|---|---|---:|---:|
+| Bevy | Sharing | 27,182 B | 456 B |
+| Bevy | Narrow integers | 27,589 B | 2,532 B |
+| Actix | Sharing | 3,436 B | −252 B |
+| Actix | Narrow integers | 167,172 B | 420 B |
+
+| Capture | Alias relationships | Across archetypes | Archived block-column instances | Aliased archived values |
+|---|---:|---:|---:|---:|
+| Bevy | **11** | 8 | 257 | 25,353 |
+| Actix | **1** | 1 | 27 | 3,672 |
+
+---
+
+Mon Oct 26 05:53:21 AM EDT 2026
+
+choose stride by picking minimum residual 
+
+> Overall timestamp storage fell 1.70% for Bevy and 1.24% for Actix. Fifteen Bevy callsites regressed slightly: smaller maximum residuals can still produce wider packing masks.
+
+actually choose stride minimizing mask
+
+> Scores actual masks for up to 64 candidates, plus minimax seed computation.
+> Always includes endpoint fitting, preventing mask-size regressions.
+> Supports bit and byte packing.
+> Timestamp storage savings versus endpoint: 2.81% Bevy, 9.93% Actix, with zero callsite regressions. All 114 tests pass in both packing configurations.
+
+Using float_u16 for stride loses only 72 B in bevy capture (from imprecision, compared to full u64). while saving 27,566 B of overhead.
+
+# delta encoding ts
+delta or delta of delta encoding ts could reduce size more than stride
+
+| Encoding | Bevy | Actix |
+|---|---:|---:|
+| Delta: store adjacent gaps | −6.05% | −14.16% |
+| Delta-of-delta: store gap changes¹ | +0.06% | −8.72% |
+| Choose current/delta per block | −6.12% | −14.23% |
+
+conclusion: not worth it

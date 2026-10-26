@@ -88,13 +88,18 @@ pub struct PerCallsiteData {
 }
 
 impl PerCallsiteData {
-    fn get_arch(&mut self, min_rows: usize) -> usize {
+    fn get_arch(
+        &mut self,
+        min_rows: usize,
+        policy: crate::data::column::physical::LayoutPolicy,
+    ) -> usize {
         let archetype = &self.last_archetype; //aliased mutability issue with structs needs to be fixed. 
-        let unit = archetype.unit();
 
         let i = match self.lookup.get(archetype) {
             Some(i) => *i,
             None => {
+                let physical = archetype.physical_layout_with_policy(policy);
+                let unit = physical.unit();
                 // The schema is fixed: reserve its worst-case string entries once.
                 let strings_per_row = archetype
                     .field_types
@@ -111,9 +116,11 @@ impl PerCallsiteData {
                 let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit).max(min_rows).max(1);
                 let i = self.cache.len();
                 self.lookup.insert(archetype.clone(), i);
+                let mut data = BlockCache::new(unit, 1, cap);
+                data.configure_layout(physical, cap);
                 self.cache.push(
                     PerArchData {
-                        data: BlockCache::new(unit, 1, cap),
+                        data,
                         strings: BufferCollection::default(),
                         chunk_string_start: 0,
                         strings_per_row,
@@ -342,6 +349,8 @@ pub struct RecordingLayer {
     /// Optional row floor over the byte target; zero disables it (default).
     /// Initialized from MESSAGE_BLOCK_MIN_ROWS; configure before recording.
     pub message_block_min_rows: usize,
+    /// Configure before recording; independent switches support replay ablations.
+    pub layout_policy: crate::data::column::physical::LayoutPolicy,
 
     /// Retained chunk/string storage limits in bytes; active storage is protected.
     pub global_memory_cap: usize,
@@ -379,6 +388,7 @@ impl RecordingLayer {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed)),
+            layout_policy: Default::default(),
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
@@ -621,6 +631,77 @@ pub struct Archetype {
 }
 
 impl Archetype {
+    /// Physical history belongs to this archetype's BlockCache, outside its hash
+    /// identity. Logical kinds continue to drive public values and Format recipes.
+    pub fn physical_layout(&self) -> crate::data::column::physical::PhysicalLayout {
+        self.physical_layout_with_policy(Default::default())
+    }
+    fn physical_layout_with_policy(
+        &self,
+        policy: crate::data::column::physical::LayoutPolicy,
+    ) -> crate::data::column::physical::PhysicalLayout {
+        use crate::data::column::physical::{Field, PhysicalLayout};
+        let payload: usize = self
+            .field_types
+            .iter()
+            .flatten()
+            .map(ValueKind::unit)
+            .sum::<usize>()
+            + self.template.unwrap_or(0) * self.string_storage.unit();
+        let header = self.unit() - payload;
+        let mut offset = header;
+        let mut fields = SmallVec::new();
+        let kinds =
+            self.field_types
+                .iter()
+                .flatten()
+                .cloned()
+                .chain(
+                    (0..self.template.unwrap_or(0)).map(|_| match self.string_storage {
+                        StringStorage::Index => ValueKind::BufferIndex,
+                        StringStorage::Offset => ValueKind::BufferOffset,
+                    }),
+                );
+        for kind in kinds {
+            let logical = ColumnLayout::new(offset, kind.unit(), kind == ValueKind::BufferIndex);
+            let signed = matches!(
+                kind,
+                ValueKind::I8
+                    | ValueKind::I16
+                    | ValueKind::I32
+                    | ValueKind::I64
+                    | ValueKind::I128
+                    | ValueKind::Isize
+            );
+            let integer = signed
+                || matches!(
+                    kind,
+                    ValueKind::U8
+                        | ValueKind::U16
+                        | ValueKind::U32
+                        | ValueKind::U64
+                        | ValueKind::U128
+                        | ValueKind::Usize
+                );
+            fields.push(Field {
+                logical,
+                stored: logical,
+                source: fields.len().try_into().expect("too many columns"),
+                family: kind.clone() as u8,
+                signed,
+                integer,
+                float64: kind == ValueKind::F64,
+            });
+            offset += kind.unit();
+        }
+        PhysicalLayout::new(
+            header,
+            self.unit(),
+            !self.is_span_end && !self.is_event,
+            fields,
+            policy,
+        )
+    }
     /// Caller-owned layout is rebuilt at block boundaries/traversal, never stored per block.
     pub fn column_layout(&self) -> SmallVec<[ColumnLayout; 8]> {
         let args = self.template.unwrap_or(0);
@@ -885,7 +966,7 @@ impl RecordingLayer {
         site.last_archetype.is_span_end = false;
         site.last_archetype.is_event = is_event;
         let callsite = site.id;
-        let index = site.get_arch(self.message_block_min_rows);
+        let index = site.get_arch(self.message_block_min_rows, self.layout_policy);
         let arch = &mut site.cache[index];
         let allocated = arch.prepare_chunk(self.string_compression_level);
         // Rollover has finished; intern into the dictionary for this exact row.
@@ -903,14 +984,10 @@ impl RecordingLayer {
                 offset,
             )
         });
-        let (bytes, index, timestamp_offset) = arch.data.allocate_timestamp(time.value);
-        let id = SpanId {
-            index: index as u64,
-            callsite: callsite as u32,
-            archetype: arch.id,
-        };
-        let mut packer = BytePacker::new(bytes);
-        packer.write_any_value(timestamp_offset, false);
+        // Build one logical row, then refine sharing/widths before allocation.
+        let mut logical = SmallVec::<[u8; 256]>::from_elem(0, arch.archetype.unit());
+        let mut packer = BytePacker::new(&mut logical);
+        packer.write_any_value(0u64, false);
         if is_event {
             // Same-archetype runs already have row order; count only transitions
             // within a shifted tick. Keep the full callsite ID (event IDs exceed u32).
@@ -933,16 +1010,27 @@ impl RecordingLayer {
             packer.write_any_value(table_index, false);
         }
         let fields = &mut site.field_value_scratchpad;
-        fields.write(&mut packer, &mut arch.strings.active);
-        if let Some(count) = arch.archetype.template {
-            for argument in &fields.template_args[..count] {
-                packer.write_any_value(
-                    site.string_storage
-                        .intern(&mut arch.strings.active, argument),
-                    false,
-                );
-            }
-        }
+        fields.write(
+            &mut packer,
+            &mut arch.strings.active,
+            arch.archetype.template.unwrap_or(0),
+        );
+        arch.data.promote(&logical, self.message_block_min_rows);
+        let mut physical = if let Some(projection) = arch.data.layouts.last() {
+            let mut physical = SmallVec::<[u8; 256]>::from_elem(0, projection.unit());
+            projection.pack(&logical, &mut physical);
+            physical
+        } else {
+            logical.clone()
+        };
+        let (bytes, index, timestamp_offset) = arch.data.allocate_timestamp(time.value);
+        physical[..8].copy_from_slice(&timestamp_offset.to_ne_bytes());
+        bytes.copy_from_slice(&physical);
+        let id = SpanId {
+            index: index as u64,
+            callsite: callsite as u32,
+            archetype: arch.id,
+        };
         arch.data.update_mask_after_append();
         arch.data.update_ts_range(time.value as usize, None);
         drop(guard);
@@ -991,7 +1079,7 @@ impl RecordingLayer {
             callsite_data.last_archetype.is_event = false;
             callsite_data.last_archetype.parent = false;
 
-            let arch = callsite_data.get_arch(self.message_block_min_rows);
+            let arch = callsite_data.get_arch(self.message_block_min_rows, self.layout_policy);
             let arch = &mut callsite_data.cache[arch];
 
             allocated = arch.prepare_chunk(self.string_compression_level);
@@ -1009,8 +1097,8 @@ impl RecordingLayer {
                     crate::data::blockbuffer::ParentOffsets::ROW_BYTES,
                 )
             });
-            let (data, _index, _) = arch.data.allocate(time.value);
-            let mut data = BytePacker::new(data);
+            let mut logical = SmallVec::<[u8; 256]>::from_elem(0, arch.archetype.unit());
+            let mut data = BytePacker::new(&mut logical);
             data.write_any_value(target.0, false);
             data.write_any_value(target.1, false);
             if let Some((residual, key)) = follows {
@@ -1019,8 +1107,17 @@ impl RecordingLayer {
             }
             // Transfer values into the row, interning strings in this chunk's buffer.
             if let Some(fields) = fields {
-                fields.write(&mut data, &mut arch.strings.active);
+                fields.write(&mut data, &mut arch.strings.active, 0);
             }
+            arch.data.promote(&logical, self.message_block_min_rows);
+            let physical = if let Some(projection) = arch.data.layouts.last() {
+                let mut physical = SmallVec::<[u8; 256]>::from_elem(0, projection.unit());
+                projection.pack(&logical, &mut physical);
+                physical
+            } else {
+                logical.clone()
+            };
+            arch.data.allocate(time.value).0.copy_from_slice(&physical);
             arch.data.update_mask_after_append();
             arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
@@ -1037,17 +1134,18 @@ impl RecordingLayer {
             let columns = arch.archetype.column_layout();
             let data = &mut arch.data;
             // A long-lived span may close after its start chunk has been evicted.
-            let retained =
-                if let Some((descriptor, mut row)) = data.get_mut(id.index as usize, &columns) {
-                    let start = row.decode_timestamp(descriptor);
-                    let mut packer = BytePacker::new(row.get_mut());
-                    packer.skip::<PackedTimestamp>(false);
-                    // Bias the duration so a zero-tick closed span differs from an open span.
-                    packer.write_any_value(time.value - start + 1, false);
-                    true
-                } else {
-                    false
-                };
+            let retained = if let Some((descriptor, mut row)) =
+                data.get_mut_physical(id.index as usize, &columns)
+            {
+                let start = row.decode_timestamp(descriptor);
+                let mut packer = BytePacker::new(row.get_mut());
+                packer.skip::<PackedTimestamp>(false);
+                // Bias the duration so a zero-tick closed span differs from an open span.
+                packer.write_any_value(time.value - start + 1, false);
+                true
+            } else {
+                false
+            };
             if retained {
                 if let Some(reference) = extra_fields {
                     data.add_span_fields_ref(id.index as usize, reference);
@@ -1116,20 +1214,37 @@ impl FieldValues {
     }
     /// Events, span starts and deferred updates share reference encoding.
     /// Scratch strings stay textual until the destination buffer is selected.
-    fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer) {
+    fn write(&mut self, packer: &mut BytePacker<'_>, buffer: &mut Buffer, args: usize) {
+        // Even strings above the buffer's dedup cutoff can share within one row.
+        let mut strings = SmallVec::<[(&str, ValueData); 8]>::new();
+        let mut intern = |text: &str| self.string_storage.intern(buffer, text);
         for (index, field) in self.values.iter_mut().enumerate() {
             if let Some(value) = field.take() {
                 let value = match value {
-                    ValueData::BufferOffset(_) => {
-                        StringStorage::Offset.intern(buffer, &self.strings[index])
-                    }
-                    ValueData::BufferIndex(_) => {
-                        StringStorage::Index.intern(buffer, &self.strings[index])
+                    ValueData::BufferOffset(_) | ValueData::BufferIndex(_) => {
+                        let text = self.strings[index].as_str();
+                        if let Some((_, value)) = strings.iter().find(|(s, _)| *s == text) {
+                            *value
+                        } else {
+                            let value = intern(text);
+                            strings.push((text, value));
+                            value
+                        }
                     }
                     value => value,
                 };
                 packer.write_any_value(value, false);
             }
+        }
+        for argument in &self.template_args[..args] {
+            let value = if let Some((_, value)) = strings.iter().find(|(s, _)| *s == argument) {
+                *value
+            } else {
+                let value = intern(argument);
+                strings.push((argument.as_str(), value));
+                value
+            };
+            packer.write_any_value(value, false);
         }
     }
     fn record(&mut self, record: impl FnOnce(&mut ValueRecorder<'_>)) {
@@ -1371,6 +1486,78 @@ mod test {
 
     fn timestamp(value: u64) -> super::Time {
         super::Time { value, shift: 0 }
+    }
+
+    #[test]
+    fn promoted_span_payloads_preserve_ids_strings_and_late_closes() {
+        use super::{InputValue, StringStorage};
+        use tracing_core::{Callsite, field::Visit};
+        let metadata = tracing::callsite!(
+            name: "promoted payload", kind: tracing_core::Kind::SPAN,
+            fields: left, right, text, copy
+        )
+        .metadata();
+        let fields: Vec<_> = metadata.fields().iter().collect();
+        // Above the buffer dedup cutoff, equality still needs one reference per
+        // row. Exercise both reference formats and archived/active span closes.
+        let text = "x".repeat(crate::data::stringbuffer::Buffer::MAX_STRING_LENGTH + 1);
+        for storage in [StringStorage::Index, StringStorage::Offset] {
+            let mut recorder = RecordingLayer::new();
+            recorder.string_storage = storage;
+            recorder.global_memory_cap = usize::MAX;
+            recorder.callsite_memory_cap = usize::MAX;
+            let values = [
+                (1, 1, text.as_str()),
+                (2, 2, text.as_str()),
+                (1u64 << 40, 3, "different"),
+            ];
+            let mut ids = Vec::new();
+            for (index, &(left, right, copy)) in values.iter().enumerate() {
+                ids.push(recorder.record_start(
+                    metadata,
+                    timestamp(100 + index as u64),
+                    None,
+                    false,
+                    |v| {
+                        v.record_u64(&fields[0], left);
+                        v.record_u64(&fields[1], right);
+                        v.record_str(&fields[2], &text);
+                        v.record_str(&fields[3], copy);
+                    },
+                ));
+                if index == 0 {
+                    let shared = recorder.callsites.read().values().next().unwrap().clone();
+                    let mut site = shared.write();
+                    let arch = &mut site.cache[0];
+                    assert_eq!(arch.data.layouts[0].fields[1].source, 0);
+                    assert_eq!(arch.data.layouts[0].fields[3].source, 2);
+                    assert_eq!(arch.strings.active.len(), 1);
+                    let columns = arch.archetype.column_layout();
+                    arch.data.cycle_with_columns(&columns);
+                }
+            }
+            for &id in &ids {
+                recorder.close_span(metadata, id, timestamp(200), None, None);
+            }
+            let shared = recorder.callsites.read().values().next().unwrap().clone();
+            let site = shared.read();
+            assert_eq!(site.cache.len(), 1);
+            assert_eq!(site.cache[0].data.layouts.len(), 2);
+            site.visit_rows(|row| {
+                let index = (row.index - 1) as usize;
+                assert_eq!(row.span.unwrap().index, ids[index].index);
+                assert_eq!(row.end_timestamp, Some(200));
+                assert_eq!(
+                    row.fields,
+                    vec![
+                        Some(InputValue::U64(values[index].0)),
+                        Some(InputValue::U64(values[index].1)),
+                        Some(InputValue::Text(text.clone())),
+                        Some(InputValue::Text(values[index].2.into())),
+                    ]
+                );
+            });
+        }
     }
 
     #[test]
@@ -1632,7 +1819,7 @@ mod test {
         // Fill an archived block even when the configured target grows. The
         // fixed template has the smallest row: timestamp/index, count and tail offset.
         let pairs = super::MESSAGE_BLOCK_TARGET_SIZE
-            / (size_of::<super::PackedTimestamp>() + size_of::<u16>() + 8 + 4)
+            / (size_of::<super::PackedTimestamp>() + size_of::<u16>() + 2 + 4)
             + 1;
         for format in ["hello {name} {}!", "fixed"] {
             // Keep this offset-specific contract explicit as the default is indexed.
@@ -1689,7 +1876,10 @@ mod test {
                         + 4
                         + arg_count * size_of::<u32>()
                 );
-                assert_eq!(matched.data.active.unit, matched.archetype.unit());
+                assert_eq!(
+                    matched.data.active.unit,
+                    matched.data.layouts.last().unwrap().unit()
+                );
                 assert!(!matched.data.ring.is_empty()); // Exercise compressed chunks too.
                 (matched.id, arg_count)
             };

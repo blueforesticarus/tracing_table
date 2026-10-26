@@ -461,6 +461,7 @@ mod tests {
                         },
                         index,
                         frame: AnyFrame::BitCompact(&mut compact),
+                        projection: None,
                     };
                     assert_eq!(row.get_mut(), &expected[index]);
                     row.get_mut()[byte] ^= change;

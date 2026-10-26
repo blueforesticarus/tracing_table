@@ -37,8 +37,11 @@ capture-bevy:
 FORMAT_ARGS ?= on
 TEMPLATES ?= on
 MIN_BLOCK_ROWS ?= 0
+COLUMN_SHARING ?= on
+INTEGER_WIDTHS ?= on
+FLOAT_WIDTHS ?= on
 storage-csv:
-	cargo bench --offline --bench archived_storage -- --format-args $(FORMAT_ARGS) --templates $(TEMPLATES) --min-block-rows $(MIN_BLOCK_ROWS) > doc/reference_archived_storage.csv.tmp
+	cargo bench --offline --bench archived_storage -- --format-args $(FORMAT_ARGS) --templates $(TEMPLATES) --min-block-rows $(MIN_BLOCK_ROWS) --column-sharing $(COLUMN_SHARING) --integer-widths $(INTEGER_WIDTHS) --float-widths $(FLOAT_WIDTHS) > doc/reference_archived_storage.csv.tmp
 	mv doc/reference_archived_storage.csv.tmp doc/reference_archived_storage.csv
 
 storage-charts: storage-csv

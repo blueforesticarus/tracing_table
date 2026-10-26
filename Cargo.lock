@@ -685,10 +685,8 @@ dependencies = [
 name = "tracing"
 version = "0.1.44"
 dependencies = [
- "introspect-fmt",
  "pin-project-lite",
  "tracing-attributes",
- "tracing-callsite-source",
  "tracing-core",
 ]
 

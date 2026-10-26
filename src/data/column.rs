@@ -3,6 +3,7 @@
 use smallvec::SmallVec;
 
 use super::{blockbuffer::ArchivedFrame, dataframe::Frame, util::float_u16::FloatU16};
+pub mod physical;
 
 /// Tuning bounds fitting work and dictionary metadata; neither is a wire capacity.
 pub const MAX_DICTIONARY_VALUES: usize = 64;
@@ -11,6 +12,15 @@ pub const MAX_CYCLE: u8 = 255;
 pub const MAX_CYCLE_CANDIDATES: usize = 4;
 pub const MIN_ENCODING_SAVINGS: usize = 8;
 const CYCLE_ANCHORS: usize = 8;
+
+/// Tuning: minimize actual packed timestamp mask cost with a bounded search.
+/// Disable both search flags to restore the original endpoint-only fit.
+pub const TIMESTAMP_MASK_STRIDE: bool = true;
+/// Maximum mask-scoring passes per block (at least one for the endpoint baseline).
+pub const TIMESTAMP_MASK_CANDIDATES: usize = 64;
+/// Seed mask search with minimax; also selects minimax when mask search is off.
+/// Computing this seed adds about 18 scans, only when archiving.
+pub const TIMESTAMP_MINIMAX_STRIDE: bool = true;
 
 /// Supplied by the caller, never copied into each block or its footer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +40,7 @@ impl Layout {
             strings,
         }
     }
-    fn range(self) -> std::ops::Range<usize> {
+    pub fn range(self) -> std::ops::Range<usize> {
         let start = usize::from(self.offset);
         start..start + usize::from(self.width)
     }
@@ -121,18 +131,190 @@ pub(crate) fn rewrite(
     write_word(&mut frame.buffer[layout.range()], mask);
 }
 
-/// Timestamp starts retain unsigned offsets when flat or outside the coefficient
-/// range. Fit only their immutable starts, never late close/range-end values.
+/// Measure ordinary absolute time errors, using the decoder's exact rounding.
+/// Underprediction falls monotonically with stride; overprediction rises.
+fn timestamp_errors(frame: &Frame, stride: FloatU16) -> (u64, u64) {
+    let mut under = 0;
+    let mut over = 0;
+    for (row, bytes) in frame.buffer[frame.unit..(frame.length + 1) * frame.unit]
+        .chunks_exact(frame.unit)
+        .enumerate()
+    {
+        let value = read_word(&bytes[..8]) as u64;
+        let predicted = advance(stride.to_u64(), row, frame.length);
+        under = under.max(value.saturating_sub(predicted));
+        over = over.max(predicted.saturating_sub(value));
+    }
+    (under, over)
+}
+
+/// Search ordered FloatU16 codes directly so quantization is part of the fit.
+/// The minimum of max(under, over) lies on either side of their crossing.
+fn minimax_timestamp_stride(frame: &Frame) -> FloatU16 {
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let (under, over) = timestamp_errors(frame, FloatU16::from_bits(mid));
+        if under > over {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let upper = FloatU16::from_bits(low);
+    let lower = FloatU16::from_bits(low.saturating_sub(1));
+    let score = |stride| {
+        let (under, over) = timestamp_errors(frame, stride);
+        under.max(over)
+    };
+    // Prefer the smaller coefficient when neighboring fits tie.
+    if score(lower) <= score(upper) {
+        lower
+    } else {
+        upper
+    }
+}
+
+/// Match the archive's mask exactly, including zero's unsigned-offset encoding.
+fn timestamp_mask(frame: &Frame, stride: FloatU16) -> u64 {
+    let mut first = 0;
+    let mut mask = 0;
+    for (row, bytes) in frame.buffer[frame.unit..(frame.length + 1) * frame.unit]
+        .chunks_exact(frame.unit)
+        .enumerate()
+    {
+        let value = read_word(&bytes[..8]);
+        let encoded = if stride.to_u64() == 0 {
+            value as u64
+        } else {
+            residual(
+                value,
+                u128::from(advance(stride.to_u64(), row, frame.length)),
+                8,
+            ) as u64
+        };
+        if row == 0 {
+            first = encoded;
+        }
+        mask |= encoded ^ first;
+    }
+    mask
+}
+
+/// Bit packing stores set bits; byte packing stores whole nonzero mask bytes.
+fn timestamp_mask_cost(mask: u64) -> u32 {
+    if cfg!(feature = "bit-compression") {
+        mask.count_ones()
+    } else {
+        mask.to_ne_bytes().iter().filter(|&&byte| byte != 0).count() as u32 * 8
+    }
+}
+
+/// A bounded, deduplicated candidate list makes tuning independent of block size.
+/// Strict improvement preserves the endpoint on ties and prevents regressions.
+fn consider_timestamp_stride(
+    frame: &Frame,
+    stride: FloatU16,
+    best: &mut (FloatU16, u32),
+    seen: &mut SmallVec<[u16; 64]>,
+    budget: usize,
+) {
+    if seen.len() >= budget || best.1 == 0 || seen.contains(&stride.to_bits()) {
+        return;
+    }
+    seen.push(stride.to_bits());
+    let cost = timestamp_mask_cost(timestamp_mask(frame, stride));
+    if cost < best.1 {
+        *best = (stride, cost);
+    }
+}
+
+/// Heuristic only: mask cost is nonmonotonic, so sampled strides need not include
+/// the global optimum. Always keep the endpoint as a no-regression baseline.
+fn mask_timestamp_stride(frame: &Frame, budget: usize) -> FloatU16 {
+    let endpoint = endpoint_timestamp_stride(frame);
+    let mut best = (
+        endpoint,
+        timestamp_mask_cost(timestamp_mask(frame, endpoint)),
+    );
+    let mut seen = SmallVec::<[u16; 64]>::new();
+    seen.push(endpoint.to_bits());
+    let budget = budget.max(1);
+    if best.1 == 0 || budget == 1 {
+        return best.0;
+    }
+    consider_timestamp_stride(frame, FloatU16::default(), &mut best, &mut seen, budget);
+    let minimax = if TIMESTAMP_MINIMAX_STRIDE && best.1 != 0 && seen.len() < budget {
+        minimax_timestamp_stride(frame)
+    } else {
+        endpoint
+    };
+    consider_timestamp_stride(frame, minimax, &mut best, &mut seen, budget);
+
+    // Sample the plausible numeric slope range before a sparse global code grid.
+    let limit = endpoint
+        .to_u64()
+        .max(minimax.to_u64())
+        .saturating_mul(2)
+        .min(FloatU16::MAX);
+    for part in 1..=8 {
+        let stride = FloatU16::from_u64_lossy((u128::from(limit) * part / 8) as u64);
+        consider_timestamp_stride(frame, stride, &mut best, &mut seen, budget);
+    }
+    for part in 1..=8 {
+        let stride = FloatU16::from_bits((u32::from(u16::MAX) * part / 8) as u16);
+        consider_timestamp_stride(frame, stride, &mut best, &mut seen, budget);
+    }
+    // Refine the current winner from coarse code steps down to adjacent codes.
+    for shift in (0..=10).rev() {
+        let center = best.0.to_bits();
+        let step = 1u16 << shift;
+        for bits in [center.saturating_sub(step), center.saturating_add(step)] {
+            consider_timestamp_stride(
+                frame,
+                FloatU16::from_bits(bits),
+                &mut best,
+                &mut seen,
+                budget,
+            );
+        }
+    }
+    // Spend the remaining budget near the winner; freeze the center for coverage.
+    let center = best.0.to_bits();
+    for distance in 1..=budget.min(u16::MAX as usize) {
+        if seen.len() >= budget || best.1 == 0 {
+            break;
+        }
+        for bits in [
+            center.saturating_sub(distance as u16),
+            center.saturating_add(distance as u16),
+        ] {
+            consider_timestamp_stride(
+                frame,
+                FloatU16::from_bits(bits),
+                &mut best,
+                &mut seen,
+                budget,
+            );
+        }
+    }
+    best.0
+}
+
+/// Fit immutable starts, never late close/range-end values. Zero keeps unsigned
+/// offsets; nonzero coefficients store exact modular ZigZag residuals.
 pub(crate) fn fit_timestamp(frame: &mut Frame) -> FloatU16 {
     if frame.length < 2 {
         return FloatU16::default();
     }
-    let end = read_word(&frame.buffer[frame.length * frame.unit..frame.length * frame.unit + 8]);
-    let stride = end * frame.length as u128 / (frame.length - 1) as u128;
-    if stride > u128::from(FloatU16::MAX) {
-        return FloatU16::default();
-    }
-    let stride = FloatU16::from_u64_lossy(stride as u64);
+    let stride = if TIMESTAMP_MASK_STRIDE {
+        mask_timestamp_stride(frame, TIMESTAMP_MASK_CANDIDATES)
+    } else if TIMESTAMP_MINIMAX_STRIDE {
+        minimax_timestamp_stride(frame)
+    } else {
+        endpoint_timestamp_stride(frame)
+    };
     if stride.to_u64() != 0 {
         let length = frame.length;
         rewrite(frame, Layout::new(0, 8, false), |value, row, _| {
@@ -140,6 +322,16 @@ pub(crate) fn fit_timestamp(frame: &mut Frame) -> FloatU16 {
         });
     }
     stride
+}
+
+/// Preserve the original endpoint fit, including its out-of-range fallback.
+fn endpoint_timestamp_stride(frame: &Frame) -> FloatU16 {
+    let end = read_word(&frame.buffer[frame.length * frame.unit..frame.length * frame.unit + 8]);
+    let stride = end * frame.length as u128 / (frame.length - 1) as u128;
+    if stride > u128::from(FloatU16::MAX) {
+        return FloatU16::default();
+    }
+    FloatU16::from_u64_lossy(stride as u64)
 }
 
 pub(crate) fn read_word(bytes: &[u8]) -> u128 {
@@ -597,10 +789,17 @@ struct Candidate {
     size: usize,
 }
 impl Candidate {
-    // Later stages are more complex. Require eight bytes or 1/64 of the current
-    // allocation, whichever is larger; near ties retain the earlier simple form.
-    fn worthwhile(&self, size: usize) -> bool {
-        size.saturating_add(MIN_ENCODING_SAVINGS.max(self.size / 64)) <= self.size
+    // Scale the threshold by this column's current first/mask slots, packed
+    // values, directory byte, and codec record. Unrelated columns and shared
+    // footer bytes must not make a useful encoding harder to select.
+    fn worthwhile(&self, size: usize, cost: &Cost<'_>) -> bool {
+        let column_bytes = 2 * cost.width
+            + ((cost.frame.length - 1) * varying_bits(self.mask, cost.width)).div_ceil(8)
+            + 1
+            + self.record.len();
+        // Compare actual frame allocations to retain packing/alignment effects;
+        // only the relative savings threshold is column-local.
+        size.saturating_add(MIN_ENCODING_SAVINGS.max(column_bytes / 64)) <= self.size
     }
 
     /// Only shortlisted predictors reach this pass. Residual masks cannot be
@@ -612,7 +811,7 @@ impl Candidate {
         cost: &Cost<'_>,
         encode: impl Fn(u128, usize) -> u128,
     ) {
-        if record.len() > u8::MAX as usize || !self.worthwhile(cost.size(0, record.len())) {
+        if record.len() > u8::MAX as usize || !self.worthwhile(cost.size(0, record.len()), cost) {
             return;
         }
         let first = encode(values[0], 0);
@@ -621,7 +820,10 @@ impl Candidate {
             let previous = mask;
             mask |= encode(value, row) ^ first;
             if mask != previous
-                && !self.worthwhile(cost.size(varying_bits(mask, cost.width), record.len()))
+                && !self.worthwhile(
+                    cost.size(varying_bits(mask, cost.width), record.len()),
+                    cost,
+                )
             {
                 return;
             }
@@ -791,7 +993,7 @@ fn consider_prediction(
 
 fn select_cycles(best: &mut Candidate, values: &[u128], layout: Layout, cost: &Cost<'_>) {
     let metadata_bytes = 1 + cost.width + if layout.strings { 2 } else { 4 };
-    if !best.worthwhile(cost.size(0, metadata_bytes)) {
+    if !best.worthwhile(cost.size(0, metadata_bytes), cost) {
         return;
     }
     let periods = cycle_periods(values);
@@ -846,7 +1048,7 @@ fn select_cycles(best: &mut Candidate, values: &[u128], layout: Layout, cost: &C
 
 fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
     // The smallest dictionary has a tag, count, width and at least one entry byte.
-    if !best.worthwhile(cost.size(0, 4)) {
+    if !best.worthwhile(cost.size(0, 4), cost) {
         return;
     }
     let width = cost.width;
@@ -869,7 +1071,8 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
     let (direct_cost, entry_bits) = dictionary_cost(&unique, cost);
     let record_bytes = 3 + (unique.len() * entry_bits).div_ceil(8);
     // Even perfect key prediction must pay for the packed entries and cycle bytes.
-    if !best.worthwhile(direct_cost) && !best.worthwhile(cost.size(0, record_bytes + 2)) {
+    if !best.worthwhile(direct_cost, cost) && !best.worthwhile(cost.size(0, record_bytes + 2), cost)
+    {
         return;
     }
     if record_bytes > u8::MAX as usize {
@@ -885,7 +1088,7 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
             dictionary[3 + position / 8] |= ((((value - base) >> bit) & 1) as u8) << (position % 8);
         }
     }
-    if best.worthwhile(direct_cost) {
+    if best.worthwhile(direct_cost, cost) {
         // Discovery assigns every key in 0..K. Their union mask and packed size
         // are known exactly, so direct dictionaries need no residual trial scan.
         let key_bits = (usize::BITS - (unique.len() - 1).leading_zeros()) as usize;
@@ -896,7 +1099,7 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
         best.encoded.extend(ids.iter().map(|id| base ^ id));
     }
     // Stride and cycle keys have the same minimum metadata cost.
-    if !best.worthwhile(cost.size(0, record_bytes + 2)) {
+    if !best.worthwhile(cost.size(0, record_bytes + 2), cost) {
         return;
     }
     // Repeated runs of progressively discovered values benefit from a fractional
@@ -926,7 +1129,7 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
     dictionary[0] = DICTIONARY_CYCLE;
     dictionary.insert(3, 0);
     dictionary.insert(4, 0);
-    if !best.worthwhile(cost.size(0, dictionary.len())) {
+    if !best.worthwhile(cost.size(0, dictionary.len()), cost) {
         return;
     }
     for period in cycle_periods(&ids) {

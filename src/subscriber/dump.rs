@@ -714,6 +714,7 @@ pub struct ReplayOptions {
     pub format_args: bool,
     pub extract_templates: bool,
     pub string_storage: super::StringStorage,
+    pub layout_policy: crate::data::column::physical::LayoutPolicy,
 }
 impl Default for ReplayOptions {
     fn default() -> Self {
@@ -721,6 +722,7 @@ impl Default for ReplayOptions {
             format_args: true,
             extract_templates: true,
             string_storage: super::StringStorage::default(),
+            layout_policy: Default::default(),
         }
     }
 }
@@ -996,8 +998,10 @@ impl Fixture {
             format_args,
             extract_templates,
             string_storage,
+            layout_policy,
         } = options;
         let mut recorder = RecordingLayer::new();
+        recorder.layout_policy = layout_policy;
         recorder.string_storage = string_storage;
         recorder.timestamp_bit_shift = self.timestamp_bit_shift;
         recorder.system_time = UNIX_EPOCH

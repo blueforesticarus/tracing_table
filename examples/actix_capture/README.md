@@ -20,6 +20,12 @@ Some requests produce intentional inventory conflicts (409) and upstream errors
 (503); the driver checks every response status and consumes every body.
 There are no external databases, queues, or services.
 
+Each `work batch transformed` event also records `signed_unit: i64`, either
+`1` or `-1` according to the checksum's high bit. This exercises mixed-sign
+integer compression without imposing a simple alternating cycle. Use the
+`column_metrics` example on the resulting dump to inspect its selected encoding
+and archived storage; `TRACING_CAPTURE_MIB` controls the sample size.
+
 The recorded timeline spans approximately **10 minutes** without waiting that
 long. The driver advances the capture clock between drained request batches,
 distributing idle gaps according to progress toward the byte target. It waits

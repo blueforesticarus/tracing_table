@@ -152,10 +152,29 @@ pub struct Row<'a> {
     pub buffer: RowBuffer<'a>,
     pub index: usize,
     pub frame: AnyFrame<'a>,
+    pub projection: Option<&'a super::column::physical::PhysicalLayout>,
 }
 
 impl<'a> Row<'a> {
     pub fn get_mut<'b>(&'b mut self) -> &'b mut [u8] {
+        if let Some(projection) = self.projection {
+            let output = self.buffer.get_or_init(projection.logical_unit());
+            if !self.init {
+                let mut physical = smallvec::SmallVec::<[u8; 256]>::from_elem(0, projection.unit());
+                match &self.frame {
+                    AnyFrame::Frame(frame) => physical.copy_from_slice(
+                        &frame.buffer[(self.index + 1) * frame.unit..(self.index + 2) * frame.unit],
+                    ),
+                    AnyFrame::Archived(block, columns) => {
+                        block.read_row(self.index, &mut physical, columns)
+                    }
+                    _ => unreachable!(),
+                }
+                projection.unpack(&physical, output);
+                self.init = true;
+            }
+            return output;
+        }
         match &mut self.frame {
             AnyFrame::Frame(frame) => {
                 let index = (1 + self.index) * frame.unit;
@@ -238,11 +257,53 @@ impl StreamingIterator for ArchivedBlockIter<'_> {
 // when the row is dropped we have to write the scratchpad back to frame storage (if it exists)
 impl<'a> Drop for Row<'a> {
     fn drop(&mut self) {
+        if let Some(projection) = self.projection {
+            if self.init {
+                let mut physical = smallvec::SmallVec::<[u8; 256]>::from_elem(0, projection.unit());
+                projection.pack(&self.buffer, &mut physical);
+                self.frame.write_row(self.index, &physical);
+            }
+            return;
+        }
         match &mut self.frame {
             AnyFrame::Frame(frame) => frame.update_mask(self.index, true),
             frame if self.init => frame.write_row(self.index, &self.buffer),
             _ => {}
         }
+    }
+}
+
+/// A layout is borrowed from archetype history, never retained by a block.
+pub struct ProjectedIter<'a, I> {
+    inner: I,
+    projection: Option<&'a super::column::physical::PhysicalLayout>,
+    row: smallvec::SmallVec<[u8; 256]>,
+}
+impl<'a, I> ProjectedIter<'a, I> {
+    pub fn new(inner: I, projection: Option<&'a super::column::physical::PhysicalLayout>) -> Self {
+        Self {
+            inner,
+            projection,
+            row: smallvec::SmallVec::from_elem(0, projection.map_or(0, |p| p.logical_unit())),
+        }
+    }
+}
+impl<I: StreamingIterator<Item = [u8]>> StreamingIterator for ProjectedIter<'_, I> {
+    type Item = [u8];
+    fn advance(&mut self) {
+        self.inner.advance();
+        if let (Some(p), Some(row)) = (self.projection, self.inner.get()) {
+            p.unpack(row, &mut self.row);
+        }
+    }
+    fn get(&self) -> Option<&[u8]> {
+        self.inner.get().map(|row| {
+            if self.projection.is_some() {
+                self.row.as_slice()
+            } else {
+                row
+            }
+        })
     }
 }
 
@@ -1047,6 +1108,7 @@ mod test {
                     buffer: RowBuffer::Owned(Box::default()),
                     index,
                     frame: AnyFrame::Compact(&mut compact),
+                    projection: None,
                 };
                 assert_eq!(row.get_mut(), &expected[index]);
                 row.get_mut()[byte] ^= change;

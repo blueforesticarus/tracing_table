@@ -125,9 +125,13 @@ fn compute(id: u64, settings: Workload) -> u64 {
                     .wrapping_mul(6364136223846793005),
             );
         }
+        // Mixed signs exercise two's-complement compression. Checksum-derived
+        // signs avoid a trivial alternating cycle; keep the recorded type i64.
+        let signed_unit: i64 = if checksum & (1 << 63) == 0 { 1 } else { -1 };
         tracing::trace!(
             batch,
             checksum,
+            signed_unit,
             items = settings.cpu_rounds,
             "work batch transformed"
         );

@@ -138,6 +138,63 @@ fn near_ties_keep_raw_but_larger_savings_pay_for_an_origin() {
 }
 
 #[test]
+fn small_column_savings_are_independent_of_unrelated_payload_and_footer() {
+    // These are the physical ZigZag values for {-1, +1}. Offset fitting saves
+    // one varying bit per tail row, enough to pay for its three-byte record.
+    // Adding a large noisy neighbor or shared footer must not raise its bar.
+    let values = irregular(2, 120, 1, 1);
+    let column = Layout::new(0, 2, false);
+    for noise_bytes in [0, 128] {
+        let mut frame = Frame::new(2 + noise_bytes, values.len());
+        let mut state = 7u64;
+        for &value in &values {
+            let mut row = vec![0; frame.unit];
+            write_word(&mut row[..2], value);
+            for byte in &mut row[2..] {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *byte = (state >> 32) as u8;
+            }
+            frame.push(&row);
+        }
+        for footer in [1, 4097] {
+            let selected = select(&values, column, &frame, footer);
+            // Byte compaction cannot remove a single varying bit, so retains raw.
+            let expected = if cfg!(feature = "bit-compression") {
+                OFFSET
+            } else {
+                0
+            };
+            assert_eq!(selected.record.first().copied().unwrap_or(0), expected);
+        }
+    }
+}
+
+#[test]
+fn large_column_still_requires_proportional_savings() {
+    // Preserve the relative guard for an expensive column, even when the
+    // absolute eight-byte minimum would accept the candidate allocation.
+    let mut frame = Frame::new(8, 1024);
+    for value in 0..1024u64 {
+        frame.push(&value.to_ne_bytes());
+    }
+    let cost = Cost {
+        frame: &frame,
+        total_bits: frame_bits(&frame),
+        original_bits: frame_bits(&frame),
+        footer: 1,
+        width: 8,
+    };
+    let candidate = Candidate {
+        record: SmallVec::new(),
+        encoded: SmallVec::new(),
+        mask: 1023,
+        size: cost.size(cost.original_bits, 0),
+    };
+    assert!(!candidate.worthwhile(candidate.size - MIN_ENCODING_SAVINGS, &cost));
+    assert!(candidate.worthwhile(candidate.size - 64, &cost));
+}
+
+#[test]
 fn calculated_dictionary_size_matches_physical_key_packing() {
     for count in [2, 5, 16, 17, 32, 33, 64] {
         let values = irregular(count, 257, 1000, 900);
@@ -498,4 +555,91 @@ fn mixed_width_small_blocks_wrapping_and_irregular_values_round_trip() {
             check(&cache, &layout, &values);
         }
     }
+}
+
+#[test]
+fn timestamp_minimax_matches_exhaustive_representable_search() {
+    // Include bursts, backward jumps, quantization boundaries, and unsigned limits.
+    for values in [
+        vec![0, 0, 0],
+        vec![0, 2, 4, 6],
+        vec![0, 90, 100, 101],
+        vec![0, 9, 0],
+        vec![0, 0, 5003],
+        vec![0, u64::MAX, 2],
+        vec![0, FloatU16::MAX / 2 + 1],
+    ] {
+        let mut cache = BlockCache::new(8, values.len(), values.len());
+        for &value in &values {
+            let (bytes, _, offset) = cache.allocate_timestamp(value);
+            bytes.copy_from_slice(&offset.to_ne_bytes());
+            cache.update_mask_after_append();
+        }
+        let frame = &cache.active;
+        let score = |stride| {
+            let (under, over) = timestamp_errors(frame, stride);
+            under.max(over)
+        };
+        let fitted = minimax_timestamp_stride(frame);
+        let best = (0..=u16::MAX)
+            .map(|bits| score(FloatU16::from_bits(bits)))
+            .min()
+            .unwrap();
+        assert_eq!(score(fitted), best, "{values:?}");
+        assert!(score(fitted) <= score(endpoint_timestamp_stride(frame)));
+    }
+}
+
+#[test]
+fn timestamp_mask_search_is_bounded_and_never_worse_than_endpoint() {
+    let mut cases = vec![
+        vec![0, 0, 0],
+        vec![0, 2, 3, 6], // Minimax has a larger mask despite smaller worst error.
+        vec![0, 90, 100, 101],
+        vec![0, 9, 0],
+        vec![0, 0, 5003],
+        vec![0, u64::MAX, 2],
+        vec![0, FloatU16::MAX / 2 + 1],
+    ];
+    // Deterministic bursty and irregular blocks exercise the nonmonotonic objective.
+    let mut state = 7u64;
+    for length in 2..=40 {
+        let mut values = vec![0];
+        for _ in 1..length {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(state % 100_000);
+        }
+        cases.push(values);
+    }
+    let mut improvements = 0;
+    for values in cases {
+        let mut cache = BlockCache::new(8, values.len(), values.len());
+        for &value in &values {
+            let (bytes, _, offset) = cache.allocate_timestamp(value);
+            bytes.copy_from_slice(&offset.to_ne_bytes());
+            cache.update_mask_after_append();
+        }
+        let frame = &cache.active;
+        let endpoint = endpoint_timestamp_stride(frame);
+        let baseline = timestamp_mask_cost(timestamp_mask(frame, endpoint));
+        for budget in [0, 1, 4, 16, 64] {
+            let selected = mask_timestamp_stride(frame, budget);
+            let cost = timestamp_mask_cost(timestamp_mask(frame, selected));
+            assert!(cost <= baseline, "{values:?}, budget={budget}");
+            if budget <= 1 {
+                assert_eq!(selected, endpoint);
+            }
+            improvements += usize::from(cost < baseline);
+        }
+        if TIMESTAMP_MASK_STRIDE {
+            let selected = mask_timestamp_stride(frame, TIMESTAMP_MASK_CANDIDATES);
+            let expected_mask = timestamp_mask(frame, selected);
+            cache.cycle();
+            let block = &cache.ring[0];
+            // Verify the scored mask is the actual archive mask, not a proxy.
+            assert_eq!(block.data.metadata.timestamp_stride, selected);
+            assert_eq!(&block.data.frame.mask()[..8], &expected_mask.to_ne_bytes());
+        }
+    }
+    assert!(improvements > 0);
 }

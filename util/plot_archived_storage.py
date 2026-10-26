@@ -1139,6 +1139,33 @@ def solid_slices(slices):
     return [(name, value, 0, 0, value) for name, value in slices]
 
 
+def metadata_populations(sites):
+    """Weight natural populations exactly like bytes without changing pie shares."""
+    result = {}
+    for style in ('rows', 'callsites'):
+        selected = list(sites.values()) if style == 'rows' else eligible_sites(sites)
+        populations = {}
+        for key, name in METADATA_PIE_LABELS.items():
+            counter, unit = (
+                (None, 'callsite') if key == 'format_recipes' else
+                ('string_buffers', 'buffer') if key.startswith('string_') else
+                ('archived_archetypes', 'arch') if key.startswith('archetype_') else
+                ('archived_blocks', 'block'))
+            # Historical CSVs lack some counts; show an unavailable rate rather
+            # than guessing object populations from implementation-specific sizes.
+            if counter and any(counter not in site['values'] for site in selected):
+                populations[name] = (None, unit)
+                continue
+            count = sum((site['values'][counter] if counter else 1) /
+                        (site['values']['archived_rows'] if style == 'callsites' else 1)
+                        for site in selected)
+            if style == 'callsites' and selected:
+                count /= len(selected)
+            populations[name] = (count, unit)
+        result[style] = populations
+    return result
+
+
 def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
     """Build five measures, each with a row-weighted and equal-callsite view."""
     # Combine raw and residual index leaves in both pies and column denominators.
@@ -1190,8 +1217,10 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
             nonfield[key]['callsites'] = sum(total(averaged, owner=owner, group=group)
                                              for group in ('metadata', 'end_buffer'))
             cohorts[key] = len(selected)
+    populations = metadata_populations(sites) if sites is not None else {}
     return [dict(key=key, title=title, rows=slices, denominator=denominator, note=note,
                  callsites=averages.get(key), callsite_count=cohorts.get(key), nonfield=nonfield.get(key),
+                 metadata_populations=populations if key == 'metadata' else {},
                  columns=columns.get(key))
             for key, title, slices, denominator, note in definitions]
 
@@ -1264,7 +1293,13 @@ def key_lines(group, style, row):
     name, cost, constant, varying, unsplit = row
     denominator = group['denominator'] if style == 'rows' else 1
     size = sum(item[1] for item in group[style])
-    info = f'{100 * cost / size:.2f}% · {per_row(8 * cost, denominator)} bits/row'
+    info = f'{100 * cost / size:.2f}%'
+    if group['key'] == 'metadata':
+        count, unit = group['metadata_populations'][style][name]
+        rate = format_rate(cost / count) if count else '—'
+        info += f' · {rate} bytes/{unit}'
+    else:
+        info += f' · {per_row(8 * cost, denominator)} bits/row'
     columns = (group.get('columns') or {}).get(style, {})
     if name in columns and name in field_labels():
         rate = per_row(8 * cost, columns[name]) if columns[name] else '—'
