@@ -28,6 +28,7 @@ use tracing_subscriber::{Layer, registry::LookupSpan};
 use crate::data::{
     CompressionStats,
     blockbuffer::{BlockCache, CallsiteArchetype},
+    column::Layout as ColumnLayout,
     dyntuple::{BytePacker, ValueData, ValueKind},
     stringbuffer::{Buffer, BufferCollection},
 };
@@ -171,11 +172,11 @@ impl PerArchData {
             // Temporary: chunks require a constant string buffer, so a forced
             // string-buffer rotation must also rotate the current chunk.
             self.data
-                .cycle_with_string_indices(&self.archetype.string_index_columns());
+                .cycle_with_columns(&self.archetype.column_layout());
         }
         if self.data.active.length == self.data.active.capacity() {
             self.data
-                .cycle_if_needed_with_string_indices(&self.archetype.string_index_columns());
+                .cycle_if_needed_with_columns(&self.archetype.column_layout());
         }
         // Only an empty chunk can change buffers, regardless of who cycled it.
         if self.data.active.length == 0 {
@@ -620,24 +621,32 @@ pub struct Archetype {
 }
 
 impl Archetype {
-    /// Derive columns only at rollover. No retained schema pointer or vector is
-    /// needed in BlockCache; ordinary fields and template captures fit independently.
-    pub fn string_index_columns(&self) -> SmallVec<[u16; 4]> {
+    /// Caller-owned layout is rebuilt at block boundaries/traversal, never stored per block.
+    pub fn column_layout(&self) -> SmallVec<[ColumnLayout; 8]> {
         let args = self.template.unwrap_or(0);
         let fields: usize = self.field_types.iter().flatten().map(ValueKind::unit).sum();
         let mut offset = self.unit() - fields - args * self.string_storage.unit();
         let mut columns = SmallVec::new();
+        // Biased durations (including zero for open spans) are logical u64 fields.
+        // Reuse exact origins/residuals and the normal archived-edit rebuild path.
+        if !self.is_span_end && !self.is_event {
+            columns.push(ColumnLayout::new(8, 8, false));
+        }
         for kind in self.field_types.iter().flatten() {
-            if *kind == ValueKind::BufferIndex {
-                columns.push(u16::try_from(offset).expect("string-index position exceeds u16"));
-            }
+            columns.push(ColumnLayout::new(
+                offset,
+                kind.unit(),
+                *kind == ValueKind::BufferIndex,
+            ));
             offset += kind.unit();
         }
-        if self.string_storage == StringStorage::Index {
-            for _ in 0..args {
-                columns.push(u16::try_from(offset).expect("template-index position exceeds u16"));
-                offset += 2;
-            }
+        for _ in 0..args {
+            columns.push(ColumnLayout::new(
+                offset,
+                self.string_storage.unit(),
+                self.string_storage == StringStorage::Index,
+            ));
+            offset += self.string_storage.unit();
         }
         columns
     }
@@ -653,13 +662,13 @@ impl Archetype {
                 bytes += std::mem::size_of::<PackedTimestamp>(); //end timestamp
             }
         } else {
-            bytes += std::mem::size_of::<SpanId>();
+            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
         }
         if self.parent {
             bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
         }
         if self.follows_from {
-            bytes += std::mem::size_of::<SpanId>();
+            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
         }
         for field in self.field_types.iter() {
             if let Some(k) = field {
@@ -986,12 +995,27 @@ impl RecordingLayer {
             let arch = &mut callsite_data.cache[arch];
 
             allocated = arch.prepare_chunk(self.string_compression_level);
+            // Both references share the block's identity dictionary and use the
+            // same residual/key representation as parent references.
+            let target = arch.data.encode_parent(
+                id.index,
+                CallsiteArchetype::new(id.callsite, id.archetype),
+                0,
+            );
+            let follows = follow_from.map(|id| {
+                arch.data.encode_parent(
+                    id.index,
+                    CallsiteArchetype::new(id.callsite, id.archetype),
+                    crate::data::blockbuffer::ParentOffsets::ROW_BYTES,
+                )
+            });
             let (data, _index, _) = arch.data.allocate(time.value);
             let mut data = BytePacker::new(data);
-            // Write the header by value through its verified NoUninit implementation.
-            data.write_any_value(id, false); // end data points to start data
-            if let Some(follows) = follow_from {
-                data.write_any_value(follows, false);
+            data.write_any_value(target.0, false);
+            data.write_any_value(target.1, false);
+            if let Some((residual, key)) = follows {
+                data.write_any_value(residual, false);
+                data.write_any_value(key, false);
             }
             // Transfer values into the row, interning strings in this chunk's buffer.
             if let Some(fields) = fields {
@@ -1009,18 +1033,21 @@ impl RecordingLayer {
             None
         };
         {
-            let data = &mut callsite_data.cache[id.archetype as usize].data;
+            let arch = &mut callsite_data.cache[id.archetype as usize];
+            let columns = arch.archetype.column_layout();
+            let data = &mut arch.data;
             // A long-lived span may close after its start chunk has been evicted.
-            let retained = if let Some((descriptor, mut row)) = data.get_mut(id.index as usize) {
-                let start = row.decode_timestamp(descriptor);
-                let mut packer = BytePacker::new(row.get_mut());
-                packer.skip::<PackedTimestamp>(false);
-                // Bias the duration so a zero-tick closed span differs from an open span.
-                packer.write_any_value(time.value - start + 1, false);
-                true
-            } else {
-                false
-            };
+            let retained =
+                if let Some((descriptor, mut row)) = data.get_mut(id.index as usize, &columns) {
+                    let start = row.decode_timestamp(descriptor);
+                    let mut packer = BytePacker::new(row.get_mut());
+                    packer.skip::<PackedTimestamp>(false);
+                    // Bias the duration so a zero-tick closed span differs from an open span.
+                    packer.write_any_value(time.value - start + 1, false);
+                    true
+                } else {
+                    false
+                };
             if retained {
                 if let Some(reference) = extra_fields {
                     data.add_span_fields_ref(id.index as usize, reference);
@@ -1347,6 +1374,133 @@ mod test {
     }
 
     #[test]
+    fn duration_origins_preserve_open_spans_and_late_closes() {
+        let metadata = timestamp_metadata()[1];
+        let mut recorder = RecordingLayer::new();
+        recorder.global_memory_cap = usize::MAX;
+        recorder.callsite_memory_cap = usize::MAX;
+        let mut spans = Vec::new();
+        let mut duration_state = 7u64;
+        for row in 0..512u64 {
+            let start = 1000 + row * 100;
+            let id = recorder.record_start(metadata, timestamp(start), None, false, |_| {});
+            // Values straddle a binary boundary; an exact origin removes the
+            // otherwise varying high bits without relying on a duration stride.
+            duration_state = duration_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            let duration = (1u64 << 40) - 128 + ((duration_state >> 32) % 251);
+            recorder.close_span(metadata, id, timestamp(start + duration), None, None);
+            spans.push((id, start, duration));
+        }
+        let open = recorder.record_start(metadata, timestamp(100_000), None, false, |_| {});
+        let shared = recorder.callsites.read().values().next().unwrap().clone();
+        {
+            let mut site = shared.write();
+            let arch = &mut site.cache[0];
+            let layout = arch.archetype.column_layout();
+            // Archive the open sentinel as well as the closed-duration blocks.
+            arch.data.cycle_with_columns(&layout);
+            assert!(arch.data.ring.iter().any(|block| {
+                block
+                    .data
+                    .column_metadata(&layout)
+                    .entries()
+                    .any(|(column, record)| column.offset == 8 && record.first() == Some(&1))
+            }));
+        }
+        // Exercise editing an origin-encoded duration and an archived open slot.
+        spans[7].2 += 12345;
+        recorder.close_span(
+            metadata,
+            spans[7].0,
+            timestamp(spans[7].1 + spans[7].2),
+            None,
+            None,
+        );
+        shared.read().visit_rows(|row| {
+            if row.index == open.index {
+                assert_eq!(row.end_timestamp, Some(0));
+            } else {
+                let (_, start, duration) = spans[(row.index - 1) as usize];
+                assert_eq!(row.timestamp, Some(start));
+                assert_eq!(row.end_timestamp, Some(start + duration));
+            }
+        });
+        recorder.close_span(metadata, open, timestamp(100_999), None, None);
+        shared.read().visit_rows(|row| {
+            if row.index == open.index {
+                assert_eq!(row.end_timestamp, Some(100_999));
+            }
+        });
+    }
+
+    #[test]
+    fn update_and_follows_references_share_footer_and_survive_eviction() {
+        let metadata = timestamp_metadata()[1];
+        let mut recorder = RecordingLayer::new();
+        recorder.global_memory_cap = usize::MAX;
+        recorder.callsite_memory_cap = usize::MAX;
+        let mut spans = Vec::new();
+        for row in 0..700u64 {
+            let id = recorder.record_start(metadata, timestamp(1000 + row), None, false, |_| {});
+            // Alternate shared and different callarch identities. The same
+            // identity in both columns must not duplicate dictionary entries.
+            let follows = super::SpanId {
+                index: u64::MAX - row * 19,
+                callsite: if row % 2 == 0 { id.callsite } else { 99 },
+                archetype: if row % 2 == 0 { id.archetype } else { 7 },
+            };
+            recorder.close_span(metadata, id, timestamp(2000 + row), Some(follows), None);
+            spans.push((id, follows));
+            if row == 0 {
+                let shared = recorder.callsites.read().values().next().unwrap().clone();
+                let mut site = shared.write();
+                for arch in &mut site.cache {
+                    // Isolate the first row, then exercise normal rollover and a tail.
+                    let layout = arch.archetype.column_layout();
+                    arch.data.cycle_with_columns(&layout);
+                }
+            }
+        }
+        let shared = recorder.callsites.read().values().next().unwrap().clone();
+        let check = |site: &super::PerCallsiteData| {
+            let mut updates = 0;
+            site.visit_rows(|row| {
+                if row.timestamp.is_none() {
+                    let id = row.span.unwrap();
+                    let (expected, follows) = spans[(id.index - 1) as usize];
+                    assert_eq!(
+                        (id.callsite, id.archetype, id.index),
+                        (expected.callsite, expected.archetype, expected.index)
+                    );
+                    let actual = row.follows_from.unwrap();
+                    assert_eq!(
+                        (actual.callsite, actual.archetype, actual.index),
+                        (follows.callsite, follows.archetype, follows.index)
+                    );
+                    assert!(site.span_fields_ref(id).is_some());
+                    updates += 1;
+                }
+            });
+            updates
+        };
+        assert_eq!(check(&shared.read()), spans.len());
+        let mut site = shared.write();
+        let update = site
+            .cache
+            .iter_mut()
+            .find(|arch| arch.archetype.is_span_end)
+            .unwrap();
+        assert_eq!(update.archetype.unit(), 20);
+        let layout = update.archetype.column_layout();
+        assert_eq!(update.data.ring[1].data.parent_offsets(&layout).len(), 2);
+        let first = update.data.ring[0].descriptor.index;
+        update.data.drop_chunk(first).unwrap();
+        assert_eq!(check(&site), spans.len() - 1);
+    }
+
+    #[test]
     fn block_timestamp_offsets_preserve_event_and_span_starts_forever() {
         use crate::data::blockbuffer::BlockCache;
         for metadata in timestamp_metadata() {
@@ -1385,7 +1539,7 @@ mod test {
             });
             assert_eq!(decoded, times);
             let data = &mut site.cache[0].data;
-            let mut raw = data.iter();
+            let mut raw = data.iter(&[]);
             let mut offsets = Vec::new();
             while let Some(row) = raw.next() {
                 offsets.push(u64::from_ne_bytes(row[..8].try_into().unwrap()));
@@ -1680,7 +1834,10 @@ mod test {
         let callsite_data = recording_layer.callsites.read();
         for (identifier, data) in callsite_data.iter() {
             for arch in data.read().cache.iter() {
-                assert_eq!(arch.data.iter().count(), 1000);
+                assert_eq!(
+                    arch.data.iter(&arch.archetype.column_layout()).count(),
+                    1000
+                );
             }
         }
     }

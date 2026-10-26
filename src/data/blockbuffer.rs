@@ -10,16 +10,15 @@ use std::{
 use streaming_iterator::{IntoStreamingIterator, StreamingIterator};
 
 use super::CompressionStats;
+use super::column::{self, Layout as ColumnLayout};
 use super::dataframe::{AnyFrame, Frame, Row, RowBuffer};
-use super::smallbox::SmallBox;
+use super::util::smallbox::SmallBox;
 use super::stringbuffer::StringBufferId;
 
 mod metadata;
 pub use metadata::CollocatedMetadata;
 mod parent_offsets;
 pub use parent_offsets::{CallsiteArchetype, ParentOffsetEntry, ParentOffsets};
-mod string_indices;
-pub use string_indices::StringIndexStarts;
 mod timestamps;
 pub use super::dataframe::ArchivedBlockIter;
 
@@ -65,7 +64,7 @@ pub struct BlockCache {
     // Writable dictionary scratch is reused after its entries move into an archive.
     active_parent_offsets: Vec<u8>,
     // These describe writable rows only; archived frames need neither field.
-    active_parent_row_offset: u16,
+    active_parent_row_offsets: smallvec::SmallVec<[u16; 2]>,
     active_timestamp_header: bool,
 }
 
@@ -180,7 +179,7 @@ impl BlockCache {
             active_metadata: CollocatedMetadata::default(),
             edit_buffer: vec![0; unit],
             active_parent_offsets: Vec::new(),
-            active_parent_row_offset: 0,
+            active_parent_row_offsets: smallvec::SmallVec::new(),
             active_timestamp_header: false,
         }
     }
@@ -192,6 +191,11 @@ impl BlockCache {
     /// Active dictionary heap belongs to writable storage, including spare capacity.
     pub fn active_parent_offsets_heap_bytes(&self) -> usize {
         self.active_parent_offsets.capacity()
+            + if self.active_parent_row_offsets.spilled() {
+                self.active_parent_row_offsets.capacity() * size_of::<u16>()
+            } else {
+                0
+            }
     }
 
     /// Call after cycle_if_needed/prepare_chunk and immediately before allocate,
@@ -208,10 +212,11 @@ impl BlockCache {
         );
         assert!(row_offset + ParentOffsets::ROW_BYTES <= self.unit);
         let row_offset = u16::try_from(row_offset).expect("parent position exceeds u16");
-        assert!(
-            self.active_parent_offsets.is_empty() || self.active_parent_row_offset == row_offset
-        );
-        self.active_parent_row_offset = row_offset;
+        // Update targets and follows-from may coexist. Share identities across
+        // columns; their exact residuals tolerate a common fitted predictor.
+        if !self.active_parent_row_offsets.contains(&row_offset) {
+            self.active_parent_row_offsets.push(row_offset);
+        }
         let table_index = match self.active_parent_offsets().find(identity) {
             Some(index) => index,
             None => {
@@ -224,7 +229,7 @@ impl BlockCache {
                     .extend_from_slice(&identity.to_bits().to_le_bytes());
                 // Store a two-byte predictor scaled by FloatU16::UNIT; every row uses
                 // its decoded value, so rounding never changes the original ID.
-                let offset = super::float_u16::FloatU16::from_u64_lossy(index);
+                let offset = super::util::float_u16::FloatU16::from_u64_lossy(index);
                 self.active_parent_offsets
                     .extend_from_slice(&offset.to_bits().to_le_bytes());
                 // Active rows use only the offset. Fit the final stride once
@@ -245,12 +250,12 @@ impl BlockCache {
     }
 
     pub fn cycle_if_needed(&mut self) {
-        self.cycle_if_needed_with_string_indices(&[]);
+        self.cycle_if_needed_with_columns(&[]);
     }
 
-    /// The subscriber supplies schema positions only at rollover, without retaining
-    /// another pointer/vector in every BlockCache or enlarging its padding.
-    pub fn cycle_if_needed_with_string_indices(&mut self, columns: &[u16]) {
+    /// The subscriber supplies selectable-column positions only at rollover;
+    /// archives retain metadata bytes without owning the caller's schema.
+    pub fn cycle_if_needed_with_columns(&mut self, columns: &[ColumnLayout]) {
         if self.active.capacity() == self.active.length {
             if self.active.capacity() < self.frame_size_max {
                 // starts at 1, jumps to 8, then double capacity untill max
@@ -262,17 +267,17 @@ impl BlockCache {
                 frame.length = self.active.length;
                 self.active = frame;
             } else {
-                self.cycle_with_string_indices(columns);
+                self.cycle_with_columns(columns);
             }
         }
     }
 
     /// Archive a populated chunk early when its owner must change string buffers.
     pub(crate) fn cycle(&mut self) {
-        self.cycle_with_string_indices(&[]);
+        self.cycle_with_columns(&[]);
     }
 
-    pub(crate) fn cycle_with_string_indices(&mut self, columns: &[u16]) {
+    pub(crate) fn cycle_with_columns(&mut self, columns: &[ColumnLayout]) {
         if self.active.length == 0 {
             return;
         }
@@ -283,12 +288,12 @@ impl BlockCache {
             parent_offsets::fit_strides(
                 &mut self.active,
                 &mut self.active_parent_offsets,
-                usize::from(self.active_parent_row_offset),
+                &self.active_parent_row_offsets,
             );
         }
         // Reuse the transient parent scratch for the combined footer. The active
         // dictionary is cleared below before it can be read or appended again.
-        string_indices::fit(&mut self.active, &mut self.active_parent_offsets, columns);
+        column::fit(&mut self.active, &mut self.active_parent_offsets, columns);
         let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
         // timestamp range and deferred references start fresh for the new frame.
@@ -308,7 +313,7 @@ impl BlockCache {
         });
         self.active.clear();
         self.active_parent_offsets.clear();
-        self.active_parent_row_offset = 0;
+        self.active_parent_row_offsets.clear();
         self.active_timestamp_header = false;
     }
 
@@ -398,7 +403,11 @@ impl BlockCache {
     }
 
     /// Borrow a row and its descriptor together, so decoding needs one lookup.
-    pub fn get_mut(&mut self, index: usize) -> Option<(&Descriptor, Row<'_>)> {
+    pub fn get_mut<'a>(
+        &'a mut self,
+        index: usize,
+        columns: &'a [ColumnLayout],
+    ) -> Option<(&'a Descriptor, Row<'a>)> {
         if index >= self.active_descriptor.index {
             if index - self.active_descriptor.index >= self.active.length {
                 return None;
@@ -417,7 +426,7 @@ impl BlockCache {
                 return None;
             };
 
-            let frame = AnyFrame::Archived(&mut data.data);
+            let frame = AnyFrame::Archived(&mut data.data, columns);
             let row = Row {
                 init: false, // Decode only if the caller accesses the archived row.
                 buffer: RowBuffer::Borrowed(self.edit_buffer.as_mut_slice()),
@@ -502,11 +511,14 @@ impl BlockCache {
         }
     }
 
-    pub fn iter(&self) -> impl StreamingIterator<Item = [u8]> {
+    pub fn iter<'a>(
+        &'a self,
+        columns: &'a [ColumnLayout],
+    ) -> impl StreamingIterator<Item = [u8]> + 'a {
         self.ring
             .iter()
             .into_streaming_iter()
-            .flat_map(|frame| frame.data.iter())
+            .flat_map(move |frame| frame.data.iter(columns))
             .chain(self.active.iter().into_streaming_iter_ref())
     }
 
@@ -520,10 +532,20 @@ impl BlockCache {
                     - size_of::<Descriptor>()
                     - size_of::<CollocatedMetadata>()
                     + self.edit_buffer.len()
-                    + self.active_parent_offsets.len(),
+                    + self.active_parent_offsets.len()
+                    + if self.active_parent_row_offsets.spilled() {
+                        self.active_parent_row_offsets.len() * size_of::<u16>()
+                    } else {
+                        0
+                    },
                 overalloc: self.edit_buffer.capacity() - self.edit_buffer.len()
-                    + self.active_parent_offsets.capacity()
-                    - self.active_parent_offsets.len(),
+                    + self.active_parent_offsets_heap_bytes()
+                    - self.active_parent_offsets.len()
+                    - if self.active_parent_row_offsets.spilled() {
+                        self.active_parent_row_offsets.len() * size_of::<u16>()
+                    } else {
+                        0
+                    },
                 ..Default::default()
             }
     }
@@ -719,10 +741,10 @@ mod test {
         // Patch an archived baseline, then another row with an already-varying
         // bit. Other archived frames remain fully constant and must terminate.
         for (index, bit) in [(1, 0x80), (2, 0x80), (17, 0)] {
-            cache.get_mut(index).unwrap().1.get_mut()[0] ^= bit;
+            cache.get_mut(index, &[]).unwrap().1.get_mut()[0] ^= bit;
             expected[index - 1][0] ^= bit; // Absolute row indexes start at one.
         }
-        let mut rows = cache.iter();
+        let mut rows = cache.iter(&[]);
         for expected in expected {
             assert_eq!(rows.next(), Some(expected.as_slice()));
         }
@@ -785,7 +807,7 @@ mod test {
         // }
 
         // read a bunch of stuff out
-        let mut c_iter = cache.iter();
+        let mut c_iter = cache.iter(&[]);
         let mut i = 0usize;
         let mut h = DefaultHasher::new();
         while let Some(item) = c_iter.next() {

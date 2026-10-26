@@ -5,7 +5,7 @@ use streaming_iterator::StreamingIterator;
 use super::{
     CONTINUOUS_BIT_PACKING, CompressionStats, Frame, Mask, NeedsRebuild, StackVec, copy_bytes,
 };
-use crate::data::smallbox::Initializer;
+use crate::data::util::smallbox::Initializer;
 
 /// Stores the mask and first row once, then only varying bits for later rows.
 /// CONTINUOUS_BIT_PACKING selects consecutive bits or byte-aligned rows at build
@@ -188,6 +188,32 @@ impl BitCompactFrame {
         assert_eq!(output.len(), self.unit(), "row size mismatch");
         output.copy_from_slice(self.first());
         self.unpack_varying(index, output);
+    }
+
+    /// Decode just one column; packed positions are derived from the shared mask.
+    pub fn read_column(&self, index: usize, offset: usize, output: &mut [u8]) {
+        assert!(index < self.len() && offset + output.len() <= self.unit());
+        output.copy_from_slice(&self.first()[offset..offset + output.len()]);
+        if index == 0 {
+            return;
+        }
+        let mask = self.mask();
+        let mut position = (index - 1) * self.packed_row_bits()
+            + mask[..offset]
+                .iter()
+                .map(|byte| byte.count_ones() as usize)
+                .sum::<usize>();
+        let packed = &self.buffer()[2 * self.unit()..];
+        for (value, &varying) in output.iter_mut().zip(&mask[offset..]) {
+            *value &= !varying;
+            let mut bits = varying;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                *value |= ((packed[position / 8] >> (position % 8)) & 1) << bit;
+                bits &= bits - 1;
+                position += 1;
+            }
+        }
     }
 
     /// Update in place, or return NeedsRebuild without changes if a constant bit changes.

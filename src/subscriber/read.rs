@@ -63,11 +63,20 @@ impl Reader<'_> {
     fn u64(&mut self) -> u64 {
         u64::from_ne_bytes(self.bytes())
     }
-    fn span(&mut self) -> SpanId {
+    // Structural references all use the shared footer dictionary, including
+    // active rows whose predictor has zero stride until rollover.
+    fn span(
+        &mut self,
+        dictionary: crate::data::blockbuffer::ParentOffsets<'_>,
+        row: usize,
+        length: usize,
+    ) -> SpanId {
+        let residual = self.u64();
+        let entry = dictionary.entry(self.u16());
         SpanId {
-            index: self.u64(),
-            callsite: self.u32(),
-            archetype: self.u32(),
+            index: entry.decode(residual, row, length),
+            callsite: entry.identity.callsite(),
+            archetype: entry.identity.archetype(),
         }
     }
 }
@@ -103,19 +112,28 @@ impl PerCallsiteData {
             else {
                 continue;
             };
-            let matches = |bytes: &[u8]| {
-                let id = Reader(bytes).span();
+            let matches = |bytes: &[u8], dictionary, row, length| {
+                let id = Reader(bytes).span(dictionary, row, length);
                 (id.callsite, id.archetype, id.index) == (span.callsite, span.archetype, span.index)
             };
             if let Some(frame) = update.data.ring.get(block) {
+                let layout = update.archetype.column_layout();
+                let dictionary = frame.data.parent_offsets(&layout);
                 let mut rows = ArchivedFrameIter::new(&frame.data.frame);
+                let mut index = 0;
                 while let Some(row) = rows.next() {
-                    if matches(row) {
+                    if matches(row, dictionary, index, frame.data.frame.len()) {
+                        return Some(reference);
+                    }
+                    index += 1;
+                }
+            } else if block == update.data.ring.len() {
+                let dictionary = update.data.active_parent_offsets();
+                for (index, row) in update.data.active.iter().enumerate() {
+                    if matches(row, dictionary, index, update.data.active.length) {
                         return Some(reference);
                     }
                 }
-            } else if block == update.data.ring.len() && update.data.active.iter().any(matches) {
-                return Some(reference);
             }
         }
         None
@@ -147,6 +165,7 @@ impl PerCallsiteData {
                 .front()
                 .map_or(arch.data.active_descriptor.index, |b| b.descriptor.index)
                 as u64;
+            let columns = a.column_layout();
             let frames = arch
                 .data
                 .ring
@@ -156,7 +175,7 @@ impl PerCallsiteData {
                         b.data.frame.len(),
                         &b.descriptor,
                         &b.data.metadata,
-                        b.data.parent_offsets(),
+                        b.data.parent_offsets(&columns),
                     )
                 })
                 .chain(std::iter::once((
@@ -165,7 +184,7 @@ impl PerCallsiteData {
                     &arch.data.active_metadata,
                     arch.data.active_parent_offsets(),
                 )));
-            let mut rows = arch.data.iter();
+            let mut rows = arch.data.iter(&columns);
             let mut strings = None;
             let mut string_id = None;
             for (count, descriptor, metadata, parent_offsets) in frames {
@@ -194,7 +213,7 @@ impl PerCallsiteData {
                     };
                     index += 1;
                     if a.is_span_end {
-                        row.span = Some(reader.span());
+                        row.span = Some(reader.span(parent_offsets, local_row, count));
                     } else {
                         // Span end edits never move the block's decoding origin.
                         row.timestamp = Some(metadata.decode_timestamp(
@@ -237,7 +256,7 @@ impl PerCallsiteData {
                         }
                     }
                     if a.follows_from {
-                        row.follows_from = Some(reader.span());
+                        row.follows_from = Some(reader.span(parent_offsets, local_row, count));
                     }
                     for kind in &a.field_types {
                         row.fields.push(kind.as_ref().map(|kind| {

@@ -26,6 +26,8 @@ default = ["bit-compression", "tracing_patched"]
 tracing_patched = []
 # Choose archived message layout at compile time; active rows and string LZ4 stay identical.
 bit-compression = []
+# Optional offline inspection; adds no counters or bytes to recorded blocks.
+column-metrics = []
 
 [dependencies]
 # Share owned formatting recipes with the vendored tracing bridge.
@@ -52,6 +54,10 @@ hashbrown = { version = "0.17", default-features = false, features = ["inline-mo
 [[bench]]
 name = "archived_storage"
 harness = false
+
+[[example]]
+name = "column_metrics"
+required-features = ["column-metrics"]
 
 [dev-dependencies]
 # Compare the linked test binary against independent DWARF discovery.

@@ -14,14 +14,6 @@ impl ArchivedBlock {
         metadata: CollocatedMetadata,
         trailer: &[u8],
     ) -> SmallBox<Self> {
-        let (parents, starts) = super::string_indices::split(trailer);
-        super::ParentOffsets::new(parents);
-        for (offset, _) in starts.entries() {
-            assert!(
-                offset + 2 <= frame.unit,
-                "string-index footer column exceeds row"
-            );
-        }
         // SAFETY: ArchivedBlock is repr(C), with metadata followed by its DST frame.
         unsafe {
             SmallBox::with_header(
@@ -31,32 +23,43 @@ impl ArchivedBlock {
         }
     }
 
-    pub fn parent_offsets(&self) -> super::ParentOffsets<'_> {
-        super::ParentOffsets::new(super::string_indices::split(self.frame.trailer()).0)
+    pub fn parent_offsets(
+        &self,
+        layout: &[crate::data::column::Layout],
+    ) -> super::ParentOffsets<'_> {
+        super::ParentOffsets::new(
+            crate::data::column::Metadata::split(self.frame.trailer(), layout).0,
+        )
     }
 
-    /// Sparse column positions and starts live entirely after the packed rows.
-    pub fn string_index_starts(&self) -> super::StringIndexStarts<'_> {
-        super::string_indices::split(self.frame.trailer()).1
+    pub fn column_metadata<'a, 's>(
+        &'a self,
+        layout: &'s [crate::data::column::Layout],
+    ) -> crate::data::column::Metadata<'a, 's> {
+        crate::data::column::Metadata::split(self.frame.trailer(), layout).1
     }
 
-    pub fn string_index_footer_bytes(&self) -> usize {
-        let starts = self.string_index_starts();
-        if starts.is_empty() {
-            0
-        } else {
-            starts.len() * super::StringIndexStarts::ENTRY_BYTES + super::StringIndexStarts::COUNT_BYTES
-        }
+    pub fn column_footer_bytes(&self, layout: &[crate::data::column::Layout]) -> usize {
+        self.column_metadata(layout).storage_bytes()
     }
 
-    /// Reconstruct indices for readers; parent/timestamp decoding keeps its existing API.
-    pub fn read_row(&self, index: usize, output: &mut [u8]) {
+    /// Structural columns retain their existing domain APIs; fields become logical values here.
+    pub fn read_row(
+        &self,
+        index: usize,
+        output: &mut [u8],
+        layout: &[crate::data::column::Layout],
+    ) {
         self.frame.read_row(index, output);
-        self.string_index_starts().decode(output, index);
+        self.column_metadata(layout)
+            .decode(&self.frame, output, index);
     }
 
-    pub fn iter(&self) -> super::ArchivedBlockIter<'_> {
-        super::ArchivedBlockIter::new(self)
+    pub fn iter<'a>(
+        &'a self,
+        layout: &'a [crate::data::column::Layout],
+    ) -> super::ArchivedBlockIter<'a> {
+        super::ArchivedBlockIter::new(self, layout)
     }
 }
 
@@ -75,7 +78,7 @@ pub struct CollocatedMetadata {
     pub string_buffer: StringBufferId,
     /// Predicted increase across the existing frame length, in shifted ticks.
     /// Zero disables prediction and retains unsigned timestamp offsets.
-    pub timestamp_stride: crate::data::float_u16::FloatU16,
+    pub timestamp_stride: crate::data::util::float_u16::FloatU16,
 }
 
 const _: () = assert!(align_of::<CollocatedMetadata>() == 2);

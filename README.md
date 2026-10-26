@@ -14,8 +14,7 @@ The vendored `log` macros use the same inspectable path at every native log leve
 The default `tracing_patched` feature avoids scanner/source lookup for directly
 captured formats. Prebuilt `fmt::Arguments` resolve a vendor template lazily on
 their first rendered message. Compatibility events built from preexisting
-`log::Record`s also use vendor fallback templates; older dumps
-retain the rendered-message matcher. Disable this feature with
+`log::Record`s also use vendor fallback templates. Disable this feature with
 `--no-default-features --features bit-compression` to enable scanner/source
 fallback; direct format capture remains available with either storage mode.
 Check linked callsite coverage with
@@ -31,6 +30,20 @@ Generate it with `make capture-actix`, then run `make storage-charts` to compute
 CSV rows retain `run=bevy` or `run=actix`; chart statistics pool both populations.
 See the [storage pipeline](doc/storage_chart.md) for single-run overrides and tuning.
 
+Captures use v3 MessagePack/LZ4: format recipes are stored once and each operation
+keeps exact typed arguments alongside rendered fields. Old v2 dumps are rejected;
+regenerate them with the capture targets. Replay defaults to **Format patch**.
+The same dump also supports rendered replay with template extraction on or off:
+
+```sh
+make storage-charts                                      # Format patch
+make storage-charts FORMAT_ARGS=off TEMPLATES=on          # template extraction on
+make storage-charts FORMAT_ARGS=off TEMPLATES=off         # template extraction off
+make storage-charts MIN_BLOCK_ROWS=256
+```
+
+Chart line 2 identifies the selected replay mode and minimum block row count.
+
 Archived frames use bit compaction by default. Build with `--no-default-features`
 to use byte compaction, or set `default-features = false` on the dependency.
 Bit frames pack varying bits continuously across row boundaries by default.
@@ -38,13 +51,18 @@ Set `CONTINUOUS_BIT_PACKING` in `src/data/dataframe.rs` to `false` and rebuild
 to restore byte-aligned packed rows. The constant does not affect byte compaction.
 [Measured continuous-packing results](doc/continuous_packing_2026-10-22.md).
 
-Parent references store a u64 ZigZag index delta and a u16 dictionary index.
-The parent-table portion of each compacted frame's footer stores
+Parent, follows-from, and deferred-update target references each store a u64
+ZigZag index residual and a u16 dictionary index (10 bytes before compaction).
+All reference columns in a block share the identity dictionary; repeated identities
+occupy one entry even when used by both update targets and follows-from.
+The identity-table portion of each compacted frame's footer stores
 `(CallsiteArchetype, FloatU16 offset, FloatU16 stride)` entries,
 8 bytes each. `CallsiteArchetype` packs a 20-bit callsite and a 12-bit archetype
 into one u32. All entries retain their identity, including singletons.
 Active blocks use a zero stride and an offset from the first matching parent.
-At initial archival, each identity's first and last matching rows define a line.
+At initial archival, each identity's first and last matching references define a line.
+When two reference columns share an identity, they share its predictor too;
+exact residuals preserve both columns even when their index sequences differ.
 Its intercept is the offset; a negative intercept instead fits a line through
 the origin and the last matching point. Flat, decreasing and singleton groups
 use a zero stride and the first matching index as their offset.
@@ -59,6 +77,29 @@ The frame's existing allocation length and row layout imply the trailer's size.
 Both compaction formats preserve these predictors through archived edits without
 refitting. Readers return ordinary `SpanId` values.
 [Earlier offset-only storage comparison](doc/parent_dictionary_2026-10-22.md).
+
+Span duration slots participate in the ordinary field codec selector, including
+an exact origin plus ZigZag residuals. Zero still means open; closed durations
+remain biased by one tick. Late closes decode and re-encode the archived codec,
+rebuilding when a dictionary cannot represent the new value.
+
+Dictionary keys support a non-cyclic FloatU16 stride as well as direct and cyclic
+keys. This helps fields that advance through a small set of irregular values in
+long runs: the dictionary handles irregular value spacing, while the key stride
+handles slow progression. Prediction is `round(stride * row / block_length)`;
+its metadata adds two bytes to the direct dictionary record. Exact modular
+ZigZag residuals handle prediction errors and revisits. Selection retains this
+form only when its packed allocation, including metadata, saves enough space.
+
+Codec selection follows a bounded sequence: raw bits, origin, line, observed
+cycles, then dictionary forms. A later form must save at least 8 bytes or 1/64
+of the current packed size; near ties keep the earlier, simpler form. Direct
+dictionary size is calculated from cardinality and entry width, without a trial
+residual scan. Cycle discovery shortlists at most four periods using repeated
+values, and each cycle family stops at the first worthwhile fit. This favors
+bounded recording work over finding the smallest possible encoding. Tune
+`MAX_CYCLE_CANDIDATES` and `MIN_ENCODING_SAVINGS` in `src/data/column.rs`;
+`MAX_DICTIONARY_VALUES` and `MAX_CYCLE` retain their capacity/search bounds.
 
 String indices optionally use prediction at archival, independently for each
 ordinary string field and extracted template argument. Period zero uses
@@ -913,7 +954,7 @@ ALSO: add implicit leading 1 to mantisa of the float, unless exp=0 (to preserve 
 TODO review codex changes
 
 # overhead reduction
-Added [Unalign<T, A> (line 74)](/home/user/files/projects/dev/util/tracing_table/src/data/unalign.rs:74) with safe get, set, replace, and into_inner methods. Used it for StringBufferId and the SmallBox pointer.
+Added [Unalign<T, A> (line 74)](/home/user/files/projects/dev/util/tracing_table/src/data/util/unalign.rs:74) with safe get, set, replace, and into_inner methods. Used it for StringBufferId and the SmallBox pointer.
 The fixed archive header shrank 26 → 22 bytes, saving 34,392 bytes on the reference capture without changing payloads.
 
 # predictive string indices
@@ -1096,3 +1137,14 @@ This does not reduce storage currently.
 | **All field schema columns** | **259** | **262** | **+3** | **+1.16%** |
 | String-index values across rows | 2,330,065 | 2,046,809 | −283,256 | −12.16% |
 | Non-string values across rows | 1,200,199 | 1,487,659 | +287,460 | +23.95% |
+
+The format change was a wash in terms of storage.
+reasons: strings are deduplicated per buffer and indices are stored with offset
+fields: have no offset or dictionary. they are not deduplicated within OR between blocks
+
+the usize issues is less relevant: yes a usize of 0 gets stored as 8 bytes, but this gets compacted usually (so mostly first+mask), strings meanwhile have a (possibly compacted) u16 in the block, and another in the buffer (per unique), and the string itself is at least 1 byte.
+- TODO this is more of an issue for active blocks
+- solution is to optimisitcally archetype on u16 or u32 for active blocks, and replace if limit is exceeded
+
+# implement dictionary, offset, stride, cycles in unified way for all columns.
+bring back in changes from experiment/numeric-u16-2026-10-24

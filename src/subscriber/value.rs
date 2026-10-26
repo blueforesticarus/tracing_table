@@ -52,8 +52,7 @@ impl InputValue {
 pub(super) struct InputVisitor {
     pub values: Vec<Option<InputValue>>,
     pub is_log: bool,
-    pub capture_formats: bool,
-    formats: Vec<(
+    pub(super) formats: Vec<(
         usize,
         std::sync::Arc<super::format::Format>,
         Vec<InputValue>,
@@ -64,7 +63,6 @@ impl InputVisitor {
         Self {
             values: vec![None; count],
             is_log,
-            capture_formats: false,
             formats: Vec::new(),
         }
     }
@@ -74,7 +72,9 @@ impl InputVisitor {
         metadata: &tracing::Metadata<'_>,
         visitor: &mut super::ValueRecorder<'_>,
     ) {
-        visit_values(metadata, &self.values, visitor);
+        visit_values(metadata, &self.values, visitor, |index| {
+            self.formats.iter().any(|(field, ..)| *field == index)
+        });
         for (index, recipe, values) in &self.formats {
             let field = metadata.fields().iter().nth(*index).unwrap();
             visitor.record_format(&field, recipe.clone(), values.clone());
@@ -89,13 +89,7 @@ impl InputVisitor {
 }
 impl Visit for InputVisitor {
     fn visit_format(&mut self, field: &Field, value: &tracing_core::field::Format<'_>) {
-        if !self.capture_formats {
-            self.set(
-                field,
-                InputValue::Text(value.render().expect("rendering input format")),
-            );
-            return;
-        }
+        // Portable capture always keeps recipes; choosing rendered input is a replay policy.
         let (recipe, values) =
             super::format::Format::capture_new(value).expect("capturing input format");
         let text = recipe
@@ -144,8 +138,13 @@ pub(super) fn visit_values(
     metadata: &tracing::Metadata<'_>,
     values: &[Option<InputValue>],
     visitor: &mut dyn Visit,
+    skip: impl Fn(usize) -> bool,
 ) {
     for (field, value) in metadata.fields().iter().zip(values) {
+        // Native Format fields bypass rendered matching and temporary text copies.
+        if skip(field.index()) {
+            continue;
+        }
         match value {
             None => {}
             // Ordinary Visit methods normalize widths; format arguments use

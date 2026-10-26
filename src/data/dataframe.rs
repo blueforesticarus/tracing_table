@@ -10,7 +10,7 @@ use streaming_iterator::StreamingIterator;
 
 use super::CompressionStats;
 use super::blockbuffer::ArchivedBlock;
-use super::smallbox::{Initializer, SmallBox, boxed_with};
+use super::util::smallbox::{Initializer, SmallBox, boxed_with};
 
 mod bitcompact;
 pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
@@ -23,7 +23,7 @@ pub enum AnyFrame<'a> {
     Frame(&'a mut Box<Frame>),
     Compact(&'a mut Box<CompactFrame>),
     BitCompact(&'a mut Box<BitCompactFrame>),
-    Archived(&'a mut SmallBox<ArchivedBlock>),
+    Archived(&'a mut SmallBox<ArchivedBlock>, &'a [super::column::Layout]),
 }
 
 /// The edit changes omitted data and requires rebuilding; the frame is unchanged.
@@ -58,16 +58,39 @@ impl AnyFrame<'_> {
                 AnyFrame::Frame(&mut unpacked).write_row(index, row);
                 **frame = BitCompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
-            Self::Archived(block) => {
-                // Public archive rows contain reconstructed string indices. Encode
-                // them back using the unchanged footer before an in-place edit/rebuild.
+            Self::Archived(block, columns) => {
+                // Public rows contain decoded field values. Preserve immutable codecs;
+                // a new dictionary value/base requires reconstruction and codec removal.
                 let mut encoded;
-                let row = if block.string_index_starts().is_empty() {
-                    row
+                let row = if !block.column_metadata(columns).has_encodings() {
+                    row // Preserve the no-copy close/edit path for plain structural rows.
                 } else {
                     encoded = StackVec::<128, u128>::new(row);
-                    block.string_index_starts().encode(&mut encoded, index);
-                    &encoded
+                    if !block
+                        .column_metadata(columns)
+                        .encode(&block.frame, &mut encoded, index)
+                    {
+                        let parents = block.parent_offsets(columns).len()
+                            * super::blockbuffer::ParentOffsets::ENTRY_BYTES;
+                        let trailer = block
+                            .column_metadata(columns)
+                            .without_dictionaries(&block.frame.trailer()[..parents]);
+                        let preserved = super::column::Metadata::split(&trailer, columns).1;
+                        let mut unpacked = Frame::new(block.frame.unit(), block.frame.len());
+                        let mut logical = StackVec::<128, u128>::new(row);
+                        for ordinal in 0..block.frame.len() {
+                            block.read_row(ordinal, &mut logical, columns);
+                            if ordinal == index {
+                                logical.copy_from_slice(row);
+                            }
+                            assert!(preserved.encode(&block.frame, &mut logical, ordinal));
+                            unpacked.push(&logical);
+                        }
+                        let metadata = std::mem::take(&mut block.metadata);
+                        **block = ArchivedBlock::new_with_trailer(&unpacked, metadata, &trailer);
+                        return;
+                    }
+                    &*encoded
                 };
                 if block.frame.try_write_row(index, row).is_ok() {
                     return;
@@ -154,10 +177,10 @@ impl<'a> Row<'a> {
                 }
                 slice
             }
-            AnyFrame::Archived(block) => {
+            AnyFrame::Archived(block, columns) => {
                 let slice = self.buffer.get_or_init(block.frame.unit());
                 if !self.init {
-                    block.read_row(self.index, slice);
+                    block.read_row(self.index, slice, columns);
                     self.init = true;
                 }
                 slice
@@ -172,14 +195,22 @@ pub struct ArchivedBlockIter<'a> {
     block: &'a ArchivedBlock,
     buffer: StackVec<128, u128>,
     yielded: usize,
+    columns: smallvec::SmallVec<[super::column::Column<'a>; 8]>,
 }
 
 impl<'a> ArchivedBlockIter<'a> {
-    pub fn new(block: &'a ArchivedBlock) -> Self {
+    pub fn new(block: &'a ArchivedBlock, columns: &'a [super::column::Layout]) -> Self {
         Self {
             block,
             buffer: StackVec::new(block.frame.first()),
             yielded: 0,
+            // Decode footer tags/coefficients once per traversal, outside the row loop.
+            columns: block
+                .column_metadata(columns)
+                .entries()
+                .filter(|(_, record)| !record.is_empty())
+                .map(|(layout, record)| super::column::Column::new(&block.frame, layout, record))
+                .collect(),
         }
     }
 }
@@ -189,7 +220,10 @@ impl StreamingIterator for ArchivedBlockIter<'_> {
 
     fn advance(&mut self) {
         if self.yielded < self.block.frame.len() {
-            self.block.read_row(self.yielded, &mut self.buffer);
+            self.block.frame.read_row(self.yielded, &mut self.buffer);
+            for column in &self.columns {
+                column.decode_row(&mut self.buffer, self.yielded);
+            }
             self.yielded += 1;
         } else {
             self.yielded = self.block.frame.len() + 1;
@@ -507,6 +541,25 @@ impl CompactFrame {
     }
 
     /// Update in place, or return NeedsRebuild without changes if a constant byte changes.
+    /// Decode a selected byte range without reconstructing the entire row.
+    pub fn read_column(&self, index: usize, offset: usize, output: &mut [u8]) {
+        assert!(index < self.len() && offset + output.len() <= self.unit());
+        output.copy_from_slice(&self.first()[offset..offset + output.len()]);
+        if index == 0 {
+            return;
+        }
+        let mask = self.mask();
+        let mut position = 2 * self.unit()
+            + (index - 1) * mask.compact_unit()
+            + mask[..offset].iter().filter(|&&byte| byte != 0).count();
+        for (value, &varying) in output.iter_mut().zip(&mask[offset..]) {
+            if varying != 0 {
+                *value = self.buffer[position];
+                position += 1;
+            }
+        }
+    }
+
     pub fn try_write_row(&mut self, index: usize, row: &[u8]) -> Result<(), NeedsRebuild> {
         assert!(index < self.len(), "row index out of bounds");
         assert_eq!(row.len(), self.unit(), "row size mismatch");

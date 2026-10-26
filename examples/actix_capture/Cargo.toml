@@ -18,6 +18,8 @@ log = { path = "../../vendor/log" }
 # The included storage collector reports bit-compacted frames.
 default = ["bit-compression"]
 bit-compression = ["tracing_table/bit-compression"]
+# Post-recording component leaves; disabled for ordinary captures.
+column-metrics = ["tracing_table/column-metrics"]
 
 [dependencies]
 # Shared storage evidence collector iterates archived string-reference rows.

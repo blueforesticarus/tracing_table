@@ -1,6 +1,7 @@
 //! Parent identity and predictor dictionaries appended to compacted frames.
+use crate::data::column;
 use crate::data::dataframe::Frame;
-use crate::data::float_u16::FloatU16;
+use crate::data::util::float_u16::FloatU16;
 use smallvec::SmallVec;
 
 /// Packed identity: callsite in the low 20 bits, archetype in the high 12 bits.
@@ -53,53 +54,38 @@ pub struct ParentOffsetEntry {
 
 impl ParentOffsetEntry {
     pub fn encode(self, actual: u64, row: usize, frame_len: usize) -> u64 {
-        let delta = actual.wrapping_sub(self.predict(row, frame_len));
-        (delta << 1) ^ ((delta as i64 >> 63) as u64)
+        column::residual(
+            u128::from(actual),
+            u128::from(self.predict(row, frame_len)),
+            8,
+        ) as u64
     }
 
     pub fn decode(self, encoded: u64, row: usize, frame_len: usize) -> u64 {
-        // Modular signed ZigZag remains exact across the entire u64 domain.
-        self.predict(row, frame_len)
-            .wrapping_add((encoded >> 1) ^ 0u64.wrapping_sub(encoded & 1))
+        column::restore(
+            u128::from(encoded),
+            u128::from(self.predict(row, frame_len)),
+            8,
+        ) as u64
     }
 
     fn predict(self, row: usize, frame_len: usize) -> u64 {
-        let stride = self.stride.to_u64();
-        // Active blocks and flat/decreasing groups need no division. Use only
-        // decoded coefficients; integer rounding is identical on every reader.
-        if stride == 0 {
-            return self.offset.to_u64();
-        }
-        assert!(row < frame_len);
-        let increase =
-            (u128::from(stride) * row as u128 + frame_len as u128 / 2) / frame_len as u128;
-        self.offset.to_u64().wrapping_add(increase as u64)
+        self.offset
+            .to_u64()
+            .wrapping_add(column::advance(self.stride.to_u64(), row, frame_len))
     }
 
     fn fit(mut self, first: usize, start: u64, last: usize, end: u64, length: usize) -> Self {
-        self.offset = FloatU16::from_u64_lossy(start);
-        self.stride = FloatU16::default();
-        if first == last || end <= start {
-            return self;
-        }
-        // Rational arithmetic avoids losing low ID bits above f64's exact range.
-        // All products fit u128: IDs are u64 and archived row counts are u16.
-        let run = (last - first) as u128;
-        let rise = u128::from(end - start);
-        let origin = u128::from(start) * run;
-        let projected = rise * first as u128;
-        let stride = if origin < projected {
-            // A negative intercept pivots the line through (0, 0) and the LAST
-            // matching point, rather than simply clipping the original line.
-            self.offset = FloatU16::default();
-            u128::from(end) * length as u128 / last as u128
-        } else {
-            self.offset = FloatU16::from_u64_lossy(((origin - projected) / run) as u64);
-            rise * length as u128 / run
-        };
-        // Extrapolation can exceed u64; saturate before narrowing. Residuals
-        // preserve exact IDs even when either FloatU16 coefficient saturates.
-        self.stride = FloatU16::from_u64_lossy(stride.min(u128::from(u64::MAX)) as u64);
+        let (offset, stride) = column::fit_line(
+            first,
+            u128::from(start),
+            last,
+            u128::from(end),
+            length,
+            true,
+        );
+        self.offset = FloatU16::from_u64_lossy(offset as u64);
+        self.stride = stride;
         self
     }
 }
@@ -158,10 +144,12 @@ impl<'a> ParentOffsets<'a> {
 
 /// Transform a completed active frame exactly once, before initial compaction.
 /// Archived edits must retain these coefficients and must NOT call this again.
-pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offset: usize) {
+pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) {
     let length = frame.length;
     assert!(length > 0 && length <= u16::MAX as usize);
-    assert!(offset + ParentOffsets::ROW_BYTES <= frame.unit);
+    for &offset in offsets {
+        assert!(usize::from(offset) + ParentOffsets::ROW_BYTES <= frame.unit);
+    }
     let table = ParentOffsets::new(bytes);
     // Most blocks have few identities. Inline scratch keeps singleton rollover
     // at one allocation; spill storage for larger dictionaries is temporary.
@@ -181,7 +169,7 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offset: usize) {
             last_index: 0,
         })
         .collect();
-    let read = |row: &[u8]| {
+    let read = |row: &[u8], offset: usize| {
         (
             u64::from_ne_bytes(row[offset..offset + 8].try_into().unwrap()),
             usize::from(u16::from_ne_bytes(
@@ -193,15 +181,17 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offset: usize) {
         .chunks_exact(frame.unit)
         .enumerate()
     {
-        let (residual, group) = read(row);
-        let e = &mut endpoints[group];
-        let actual = e.original.decode(residual, r, length);
-        if e.first_row == usize::MAX {
-            e.first_row = r;
-            e.first_index = actual;
+        for &offset in offsets {
+            let (residual, group) = read(row, usize::from(offset));
+            let e = &mut endpoints[group];
+            let actual = e.original.decode(residual, r, length);
+            if e.first_row == usize::MAX {
+                e.first_row = r;
+                e.first_index = actual;
+            }
+            e.last_row = r;
+            e.last_index = actual;
         }
-        e.last_row = r;
-        e.last_index = actual;
     }
     for (g, e) in endpoints.iter().enumerate() {
         assert_ne!(e.first_row, usize::MAX, "unused active parent entry");
@@ -213,24 +203,22 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offset: usize) {
         bytes[begin + 6..begin + 8].copy_from_slice(&fitted.stride.to_bits().to_le_bytes());
     }
     let fitted = ParentOffsets::new(bytes);
-    let mut first = 0;
-    let mut mask = 0u64;
-    for (r, row) in frame.buffer[frame.unit..(length + 1) * frame.unit]
-        .chunks_exact_mut(frame.unit)
-        .enumerate()
-    {
-        let (residual, group) = read(row);
-        let actual = endpoints[group].original.decode(residual, r, length);
-        let encoded = fitted.entry(group as u16).encode(actual, r, length);
-        row[offset..offset + 8].copy_from_slice(&encoded.to_ne_bytes());
-        if r == 0 {
-            first = encoded;
-        }
-        mask |= encoded ^ first;
+    // Each reference column keeps its own mask even when identities are shared.
+    for &offset in offsets {
+        let offset = usize::from(offset);
+        column::rewrite(
+            frame,
+            column::Layout::new(offset, 8, false),
+            |residual, r, row| {
+                let group = read(row, offset).1 as u16;
+                let actual =
+                    endpoints[usize::from(group)]
+                        .original
+                        .decode(residual as u64, r, length);
+                u128::from(fitted.entry(group).encode(actual, r, length))
+            },
+        );
     }
-    // Replace just the parent residual mask; old bits would erase the savings.
-    // Other fields may intentionally retain locked/stale bits for late edits.
-    frame.buffer[offset..offset + 8].copy_from_slice(&mask.to_ne_bytes());
 }
 
 #[cfg(test)]
@@ -351,7 +339,7 @@ mod tests {
         }
         assert_ne!(&frame.buffer[1..9], &[0; 8]);
         frame.lock_editable(0, 1);
-        fit_strides(&mut frame, &mut bytes, 1);
+        fit_strides(&mut frame, &mut bytes, &[1]);
         let fitted = ParentOffsets::new(&bytes).entry(0);
         assert_eq!(fitted.stride.to_u64(), 4 * FloatU16::UNIT);
         assert_eq!(&frame.buffer[1..9], &[0; 8]);

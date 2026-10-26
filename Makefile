@@ -33,8 +33,12 @@ capture-bevy:
 	cargo run --locked --manifest-path examples/bevy_capture/Cargo.toml
 
 # Collect both reference inputs by default; publish only a successful CSV.
+# One v3 capture supports every mode: FORMAT_ARGS=off TEMPLATES=on|off.
+FORMAT_ARGS ?= on
+TEMPLATES ?= on
+MIN_BLOCK_ROWS ?= 0
 storage-csv:
-	cargo bench --offline --bench archived_storage > doc/reference_archived_storage.csv.tmp
+	cargo bench --offline --bench archived_storage -- --format-args $(FORMAT_ARGS) --templates $(TEMPLATES) --min-block-rows $(MIN_BLOCK_ROWS) > doc/reference_archived_storage.csv.tmp
 	mv doc/reference_archived_storage.csv.tmp doc/reference_archived_storage.csv
 
 storage-charts: storage-csv

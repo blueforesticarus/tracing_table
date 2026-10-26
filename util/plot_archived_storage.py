@@ -158,8 +158,9 @@ METADATA_COMPONENTS = {
     "end_timestamp": ("end_timestamp",),
     "parent_archetype_callsite": ("parent.archetype", "parent.callsite", "parent.table_index"),
     "parent_index": ("parent.index",),
-    "follows_from": ("follows_from.index", "follows_from.callsite", "follows_from.archetype"),
-    "update_span": ("update_span.index", "update_span.callsite", "update_span.archetype"),
+    # All span references can use a residual plus shared identity-table key.
+    "follows_from": ("follows_from.index", "follows_from.callsite", "follows_from.archetype", "follows_from.table_index"),
+    "update_span": ("update_span.index", "update_span.callsite", "update_span.archetype", "update_span.table_index"),
 }
 COMPONENT_ORDER = ("timestamp", "timestamp_index", "end_timestamp", "parent_archetype_callsite",
                    "parent_index", "follows_from", "spanfieldsref", "update_span", *GROUPS[1:])
@@ -999,7 +1000,7 @@ def hist_render(surface, columns, sites, mode, threshold, source_links=None):
     hist_label(ctx, MARGIN, 52, 'Storage cost distributions', 32, bold=True)
     paired = any('callsite_percent' in panel for _, panels in columns for panel in panels)
     cutoff = 'either paired pie' if paired else 'their owning pie'
-    hist_label(ctx, MARGIN, 86, f'Templates {"on" if mode == "true" else "off"} · >{threshold:g}% of {cutoff} · x: bits/row · y: % of all samples · ↑ blocks / ↓ callsite block-means', 18)
+    hist_label(ctx, MARGIN, 86, f'{replay_description(mode)} · >{threshold:g}% of {cutoff} · x: bits/row · ↑ blocks / ↓ callsite block-means', 18)
     hist_label(ctx, MARGIN, 112, 'Min/median >0 · dominant zeros listed separately · independent B/C y scales; waves mark gaps', 17, MUTED)
     width = PAGE_WIDTH - 2 * MARGIN
     x, top = MARGIN, HIST_HEADER_HEIGHT
@@ -1458,11 +1459,20 @@ def append_interactive_pies(path, groups, layout):
     ET.ElementTree(root).write(path, encoding='unicode', xml_declaration=True)
 
 
+def replay_description(mode):
+    """Use measured policy for both chart headers, independent of environment."""
+    if not {'format_args', 'extract_templates', 'min_block_rows'} <= SETTINGS.keys():
+        raise ValueError('Recollect storage CSV with the current collector: replay mode and minimum block rows are required')
+    policy = ('Format patch' if SETTINGS.get('format_args') else
+              f"template extraction {'on' if mode == 'true' else 'off'}")
+    return f"{policy} · min rows {SETTINGS['min_block_rows']}"
+
+
 def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
     """Draw shared headings and the default main/satellite arrangement."""
     text(ctx, MARGIN, 55, 'Where recorded storage goes', size=35, bold=True)
     runs = ' + '.join(name.capitalize() for name in SETTINGS.get('runs', ('bevy',)))
-    text(ctx, MARGIN, 91, f"{runs} reference · template extraction {'on' if mode == 'true' else 'off'} · {timestamp_settings()[2]} ns ticks", size=22)
+    text(ctx, MARGIN, 91, f"{runs} reference · {replay_description(mode)} · {timestamp_settings()[2]} ns ticks", size=22)
     # The lifetime snapshot partitions into archive-only and active-only totals.
     # Absolute sizing summaries share that partition for every pie style.
     by_key = {group['key']: group for group in groups}
@@ -1671,8 +1681,10 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
     need_histograms = args.view != 'pies'
     need_callsites = need_histograms or args.pie_style != 'rows'
     modes, histogram_modes = {}, {}
-    # Historical inputs may contain both modes; publish templates-on evidence only.
-    for mode in ('true',):
+    # New captures select one mode; historical bundles may contain both.
+    for mode in ('true', 'false'):
+        if not counts[mode]:
+            continue
         groups = build_groups(data[mode], counts[mode], kinds[mode], metadata[mode], lifetime[mode],
                               sites[mode] if need_callsites else None)
         if need_pies and args.pie_style == 'both':
@@ -1722,6 +1734,8 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
 
         suffix = '' if args.view == 'consolidated' else (
             '_histograms' if args.view == 'histograms' else '_' + args.pie_style + '_pies')
+        if mode == 'false' and counts['true']:
+            suffix += '_templates_off'
         path = PREFIX.parent / (PREFIX.name + suffix)
         svg = cairo.SVGSurface(str(path.with_suffix('.svg')), width, height)
         interactive = need_pies and args.pie_style == 'both'

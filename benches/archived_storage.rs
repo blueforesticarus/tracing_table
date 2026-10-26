@@ -32,7 +32,7 @@ pub mod collect {
         subscriber::{
             Archetype, MESSAGE_BLOCK_MIN_ROWS, MESSAGE_BLOCK_TARGET_SIZE, PackedTimestamp,
             PerArchData, RecordingLayer, STRING_BUFFER_TARGET_SIZE, SpanFieldsRef, SpanId,
-            StringStorage, dump::Fixture,
+            dump::{Fixture, ReplayOptions},
         },
     };
 
@@ -77,7 +77,8 @@ pub mod collect {
             (arch.follows_from, "follows_from"),
         ] {
             if present {
-                for (member, size) in [("index", 8), ("callsite", 4), ("archetype", 4)] {
+                // All span references use residual + shared identity-table key.
+                for (member, size) in [("index", 8), ("table_index", 2)] {
                     entry("metadata", &format!("{prefix}.{member}"), size, false);
                 }
             }
@@ -255,15 +256,23 @@ pub mod collect {
             .ring
             .iter()
             .map(|block| {
-                block.data.parent_offsets().len()
+                block
+                    .data
+                    .parent_offsets(&arch.archetype.column_layout())
+                    .len()
                     * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
             })
             .sum();
+        // Preserve the historical CSV key; its payload now includes all field codecs.
         let string_starts: usize = arch
             .data
             .ring
             .iter()
-            .map(|block| block.data.string_index_footer_bytes())
+            .map(|block| {
+                block
+                    .data
+                    .column_footer_bytes(&arch.archetype.column_layout())
+            })
             .sum();
         let frame_padding = frame_overhead - frame_headers - parent_tables - string_starts;
         let block_entries = arch.data.ring.len() * size_of::<Data>();
@@ -407,6 +416,7 @@ pub mod collect {
         let settings = RecordingLayer::new();
         let mut shift = settings.timestamp_bit_shift;
         let mut min_rows = settings.message_block_min_rows;
+        let mut replay = ReplayOptions::default();
         let mut inputs = Vec::new();
         let mut args = args.by_ref().peekable();
         // Preserve the historical FIXTURE [SHIFT] invocation for investigations.
@@ -428,6 +438,18 @@ pub mod collect {
         }
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--format-args" | "--templates" => {
+                    let enabled = match args.next().as_deref() {
+                        Some("on") => true,
+                        Some("off") => false,
+                        _ => return Err(format!("{arg} expects on or off").into()),
+                    };
+                    if arg == "--format-args" {
+                        replay.format_args = enabled;
+                    } else {
+                        replay.extract_templates = enabled;
+                    }
+                }
                 "--min-block-rows" => min_rows = args.next().ok_or("missing row count")?.parse()?,
                 "--timestamp-shift" => {
                     shift = args.next().ok_or("missing timestamp shift")?.parse()?
@@ -475,7 +497,7 @@ pub mod collect {
         for (run, path) in inputs {
             eprintln!("collecting run={run}: {path}");
             output.run = run;
-            collect_fixture(&mut output, &path, shift, min_rows)?;
+            collect_fixture(&mut output, &path, shift, min_rows, replay)?;
         }
         output.writer.flush()?;
         Ok(())
@@ -488,6 +510,7 @@ pub mod collect {
         path: &str,
         shift: u8,
         min_rows: usize,
+        replay: ReplayOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::load(BufReader::new(File::open(path)?))?;
         assert!(
@@ -498,17 +521,18 @@ pub mod collect {
             record.timestamp >>= shift - fixture.timestamp_bit_shift;
         }
         fixture.timestamp_bit_shift = shift;
-        let recorder = fixture.replay_with_options(true, StringStorage::Index);
-        collect_recording(output, &fixture, &recorder, min_rows, None)
+        let recorder = fixture.replay_with_options(replay);
+        collect_recording(output, &fixture, &recorder, min_rows, None, replay)
     }
 
-    /// Export live and replayed recorders through the same storage accounting.
+    /// Carry the actual replay policy into evidence so charts never infer it.
     pub fn write_recording<W: Write>(
         writer: W,
         run: &str,
         fixture: &Fixture,
         recorder: &RecordingLayer,
         ids: Option<&std::collections::HashMap<usize, u64>>,
+        replay: ReplayOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut output = Csv {
             writer,
@@ -521,6 +545,7 @@ pub mod collect {
             recorder,
             recorder.message_block_min_rows,
             ids,
+            replay,
         )?;
         output.writer.flush()?;
         Ok(())
@@ -532,9 +557,16 @@ pub mod collect {
         recorder: &RecordingLayer,
         min_rows: usize,
         ids: Option<&std::collections::HashMap<usize, u64>>,
+        replay: ReplayOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let shift = fixture.timestamp_bit_shift;
-        for (key, value) in [("schema", 2), ("timestamp_bit_shift", shift as usize)] {
+        for (key, value) in [
+            ("schema", 2),
+            ("timestamp_bit_shift", shift as usize),
+            ("min_block_rows", min_rows),
+            ("format_args", usize::from(replay.format_args)),
+            ("extract_templates", usize::from(replay.extract_templates)),
+        ] {
             output.row(
                 &[],
                 &[
@@ -577,9 +609,9 @@ pub mod collect {
                 ],
             )?;
         }
-        // Chart evidence only measures the supported templates-on configuration.
+        // Keep the existing mode dimension, with explicit policy in settings.
         {
-            let templates = true;
+            let templates = replay.extract_templates;
             let sites = recorder.callsites.read();
             for (callsite, source) in fixture.callsites.iter().enumerate() {
                 let key = if let Some(ids) = ids {
@@ -702,9 +734,14 @@ pub mod collect {
                             )?;
                         }
                         assert_eq!(attributed_bits, bits);
-                        let ends = block.data.parent_offsets().len()
+                        let ends = block
+                            .data
+                            .parent_offsets(&arch.archetype.column_layout())
+                            .len()
                             * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
-                            + block.data.string_index_footer_bytes();
+                            + block
+                                .data
+                                .column_footer_bytes(&arch.archetype.column_layout());
                         output.row(
                             &block_identity,
                             &[
@@ -716,7 +753,8 @@ pub mod collect {
                         if !ranges.is_empty() {
                             buffers.insert(block.data.metadata.string_buffer);
                             if block.data.metadata.string_buffer == arch.strings.active_index() {
-                                let mut iter = block.data.iter();
+                                let columns = arch.archetype.column_layout();
+                                let mut iter = block.data.iter(&columns);
                                 while let Some(row) = iter.next() {
                                     for range in &ranges {
                                         active_indices.insert(u16::from_ne_bytes(

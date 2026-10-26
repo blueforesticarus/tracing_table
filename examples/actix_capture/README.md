@@ -25,8 +25,8 @@ long. The driver advances the capture clock between drained request batches,
 distributing idle gaps according to progress toward the byte target. It waits
 for all captured spans to close before each jump, preserving real request and
 child-span durations. A final request starts at the 10-minute mark; its normal
-execution and server shutdown add a small tail. The optional live storage
-comparison uses the same simulated clock.
+execution and server shutdown add a small tail. All replay modes use this same
+simulated clock.
 
 The default output is `doc/actix_reference.msgpack.lz4`. An optional positional
 argument selects another path. Default paths resolve from the repository, regardless
@@ -39,6 +39,11 @@ batch and shutting down the server before writing the completeness footer.
 It does not pad or duplicate records to reach the target. The decoded fixture is
 validated for size, parented events, and one completed middleware span per request. A `.capture.txt`
 sidecar records exact sizes, request/status counts, settings and callsite families.
+
+The v3 dump preserves Format recipes, typed arguments, and rendered inputs.
+`make storage-charts` uses Format replay by default. Set `FORMAT_ARGS=off` and
+`TEMPLATES=on` or `TEMPLATES=off` to compare rendered replay from that same dump.
+Old v2 dumps are rejected and must be regenerated.
 
 Tuning variables:
 

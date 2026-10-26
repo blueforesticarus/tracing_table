@@ -1,9 +1,7 @@
 //! Fit timestamp predictors once, keeping active writes as unsigned offsets.
 use super::{CollocatedMetadata, Descriptor};
-use crate::data::{
-    dataframe::{AnyFrame, Frame, Row},
-    float_u16::FloatU16,
-};
+use crate::data::column;
+use crate::data::dataframe::{AnyFrame, Frame, Row};
 
 impl CollocatedMetadata {
     /// The frame owns its row count; coefficients never duplicate that count.
@@ -17,57 +15,18 @@ impl CollocatedMetadata {
         let offset = if self.timestamp_stride.to_u64() == 0 {
             encoded
         } else {
-            // Modular ZigZag handles residuals throughout the u64 domain.
-            self.predict_timestamp(row, length)
-                .wrapping_add((encoded >> 1) ^ 0u64.wrapping_sub(encoded & 1))
+            column::restore(
+                u128::from(encoded),
+                u128::from(column::advance(self.timestamp_stride.to_u64(), row, length)),
+                8,
+            ) as u64
         };
         descriptor.decode_timestamp(offset)
     }
 
-    /// Predict in shifted ticks, preserving unit precision for coarse clocks.
-    fn predict_timestamp(&self, row: usize, length: usize) -> u64 {
-        assert!(row < length);
-        let length = length as u128;
-        ((u128::from(self.timestamp_stride.to_u64()) * row as u128 + length / 2) / length) as u64
-    }
-
-    /// Initial compaction only: archived edits must keep both coefficients fixed.
+    /// Preserve the timestamp policy: fixed zero origin and optional FloatU16 line.
     pub(super) fn fit_timestamp_stride(&mut self, frame: &mut Frame) {
-        let length = frame.length;
-        assert_eq!(self.timestamp_stride.to_u64(), 0);
-        if length < 2 {
-            return;
-        }
-        // The immutable origin is the first timestamp. Fit the last start time,
-        // never the mutable range end, which can include late span closes.
-        let last = length * frame.unit;
-        let end = u64::from_ne_bytes(frame.buffer[last..last + 8].try_into().unwrap());
-        let stride = u128::from(end) * length as u128 / (length - 1) as u128;
-        if stride > u128::from(FloatU16::MAX) {
-            return; // Disable instead of saturating an out-of-range timestamp stride.
-        }
-        self.timestamp_stride = FloatU16::from_u64_lossy(stride as u64);
-        if self.timestamp_stride.to_u64() == 0 {
-            return; // Flat blocks retain the original unsigned offsets.
-        }
-        let mut first = 0;
-        let mut mask = 0u64;
-        for (r, row) in frame.buffer[frame.unit..(length + 1) * frame.unit]
-            .chunks_exact_mut(frame.unit)
-            .enumerate()
-        {
-            let offset = u64::from_ne_bytes(row[..8].try_into().unwrap());
-            // Quantized coefficients must be decoded before forming residuals.
-            let delta = offset.wrapping_sub(self.predict_timestamp(r, length));
-            let encoded = (delta << 1) ^ ((delta as i64 >> 63) as u64);
-            row[..8].copy_from_slice(&encoded.to_ne_bytes());
-            if r == 0 {
-                first = encoded;
-            }
-            mask |= encoded ^ first;
-        }
-        // Replace only timestamp bits; late span-end edits and other locks survive.
-        frame.buffer[..8].copy_from_slice(&mask.to_ne_bytes());
+        self.timestamp_stride = column::fit_timestamp(frame);
     }
 }
 
@@ -76,7 +35,7 @@ impl Row<'_> {
     pub(crate) fn decode_timestamp(&mut self, descriptor: &Descriptor) -> u64 {
         let encoded = u64::from_ne_bytes(self.get_mut()[..8].try_into().unwrap());
         match &self.frame {
-            AnyFrame::Archived(block) => {
+            AnyFrame::Archived(block, _) => {
                 block
                     .metadata
                     .decode_timestamp(descriptor, encoded, self.index, block.frame.len())
@@ -91,6 +50,7 @@ impl Row<'_> {
 mod tests {
     use super::*;
     use crate::data::blockbuffer::{BlockCache, CallsiteArchetype};
+    use crate::data::util::float_u16::FloatU16;
 
     fn append(cache: &mut BlockCache, ts: u64) {
         // Match the subscriber's timestamp-header write and mask update order.
@@ -208,7 +168,7 @@ mod tests {
         assert_eq!(cache.ring[0].data.frame.mask()[8], 0xff);
         check_archived(&cache, &times);
         // Changing a constant byte rebuilds the archive without refitting times.
-        cache.get_mut(1).unwrap().1.get_mut()[9] = 42;
+        cache.get_mut(1, &[]).unwrap().1.get_mut()[9] = 42;
         cache.update_ts_range(2_000_000, Some(2));
         check_archived(&cache, &times);
         for ts in [500, 501] {
@@ -234,7 +194,7 @@ mod tests {
         cache.cycle();
         check_archived(&cache, &[100, 102, 104, 106]);
         let block = &cache.ring[0];
-        let entry = block.data.parent_offsets().entry(0);
+        let entry = block.data.parent_offsets(&[]).entry(0);
         assert_eq!(entry.stride.to_u64(), 12);
         let mut row = [0; 18];
         for r in 0..4 {

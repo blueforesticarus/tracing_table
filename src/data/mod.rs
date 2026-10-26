@@ -1,17 +1,14 @@
 // Storage and packing data structures used by the recording subscriber.
 pub mod blockbuffer;
+pub mod column;
 pub mod dataframe;
 pub mod dyntuple;
 
-// Lossy block predictors are paired with exact residuals by their callers.
-pub mod float_u16;
-
 // Strings live in per-archetype buffers, shared by consecutive message chunks.
-pub mod smallbox;
 pub mod stringbuffer;
 
-// Explicit alignment wrappers keep packed field access inside a reusable utility.
-pub mod unalign;
+// Shared packing and allocation primitives live together.
+pub mod util;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompressionStats {

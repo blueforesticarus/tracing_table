@@ -2,9 +2,9 @@
 //!
 //! dump and replay for benchmark
 //!
-//! Version 2 input capture: consecutive MessagePack arrays in a checksummed LZ4 frame.
-//! This deliberately replaces v1's storage snapshot. No table layouts or extracted
-//! arguments enter this format; sequence numbers, scalar bits, and timestamps survive replay.
+//! Version 3 input capture: MessagePack arrays in a checksummed LZ4 frame.
+//! Recipes and typed arguments survive alongside rendered inputs, allowing all
+//! replay modes from one capture. Older rendered-only fixtures are rejected.
 use super::{
     FieldValues, InputValue, RecordingLayer, SpanId, Time, log_callsite_adapter,
     template::CompiledTemplate,
@@ -23,6 +23,7 @@ use tracing::{Metadata, Subscriber, field::FieldSet};
 use tracing_core::{Callsite, Kind, callsite::Identifier};
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+mod formats;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -44,7 +45,7 @@ fn encode_value(value: &Option<InputValue>) -> Mp {
         return Mp::Nil;
     };
     let (tag, payload) = match value {
-        // Width-specific tags extend v2 while keeping existing tags readable.
+        // Width-specific tags preserve native primitive identity through replay.
         InputValue::I8(v) => ("i8", Mp::Binary(v.to_le_bytes().to_vec())),
         InputValue::I16(v) => ("i16", Mp::Binary(v.to_le_bytes().to_vec())),
         InputValue::I32(v) => ("i32", Mp::Binary(v.to_le_bytes().to_vec())),
@@ -241,6 +242,9 @@ impl<W: Write + Send> Clone for Capture<W> {
 struct CaptureState<W: Write> {
     output: Option<CountWriter<FrameEncoder<W>>>,
     sites: HashMap<usize, u64>,
+    // Recipe IDs are global; lookup stays local to one callsite/field.
+    formats: HashMap<(u64, usize), Vec<(u64, Arc<super::format::Format>)>>,
+    format_count: u64,
     records: u64,
     next_span: u64,
     started: Instant,
@@ -262,6 +266,40 @@ struct RecordingSpan {
     follows: Option<SpanId>,
 }
 impl<W: Write> CaptureState<W> {
+    fn formats(&mut self, site: u64, visitor: &InputVisitor) -> io::Result<Mp> {
+        let mut values = Vec::new();
+        for (field, recipe, arguments) in &visitor.formats {
+            let existing = self.formats.get(&(site, *field)).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(_, candidate)| candidate == recipe)
+                    .map(|(id, _)| *id)
+            });
+            let id = if let Some(id) = existing {
+                id
+            } else {
+                let id = self.format_count;
+                self.write(array([
+                    "format".into(),
+                    id.into(),
+                    site.into(),
+                    (*field as u64).into(),
+                    formats::encode(recipe),
+                ]))?;
+                self.formats
+                    .entry((site, *field))
+                    .or_default()
+                    .push((id, recipe.clone()));
+                self.format_count += 1;
+                id
+            };
+            values.push(array([
+                id.into(),
+                encode_fields(&arguments.iter().cloned().map(Some).collect::<Vec<_>>()),
+            ]));
+        }
+        Ok(array(values))
+    }
     fn write(&mut self, value: Mp) -> io::Result<()> {
         rmpv::encode::write_value(self.output.as_mut().expect("capture open"), &value)
             .map_err(io::Error::other)
@@ -318,6 +356,8 @@ impl<W: Write + Send> Capture<W> {
                 bytes: 0,
             }),
             sites: HashMap::new(),
+            formats: HashMap::new(),
+            format_count: 0,
             records: 0,
             next_span: 1,
             started: Instant::now(),
@@ -337,7 +377,7 @@ impl<W: Write + Send> Capture<W> {
             .to_string();
         state.write(array([
             "tracing_table.input".into(),
-            2.into(),
+            3.into(),
             timestamp_bit_shift.into(),
             origin.into(),
         ]))?;
@@ -346,7 +386,7 @@ impl<W: Write + Send> Capture<W> {
         })
     }
     /// Mirror original borrowed values into a recorder using the capture clock.
-    /// Enable before dispatch; capture files intentionally remain version-2 text inputs.
+    /// Optional live audit only; ordinary captures preserve formats without a mirror.
     pub fn enable_recording(&self, recording: Arc<RecordingLayer>) {
         let mut state = self.state.lock();
         assert_eq!(state.records, 0, "enable recording before dispatch");
@@ -453,8 +493,8 @@ where
         self.capture(|state| {
             let site = state.site(metadata, event.is_log())?;
             let mut visitor = InputVisitor::new(metadata.fields().len(), event.is_log());
-            visitor.capture_formats = state.recording.is_some();
             event.record(&mut visitor);
+            let formats = state.formats(site, &visitor)?;
             if let Some(recording) = &state.recording {
                 let parent = parent.map(|id| state.recording_spans[&id].stored);
                 recording.record_start(
@@ -474,6 +514,7 @@ where
                     site.into(),
                     optional(parent),
                     encode_fields(&visitor.values),
+                    formats,
                 ],
             )
         });
@@ -488,8 +529,8 @@ where
         self.capture(|state| {
             let site = state.site(attrs.metadata(), false)?;
             let mut visitor = InputVisitor::new(attrs.metadata().fields().len(), false);
-            visitor.capture_formats = state.recording.is_some();
             attrs.record(&mut visitor);
+            let formats = state.formats(site, &visitor)?;
             let captured = state.next_span;
             state.next_span += 1;
             if let Some(recording) = &state.recording {
@@ -526,6 +567,7 @@ where
                     captured.into(),
                     optional(parent),
                     encode_fields(&visitor.values),
+                    formats,
                 ],
             )?;
             ctx.span(id)
@@ -547,8 +589,9 @@ where
         if let Some(captured) = captured {
             self.capture(|state| {
                 let mut visitor = InputVisitor::new(span.fields().len(), false);
-                visitor.capture_formats = state.recording.is_some();
                 values.record(&mut visitor);
+                let site = state.site(span.metadata(), false)?;
+                let formats = state.formats(site, &visitor)?;
                 if state.recording.is_some() {
                     state
                         .recording_spans
@@ -559,7 +602,7 @@ where
                 }
                 state.operation(
                     "record",
-                    [captured.0.into(), encode_fields(&visitor.values)],
+                    [captured.0.into(), encode_fields(&visitor.values), formats],
                 )
             });
         }
@@ -653,6 +696,44 @@ pub struct Record {
     pub msgpack_bytes: u64,
     pub timestamp: u64,
     pub operation: Operation,
+    pub formats: Vec<CapturedFormat>,
+}
+
+/// A field's original typed arguments; opaque formatting is already snapshotted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedFormat {
+    pub field: usize,
+    pub recipe: Arc<super::format::Format>,
+    pub values: Vec<InputValue>,
+}
+
+/// Format replay and rendered-message extraction are independent choices.
+/// With Format disabled, the same captured text supports either matcher policy.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayOptions {
+    pub format_args: bool,
+    pub extract_templates: bool,
+    pub string_storage: super::StringStorage,
+}
+impl Default for ReplayOptions {
+    fn default() -> Self {
+        Self {
+            format_args: true,
+            extract_templates: true,
+            string_storage: super::StringStorage::default(),
+        }
+    }
+}
+impl ReplayOptions {
+    pub fn mode(self) -> &'static str {
+        if self.format_args {
+            "Format patch"
+        } else if self.extract_templates {
+            "template extraction on"
+        } else {
+            "template extraction off"
+        }
+    }
 }
 #[derive(Debug)]
 pub struct Fixture {
@@ -745,9 +826,9 @@ impl Fixture {
         };
         let header = next(&mut input)?;
         let h = items(&header)?;
-        if h.len() != 4 || string(&h[0])? != "tracing_table.input" || number(&h[1])? != 2 {
+        if h.len() != 4 || string(&h[0])? != "tracing_table.input" || number(&h[1])? != 3 {
             return Err(invalid(
-                "expected v2 replay fixture; v1 storage snapshots are retired",
+                "expected v3 replay fixture with Format arguments; regenerate older captures",
             ));
         }
         let shift = u8::try_from(number(&h[2])?).map_err(io::Error::other)?;
@@ -763,6 +844,7 @@ impl Fixture {
             msgpack_bytes: 0,
         };
         let mut spans = HashMap::<u64, (usize, bool)>::new();
+        let mut definitions = Vec::<formats::Definition>::new();
         loop {
             let before = input.bytes;
             let record = next(&mut input)?;
@@ -799,6 +881,28 @@ impl Fixture {
                 fixture.callsites.push(callsite);
                 continue;
             }
+            if kind == "format" {
+                if v.len() != 5 || number(&v[1])? != definitions.len() as u64 {
+                    return Err(invalid("noncontiguous format recipe IDs"));
+                }
+                let site = usize::try_from(number(&v[2])?).map_err(io::Error::other)?;
+                let field = usize::try_from(number(&v[3])?).map_err(io::Error::other)?;
+                if fixture
+                    .callsites
+                    .get(site)
+                    .is_none_or(|s| field >= s.metadata.fields().len())
+                {
+                    return Err(invalid("unknown format recipe callsite/field"));
+                }
+                definitions.push(formats::Definition {
+                    site,
+                    field,
+                    recipe: formats::decode(&v[4])?,
+                });
+                // Recipe definitions are callsite metadata in input-size reports.
+                fixture.callsites[site].msgpack_bytes += input.bytes - before;
+                continue;
+            }
             if v.len() < 4 || number(&v[1])? != fixture.records.len() as u64 {
                 return Err(invalid("noncontiguous operation sequence"));
             }
@@ -810,8 +914,9 @@ impl Fixture {
                     Err(invalid("reference to unknown/closed span"))
                 }
             };
+            let mut captured_formats = Vec::new();
             let operation = match (kind, v.len()) {
-                ("event", 6) | ("span", 7) => {
+                ("event", 7) | ("span", 8) => {
                     let site = usize::try_from(number(&v[3])?).map_err(io::Error::other)?;
                     let metadata = fixture
                         .callsites
@@ -827,6 +932,8 @@ impl Fixture {
                     if fields.len() != metadata.fields().len() {
                         return Err(invalid("field count differs"));
                     }
+                    captured_formats =
+                        formats::decode_values(&v[parent_at + 2], site, &definitions, &fields)?;
                     if kind == "event" {
                         Operation::Event {
                             site,
@@ -847,12 +954,14 @@ impl Fixture {
                         }
                     }
                 }
-                ("record", 5) => {
+                ("record", 6) => {
                     let id = known_span(number(&v[3])?)?;
                     let fields = decode_fields(&v[4])?;
                     if fields.len() != fixture.callsites[spans[&id].0].metadata.fields().len() {
                         return Err(invalid("span update field count differs"));
                     }
+                    captured_formats =
+                        formats::decode_values(&v[5], spans[&id].0, &definitions, &fields)?;
                     Operation::Record { id, fields }
                 }
                 ("follows", 5) => Operation::Follows {
@@ -870,31 +979,24 @@ impl Fixture {
                 msgpack_bytes: input.bytes - before,
                 timestamp,
                 operation,
+                formats: captured_formats,
             });
         }
     }
 
-    /// Replay normal storage work using original timestamps and fresh matchers.
-    /// Metadata decoding is outside this method; registration and compilation are inside.
+    /// Replay native Format arguments by default; all registration and storage work
+    /// happens here, after portable metadata decoding and validation.
     pub fn replay(&self) -> RecordingLayer {
-        self.replay_with_templates(true)
+        self.replay_with_options(ReplayOptions::default())
     }
 
-    /// Select whether captured source formats participate in extraction. Turning
-    /// it off keeps raw messages and bypasses matcher compilation and matching.
-    ///
-    /// Actual source locations and/or embedded section are not used in replay mode
-    pub fn replay_with_templates(&self, extract_templates: bool) -> RecordingLayer {
-        // Keep replay's implicit addressing aligned with live recording.
-        self.replay_with_options(extract_templates, super::StringStorage::default())
-    }
-
-    /// Replay selects physical string addressing without changing captured inputs.
-    pub fn replay_with_options(
-        &self,
-        extract_templates: bool,
-        string_storage: super::StringStorage,
-    ) -> RecordingLayer {
+    /// Select native arguments or rendered input with template extraction on/off.
+    pub fn replay_with_options(&self, options: ReplayOptions) -> RecordingLayer {
+        let ReplayOptions {
+            format_args,
+            extract_templates,
+            string_storage,
+        } = options;
         let mut recorder = RecordingLayer::new();
         recorder.string_storage = string_storage;
         recorder.timestamp_bit_shift = self.timestamp_bit_shift;
@@ -944,7 +1046,13 @@ impl Fixture {
                     let parent = parent.map(|id| spans[&id].stored);
                     let stored =
                         recorder.record_start(callsite.metadata, time, parent, false, |visitor| {
-                            visit_values(callsite.metadata, fields, visitor)
+                            Self::visit_fields(
+                                record,
+                                callsite.metadata,
+                                fields,
+                                format_args,
+                                visitor,
+                            )
                         });
                     if let Operation::Span { id, .. } = record.operation {
                         spans.insert(
@@ -964,7 +1072,9 @@ impl Fixture {
                     let updates = span.fields.get_or_insert_with(|| {
                         FieldValues::new(metadata.fields().len(), 0, string_storage)
                     });
-                    updates.record(|visitor| visit_values(metadata, fields, visitor));
+                    updates.record(|visitor| {
+                        Self::visit_fields(record, metadata, fields, format_args, visitor)
+                    });
                 }
                 Operation::Follows { id, follows } => {
                     // Resolve while the predecessor is alive; it may close first.
@@ -984,5 +1094,27 @@ impl Fixture {
             }
         }
         recorder
+    }
+
+    fn visit_fields(
+        record: &Record,
+        metadata: &'static Metadata<'static>,
+        fields: &[Option<InputValue>],
+        format_args: bool,
+        visitor: &mut super::ValueRecorder<'_>,
+    ) {
+        visit_values(metadata, fields, visitor, |index| {
+            format_args && record.formats.iter().any(|format| format.field == index)
+        });
+        if format_args {
+            for format in &record.formats {
+                let field = metadata
+                    .fields()
+                    .iter()
+                    .nth(format.field)
+                    .expect("validated format field");
+                visitor.record_format(&field, format.recipe.clone(), format.values.clone());
+            }
+        }
     }
 }

@@ -58,7 +58,7 @@ struct Packed<T>(T);
 /// Borrows of this wrapper are safe, but no reference to its inner T is exposed.
 ///
 /// ```
-/// use tracing_table::data::unalign::Unalign;
+/// use tracing_table::data::util::unalign::Unalign;
 /// // A low-alignment field remains accessible through ordinary safe methods.
 /// let mut value = Unalign::<u32, 2>::new(42);
 /// value.set(value.get() + 1);
@@ -66,7 +66,7 @@ struct Packed<T>(T);
 /// ```
 ///
 /// ```compile_fail
-/// use tracing_table::data::unalign::Unalign;
+/// use tracing_table::data::util::unalign::Unalign;
 /// // Reject invalid alignments at compile time rather than during construction.
 /// let _ = Unalign::<u32, 3>::new(42);
 /// ```

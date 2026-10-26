@@ -6,8 +6,17 @@ use introspect_fmt::{Format as BorrowedFormat, OwnedTemplate, OwnedValue, Render
 macro_rules! argument_kinds {
     ($($variant:ident => $input:ident, $encode:expr, $decode:expr);* $(;)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum ArgumentKind { $($variant,)* }
+        pub(super) enum ArgumentKind { $($variant,)* }
         impl ArgumentKind {
+            pub(super) fn tag(self) -> &'static str {
+                match self { $(Self::$variant => stringify!($variant),)* }
+            }
+            pub(super) fn from_tag(tag: &str) -> Option<Self> {
+                match tag { $(stringify!($variant) => Some(Self::$variant),)* _ => None }
+            }
+            pub(super) fn accepts(self, value: &InputValue) -> bool {
+                matches!((self, value), $((Self::$variant, InputValue::$input(_)))|*)
+            }
             fn capture(value: OwnedValue) -> (Self, InputValue) {
                 match value {
                     $(OwnedValue::$variant(value) => (Self::$variant, InputValue::$input(($encode)(value))),)*
@@ -46,9 +55,18 @@ argument_kinds! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
     pub template: OwnedTemplate,
-    kinds: Vec<ArgumentKind>,
+    pub(super) kinds: Vec<ArgumentKind>,
 }
 impl Format {
+    /// Validate portable arguments before a replay can reach schema assertions.
+    pub(super) fn accepts(&self, values: &[InputValue]) -> bool {
+        self.kinds.len() == values.len()
+            && self
+                .kinds
+                .iter()
+                .zip(values)
+                .all(|(kind, value)| kind.accepts(value))
+    }
     /// Heap capacity excludes this inline value and its enclosing Arc allocation.
     pub fn heap_bytes(&self) -> usize {
         self.template.heap_bytes() + self.kinds.capacity() * size_of::<ArgumentKind>()

@@ -5,7 +5,7 @@ use std::{borrow::Cow, collections::VecDeque, hash::BuildHasher, ops::Deref};
 use foldhash::fast::RandomState;
 use hashbrown::{HashTable, hash_table::Entry};
 
-use super::{CompressionStats, dyntuple::ValueData, unalign::Unalign};
+use super::{CompressionStats, dyntuple::ValueData, util::unalign::Unalign};
 
 /// Choose a string reference once per callsite: u32 offsets or u16 indexes in raw rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
