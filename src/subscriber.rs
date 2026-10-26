@@ -324,6 +324,32 @@ struct Time {
 // cannot use tracing callsite id because tracing_log uses one callsite for all logs
 type CallsiteId = usize;
 
+/// Optional parent identity partitioning; row headers and dictionaries stay unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParentArchetyping {
+    #[default]
+    Off,
+    Callsite,
+    CallsiteArch,
+}
+impl ParentArchetyping {
+    fn from_env() -> Self {
+        match std::env::var("PARENT_ARCHETYPING").as_deref() {
+            Ok("callsite") => Self::Callsite,
+            Ok("callsite+arch") => Self::CallsiteArch,
+            _ => Self::Off,
+        }
+    }
+    fn key(self, parent: Option<SpanId>) -> u64 {
+        // Exact concatenation, not a hash: distinct parent identities cannot collide.
+        parent.map_or(0, |p| match self {
+            Self::Off => 0,
+            Self::Callsite => u64::from(p.callsite),
+            Self::CallsiteArch => u64::from(p.callsite) | (u64::from(p.archetype) << 32),
+        })
+    }
+}
+
 pub struct RecordingLayer {
     // TODO need to seperate storage thread and layer
     // Canonical metadata addresses distinguish log origins sharing tracing-log's Identifier.
@@ -357,6 +383,9 @@ pub struct RecordingLayer {
     pub message_block_min_rows: usize,
     /// Configure before recording; independent switches support replay ablations.
     pub layout_policy: crate::data::column::physical::LayoutPolicy,
+    /// Initialized from PARENT_ARCHETYPING: off (default), callsite, callsite+arch.
+    /// Configure before recording; this changes schema selection only.
+    pub parent_archetyping: ParentArchetyping,
 
     /// Retained chunk/string storage limits in bytes; active storage is protected.
     pub global_memory_cap: usize,
@@ -395,6 +424,7 @@ impl RecordingLayer {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed)),
             layout_policy: Default::default(),
+            parent_archetyping: ParentArchetyping::from_env(),
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
@@ -476,7 +506,7 @@ impl RecordingLayer {
                             template: None,
                             formats: Vec::new(),
                             string_storage: self.string_storage,
-                            extra_hash: 0,
+                            parent_identity: 0,
                             is_span_end: false,
                             is_event: false,
                             // unit: 0,
@@ -633,7 +663,8 @@ pub struct Archetype {
     pub formats: Vec<(usize, usize, usize)>,
     /// Template captures use the same reference width as ordinary string fields.
     pub string_storage: StringStorage,
-    extra_hash: usize,
+    // Partition-only identity; never replaces the parent stored in each row.
+    parent_identity: u64,
 }
 
 impl Archetype {
@@ -965,7 +996,7 @@ impl RecordingLayer {
                 .iter()
                 .map(|value| value.as_ref().map(ValueKind::from)),
         );
-        site.last_archetype.extra_hash = 0;
+        site.last_archetype.parent_identity = self.parent_archetyping.key(parent);
         // Follows-from is known at close and lives only in deferred rows.
         site.last_archetype.follows_from = false;
         site.last_archetype.parent = parent.is_some();
@@ -1078,7 +1109,8 @@ impl RecordingLayer {
                 fields.as_ref().map_or_else(Vec::new, |fields| {
                     fields.format_schema(&mut callsite_data.formats)
                 });
-            callsite_data.last_archetype.extra_hash = 0;
+            // Deferred rows have no parent; clear the reused start-row partition.
+            callsite_data.last_archetype.parent_identity = 0;
             callsite_data.last_archetype.follows_from = follow_from.is_some();
             callsite_data.last_archetype.template = None;
             callsite_data.last_archetype.is_span_end = true;
@@ -1563,6 +1595,43 @@ mod test {
                     ]
                 );
             });
+        }
+    }
+
+    #[test]
+    fn parent_partitioning_preserves_parent_rows() {
+        use super::{ParentArchetyping, SpanId};
+        // Vary identity independently of the parent index; roots remain separate.
+        let parents = [None, Some(SpanId {callsite: 1, archetype: 0, index: 10}),
+            Some(SpanId {callsite: 1, archetype: 1, index: 20}),
+            Some(SpanId {callsite: 2, archetype: 0, index: 30}),
+            Some(SpanId {callsite: 1, archetype: 0, index: 40})];
+        for (mode, expected) in [(ParentArchetyping::Off, 2),
+            (ParentArchetyping::Callsite, 3), (ParentArchetyping::CallsiteArch, 4)] {
+            for metadata in timestamp_metadata() {
+                let mut recorder = RecordingLayer::new();
+                recorder.parent_archetyping = mode;
+                let mut ids = Vec::new();
+                for (i, parent) in parents.into_iter().enumerate() {
+                    ids.push(recorder.record_start(metadata, timestamp(100 + i as u64),
+                        parent, metadata.is_event(), |_| {}));
+                }
+                let sites = recorder.callsites.read();
+                let mut site = sites.values().next().unwrap().write();
+                assert_eq!(site.cache.len(), expected);
+                assert_eq!(ids[1].archetype, ids[4].archetype);
+                // Force archive decoding as well as the normal active-tail path.
+                for arch in &mut site.cache {
+                    let layout = arch.archetype.column_layout();
+                    arch.data.cycle_with_columns(&layout);
+                }
+                let mut decoded = Vec::new();
+                site.visit_rows(|r| decoded.push((r.timestamp.unwrap(), r.parent)));
+                decoded.sort_by_key(|r| r.0);
+                let identity = |p: Option<SpanId>| p.map(|p| (p.callsite, p.archetype, p.index));
+                assert_eq!(decoded.iter().map(|r| identity(r.1)).collect::<Vec<_>>(),
+                    parents.map(identity));
+            }
         }
     }
 

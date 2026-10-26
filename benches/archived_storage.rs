@@ -626,6 +626,8 @@ pub mod collect {
             ("column_sharing", usize::from(replay.layout_policy.sharing)),
             ("integer_widths", usize::from(replay.layout_policy.integers)),
             ("float_widths", usize::from(replay.layout_policy.floats)),
+            // Persist the actual partition mode alongside each measurement.
+            ("parent_archetyping", recorder.parent_archetyping as usize),
         ] {
             output.row(
                 &[],
@@ -1011,6 +1013,8 @@ pub mod collect {
                     ("archived_rows", archived_rows),
                     ("active_rows", active_rows),
                     ("archived_blocks", blocks),
+                    // Include active-only partitions when comparing schema growth.
+                    ("total_archetypes", site.cache.len()),
                     ("archived_archetypes", archived_archetypes),
                     ("fsst_archetypes", fsst_archetypes),
                     ("string_buffers", string_buffers),

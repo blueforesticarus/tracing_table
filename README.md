@@ -1330,3 +1330,36 @@ there are some static strings in the dataset but existing compaction compresses 
 TODO: might help active buffer though.
 
 # archetype on parent span id callsite
+| Capture | Callsites | With multiple parent pairs | Maximum |
+|---|---:|---:|---:|
+| Actix | 44 | **0** | 1 |
+| Bevy | 338 | **91 (26.9%)** | **17** |
+
+This implies that archetyping on parent span is viable.
+
+archetype inflation:
+| Callsite | Off | Callsite | Callsite+arch |
+|---|---:|---:|---:|
+| `StagingBuffer::new` | 1 | 7 (+6) | **19 (+18)** |
+| `Device::create_buffer` | 1 | **13 (+12)** | 17 (+16) |
+| Event immediately inside `create_buffer` | 1 | 1 | 17 (+16) |
+| `Queue::write_buffer` | 1 | 8 (+7) | 15 (+14) |
+| Event immediately inside `write_buffer` | 1 | 1 | 15 (+14) |
+| Queue `copy` | 1 | 1 | 13 (+12) |
+| ECS message event | 10 | 15 (+5) | 19 (+9) |
+
+| Payload component | Off | Callsite Δ | Callsite+arch Δ |
+|---|---:|---:|---:|
+| Timestamps, durations, event ordering | 20.497 | +0.071 | +0.108 |
+| Parent index residuals | 3.289 | −0.118 | −0.472 |
+| Parent dictionary keys | 0.605 | −0.150 | −0.415 |
+| String indices, including format arguments | 3.159 | −0.084 | −0.112 |
+| Other scalar fields | 1.024 | −0.018 | −0.009 |
+| Compressed strings | 8.776 | −0.130 | −0.154 |
+| End buffers | 1.448 | −0.089 | −0.240 |
+| **Total** | **38.798** | **−0.519** | **−1.294** |
+
+Adds alot to active, but that is expected. Will be mostly fixed by optimistic compaction later.
+
+switching string buffer to per callsite not per arch could help here but the problem is that we may end up keeping around alot of strings which should be dropped. 
+- tested, increases compressed string bits/row
