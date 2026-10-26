@@ -1,6 +1,29 @@
 //! Chunk-local string storage. Strings are deduplicated within each writable buffer;
-//! frozen buffers retain only LZ4 data and, optionally, an index. Templates are deferred.
-use std::{borrow::Cow, collections::VecDeque, hash::BuildHasher, ops::Deref};
+//! FSST tables are learned once per archetype, then shared across active/frozen
+//! buffers. Frozen payloads additionally use LZ4. Templates are deferred.
+use std::{borrow::Cow, collections::VecDeque, hash::BuildHasher, ops::Deref, sync::Arc};
+
+mod fsst;
+
+/// Select training on the entire first buffer at its first nonempty rotation.
+/// Keep this as a sentinel so an experimental policy adds no per-buffer bytes.
+pub const FSST_TRAIN_FIRST_BUFFER: usize = usize::MAX;
+
+// Tune warm-up without changing the wire layout. Zero retains the legacy UTF-8
+// baseline; "first-buffer" defers training until the first buffer is frozen.
+pub fn fsst_training_bytes() -> usize {
+    // First-buffer training slightly reduced archived payload but increased total storage versus 16 KiB warm-up by 531,123 B for Bevy and 11,180 B for Actix.
+    std::env::var("STRING_FSST_TRAIN_BYTES")
+        .ok()
+        .and_then(|v| {
+            if v == "first-buffer" {
+                Some(FSST_TRAIN_FIRST_BUFFER)
+            } else {
+                v.parse().ok()
+            }
+        })
+        .unwrap_or(16 * 1024)
+}
 
 use foldhash::fast::RandomState;
 use hashbrown::{HashTable, hash_table::Entry};
@@ -43,7 +66,7 @@ impl StringStorage {
         }
     }
 
-    pub(crate) fn read(self, buffer: &ExpandedBuffer, reference: u32) -> &str {
+    pub(crate) fn read(self, buffer: &ExpandedBuffer, reference: u32) -> Cow<'_, str> {
         match self {
             Self::Offset => buffer.get_offset(reference as usize),
             Self::Index => buffer.get_index(reference as usize),
@@ -114,7 +137,7 @@ fn table_hash(hash: u16) -> u64 {
 //  - store template descriptors together in index and buffer to improve compaction of references in message chunk.
 //    could use negative offset/indices for templates.
 
-/// An append-only cache with stable insertion indexes and byte offsets.
+/// An append-only cache with stable insertion indexes. Training may move offsets.
 /// Ordinary strings use packed 8-byte lookup entries. Inputs outside those packed
 /// bounds use a linear overflow lookup without adding metadata to every buffer.
 #[derive(Clone, Debug, Default)]
@@ -123,6 +146,9 @@ pub struct Buffer {
     // Equality checks the single stored copy; hashes remain available when the table grows.
     lookup: HashTable<StringEntry>,
     hash_builder: RandomState,
+    // Standalone scratch buffers default to raw; archetype collections opt in.
+    train_bytes: usize,
+    training_attempted: bool,
 }
 
 /// Immutable expanded strings, with index and offset reads but no dedup metadata.
@@ -132,6 +158,10 @@ pub struct ExpandedBuffer {
     // allowing large shader diagnostics without widening ordinary string headers.
     data: Vec<u8>,
     index: Vec<u32>,
+    // Rotation continues to use original framed UTF-8 sizes, so FSST does not
+    // silently change message/string buffer boundaries or retention behavior.
+    raw_bytes: usize,
+    codec: Option<Arc<fsst::Table>>,
 }
 
 // Share the read API and borrow active storage without copying or exposing mutation.
@@ -144,6 +174,79 @@ impl Deref for Buffer {
 }
 
 impl Buffer {
+    pub fn with_fsst_training(train_bytes: usize) -> Self {
+        Self {
+            train_bytes,
+            ..Self::default()
+        }
+    }
+
+    pub fn has_fsst(&self) -> bool {
+        self.storage.codec.is_some()
+    }
+
+    // Train on a bounded prefix, then rewrite all entries in insertion order.
+    // Rows retain their string indexes; packed dedup entries get new offsets.
+    fn maybe_train(&mut self, full_buffer: bool) {
+        if self.train_bytes == 0
+            || self.training_attempted
+            || self.has_fsst()
+            || self.storage.is_empty()
+            || (!full_buffer && self.storage.raw_bytes < self.train_bytes)
+        {
+            return;
+        }
+        self.training_attempted = true;
+        let mut samples = Vec::new();
+        let mut sampled = 0;
+        // Offer every string of the completed buffer in first-buffer mode.
+        // Threshold mode retains its bounded prefix; upstream FSST may sample
+        // either supplied corpus internally during symbol-table calibration.
+        let sample_limit = if full_buffer { usize::MAX } else { 64 * 1024 };
+        for &offset in &self.storage.index {
+            let range = self
+                .storage
+                .entry_range(offset as usize)
+                .expect("stored entry");
+            let bytes = &self.storage.data[range];
+            let take = bytes.len().min(sample_limit.saturating_sub(sampled));
+            if take > 0 {
+                samples.push(&bytes[..take]);
+                sampled += take;
+            }
+            if sampled == sample_limit {
+                break;
+            }
+        }
+        let Some(codec) = fsst::Table::train(&samples) else {
+            return;
+        };
+        let mut encoded = ExpandedBuffer {
+            codec: Some(codec),
+            ..Default::default()
+        };
+        for index in 0..self.storage.len() {
+            encoded.append(&self.storage.get_index(index).expect("stored UTF-8"));
+        }
+        // Include the complete shared table before accepting a learned model.
+        if encoded.data.len() + fsst::Table::allocation_bytes() >= self.storage.data.len() {
+            return;
+        }
+        self.storage = encoded;
+        let old: Vec<_> = self.lookup.iter().cloned().collect();
+        self.lookup.clear();
+        for entry in old {
+            let offset = self.storage.index[entry.index()] as usize;
+            if offset <= Self::MAX_OFFSET {
+                self.lookup.insert_unique(
+                    table_hash(entry.hash()),
+                    StringEntry::new(entry.hash(), offset, entry.length(), entry.index()),
+                    |entry| table_hash(entry.hash()),
+                );
+            }
+        }
+    }
+
     /// Hard entry limit, independent of the smaller packed lookup bounds below.
     pub const MAX_ENTRIES: usize = 1 << 16;
 
@@ -158,14 +261,15 @@ impl Buffer {
         if length > Self::MAX_STRING_LENGTH {
             return self.add_overflow(text);
         }
+        // Hash raw text independently of the codec; decode only matching
+        // candidates so dedup hits never encode the incoming string.
         let hash = self.hash_builder.hash_one(text) as u16;
         let entry = self.lookup.entry(
             table_hash(hash),
             |entry| {
                 entry.hash() == hash
                     && entry.length() == length
-                    && &self.storage.data[entry.offset() + 2..entry.offset() + 2 + length]
-                        == text.as_bytes()
+                    && self.storage.get_offset(entry.offset()).as_deref() == Some(text)
             },
             |entry| table_hash(entry.hash()),
         );
@@ -183,23 +287,25 @@ impl Buffer {
             return self.add_overflow(text);
         }
         let entry = StringEntry::new(hash, offset, length, index);
+        // Encoding is needed only when inserting a new unique string.
         let address = self.storage.append(text);
         vacant.insert(entry);
-        address
+        self.maybe_train(false);
+        (address.0, self.storage.index[address.0] as usize)
     }
 
     // add a string too large for the hash table sizes, does not use hash table.
     fn add_overflow(&mut self, text: &str) -> (usize, usize) {
-        if let Some((index, &offset)) = self
-            .storage
-            .index
-            .iter()
-            .enumerate()
-            .find(|(_, offset)| self.storage.get_offset(**offset as usize) == Some(text))
+        if let Some((index, &offset)) =
+            self.storage.index.iter().enumerate().find(|(_, offset)| {
+                self.storage.get_offset(**offset as usize).as_deref() == Some(text)
+            })
         {
             return (index, offset as usize);
         }
-        self.storage.append(text)
+        let address = self.storage.append(text);
+        self.maybe_train(false);
+        (address.0, self.storage.index[address.0] as usize)
     }
 
     /// Encoded unique strings (including encoded lengths) are data; the index and
@@ -253,6 +359,8 @@ impl Buffer {
         CompressedBuffer {
             data: compress(&self.data, level),
             index,
+            raw_bytes: self.storage.raw_bytes,
+            codec: self.storage.codec.clone(),
         }
     }
 }
@@ -260,17 +368,25 @@ impl Buffer {
 impl ExpandedBuffer {
     // Keep writing and scanning the escaped length format in this module only.
     fn append(&mut self, text: &str) -> (usize, usize) {
+        let encoded = self
+            .codec
+            .as_ref()
+            .map(|codec| codec.encode(text.as_bytes()));
+        self.append_bytes(encoded.as_deref().unwrap_or(text.as_bytes()), text.len())
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8], raw_length: usize) -> (usize, usize) {
         // Owners must rotate before appending an entry that cannot have a u16 index.
         assert!(
             self.index.len() < Buffer::MAX_ENTRIES,
             "string buffer is full"
         );
         let offset = self.data.len();
-        let length = u32::try_from(text.len()).expect("string exceeds u32 length");
+        let length = u32::try_from(bytes.len()).expect("string exceeds u32 length");
         let prefix = if length < u16::MAX as u32 { 2 } else { 6 };
         assert!(
             offset
-                .checked_add(prefix + text.len())
+                .checked_add(prefix + bytes.len())
                 .is_some_and(|end| end <= u32::MAX as usize),
             "string buffer exceeds u32 offsets"
         );
@@ -280,7 +396,8 @@ impl ExpandedBuffer {
             self.data.extend_from_slice(&u16::MAX.to_le_bytes());
             self.data.extend_from_slice(&length.to_le_bytes());
         }
-        self.data.extend_from_slice(text.as_bytes());
+        self.data.extend_from_slice(bytes);
+        self.raw_bytes += raw_length + if raw_length < u16::MAX as usize { 2 } else { 6 };
         let index = self.index.len();
         self.index.push(offset as u32);
         (index, offset)
@@ -310,26 +427,66 @@ impl ExpandedBuffer {
 
     /// Uncompressed storage bytes, including entry lengths (used for size targets).
     pub fn byte_len(&self) -> usize {
+        self.raw_bytes
+    }
+
+    /// Resident entry payload before outer LZ4; FSST codes when trained.
+    pub fn stored_byte_len(&self) -> usize {
         self.data.len()
+    }
+
+    /// Shared retained table allocation, charged once to the active owner.
+    pub fn fsst_table_bytes(&self) -> usize {
+        self.codec
+            .as_ref()
+            .map_or(0, |_| fsst::Table::allocation_bytes())
+    }
+
+    /// Physical bytes of one framed entry, without decoding it for accounting.
+    pub fn entry_byte_len(&self, index: usize) -> Option<usize> {
+        let offset = *self.index.get(index)? as usize;
+        self.entry_range(offset).map(|range| range.end - offset)
+    }
+
+    /// Pruned archive snapshots must reuse the owning archetype's table rather
+    /// than silently rebuilding a UTF-8 representation for the storage report.
+    pub fn empty_with_same_encoding(&self) -> Buffer {
+        Buffer {
+            storage: Self {
+                codec: self.codec.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     pub fn compression_ratio(&self) -> CompressionStats {
         CompressionStats {
-            data: self.data.len(),
+            data: self.raw_bytes,
             compressed: self.data.len(),
-            overhead: size_of::<Self>() + self.index.len() * size_of::<u32>(),
+            overhead: size_of::<Self>()
+                + self.index.len() * size_of::<u32>()
+                + self
+                    .codec
+                    .as_ref()
+                    .map_or(0, |_| fsst::Table::allocation_bytes()),
             overalloc: self.data.capacity() - self.data.len()
                 + (self.index.capacity() - self.index.len()) * size_of::<u32>(),
         }
     }
 
-    pub fn get_index(&self, index: usize) -> Option<&str> {
+    pub fn get_index(&self, index: usize) -> Option<Cow<'_, str>> {
         self.get_offset(*self.index.get(index)? as usize)
     }
 
-    /// Resolve an entry offset previously returned by `Buffer::add_string`.
-    pub fn get_offset(&self, offset: usize) -> Option<&str> {
-        std::str::from_utf8(self.data.get(self.entry_range(offset)?)?).ok()
+    /// Offsets are valid until FSST training rewrites this buffer. Use indexes
+    /// for retained references; decoding never expands unrelated strings.
+    pub fn get_offset(&self, offset: usize) -> Option<Cow<'_, str>> {
+        let bytes = self.data.get(self.entry_range(offset)?)?;
+        match &self.codec {
+            Some(codec) => String::from_utf8(codec.decode(bytes)?).ok().map(Cow::Owned),
+            None => std::str::from_utf8(bytes).ok().map(Cow::Borrowed),
+        }
     }
 }
 
@@ -338,6 +495,8 @@ impl ExpandedBuffer {
 pub struct CompressedBuffer {
     data: Box<[u8]>,
     index: Option<Box<[u8]>>,
+    raw_bytes: usize,
+    codec: Option<Arc<fsst::Table>>,
 }
 
 impl CompressedBuffer {
@@ -350,12 +509,13 @@ impl CompressedBuffer {
     }
 
     /// Count the LZ4 size prefix and optional compressed index as overhead.
-    /// The original encoded data size is available without decompressing.
+    /// The shared FSST allocation is charged once to the owning collection's
+    /// active buffer, including when that buffer is empty after rotation.
     pub fn compression_ratio(&self) -> CompressionStats {
-        let (data, compressed) =
+        let (_, compressed) =
             lz4_flex::block::uncompressed_size(&self.data).expect("stored LZ4 size prefix");
         CompressionStats {
-            data,
+            data: self.raw_bytes,
             compressed: compressed.len(),
             overhead: size_of::<Self>()
                 + size_of::<u32>()
@@ -370,6 +530,8 @@ impl CompressedBuffer {
         let mut buffer = ExpandedBuffer {
             data: lz4_flex::decompress_size_prepended(&self.data)?,
             index: Vec::new(),
+            raw_bytes: self.raw_bytes,
+            codec: self.codec.clone(),
         };
         if let Some(index) = &self.index {
             buffer.index = lz4_flex::decompress_size_prepended(index)?
@@ -416,7 +578,7 @@ const _: () = {
 
 /// Buffer IDs are absolute indexes: removing old buffers does not renumber survivors.
 /// The owner decides when to rotate and when no retained data refers to old buffers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BufferCollection {
     pub active: Buffer,
     // Eviction inspects stored sizes without expanding the buffers.
@@ -424,7 +586,20 @@ pub struct BufferCollection {
     offset: usize,
 }
 
+impl Default for BufferCollection {
+    fn default() -> Self {
+        Self::with_fsst_training(fsst_training_bytes())
+    }
+}
+
 impl BufferCollection {
+    pub fn with_fsst_training(train_bytes: usize) -> Self {
+        Self {
+            active: Buffer::with_fsst_training(train_bytes),
+            compressed: VecDeque::new(),
+            offset: 0,
+        }
+    }
     pub fn active_index(&self) -> StringBufferId {
         StringBufferId::new(
             u32::try_from(self.offset + self.compressed.len())
@@ -479,8 +654,17 @@ impl BufferCollection {
 
     /// The recording layer chooses the encoder; buffer IDs and readers stay the same.
     pub fn rotate_with_level(&mut self, keep_index: bool, level: Option<u32>) -> StringBufferId {
-        self.compressed
-            .push_back(std::mem::take(&mut self.active).compress_with_level(keep_index, level));
+        if self.active.train_bytes == FSST_TRAIN_FIRST_BUFFER {
+            // Train before cloning the model into the replacement active buffer;
+            // this also re-encodes the complete first buffer before outer LZ4.
+            self.active.maybe_train(true);
+        }
+        let mut next = Buffer::with_fsst_training(self.active.train_bytes);
+        next.training_attempted = self.active.training_attempted;
+        next.storage.codec = self.active.storage.codec.clone();
+        self.compressed.push_back(
+            std::mem::replace(&mut self.active, next).compress_with_level(keep_index, level),
+        );
         self.active_index()
     }
 
@@ -509,6 +693,122 @@ impl BufferCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_buffer_training_waits_for_rotation_and_rewrites_all_indexes() {
+        let mut buffers = BufferCollection::with_fsst_training(FSST_TRAIN_FIRST_BUFFER);
+        let texts: Vec<_> = (0..900).map(|index| format!(
+            "render pipeline shader module {index:04}: validating resource binding and texture descriptor"
+        )).collect();
+        for text in &texts {
+            buffers.active.add_string(text);
+        }
+        // Exceed both the normal threshold and its 64 KiB corpus cap without
+        // learning early. The first completed buffer is the offered corpus.
+        assert!(buffers.active.byte_len() > 64 * 1024);
+        assert!(!buffers.active.has_fsst());
+        let first = buffers.active_index();
+        buffers.rotate_with_level(false, Some(3));
+        assert!(buffers.active.has_fsst());
+        let saved = buffers.get(first).unwrap();
+        for (index, text) in texts.iter().enumerate() {
+            assert_eq!(saved.get_index(index).as_deref(), Some(text.as_str()));
+        }
+        drop(saved);
+        let model = buffers.active.storage.codec.clone().unwrap();
+        buffers.active.add_string("unseen Unicode é🦀");
+        buffers.rotate(true);
+        assert!(Arc::ptr_eq(
+            &model,
+            buffers.active.storage.codec.as_ref().unwrap()
+        ));
+        assert_eq!(
+            buffers
+                .get(StringBufferId::new(1))
+                .unwrap()
+                .get_index(0)
+                .as_deref(),
+            Some("unseen Unicode é🦀")
+        );
+    }
+
+    #[test]
+    fn learned_fsst_keeps_indexes_and_shares_one_table_across_rotation() {
+        let mut buffers = BufferCollection::with_fsst_training(16 * 1024);
+        let texts: Vec<_> = (0..600).map(|index| format!(
+            "render pipeline shader module {index:04}: validating resource binding and texture descriptor"
+        )).collect();
+        for (index, text) in texts.iter().enumerate() {
+            assert_eq!(buffers.active.add_string(text).0, index);
+        }
+        assert!(buffers.active.has_fsst());
+        assert!(buffers.active.storage.data.len() < buffers.active.byte_len());
+        for (index, text) in texts.iter().enumerate() {
+            assert_eq!(
+                buffers.active.get_index(index).as_deref(),
+                Some(text.as_str())
+            );
+            assert_eq!(buffers.active.add_string(text).0, index);
+        }
+        let model = buffers.active.storage.codec.clone().unwrap();
+        let initial_size = buffers.active.byte_len();
+        let first = buffers.active_index();
+        buffers.rotate_with_level(false, Some(3));
+        assert!(buffers.active.has_fsst());
+        assert_eq!(buffers.active.byte_len(), 0);
+        let archived = buffers.get_compressed(first).unwrap();
+        assert!(Arc::ptr_eq(archived.codec.as_ref().unwrap(), &model));
+        assert!(Arc::ptr_eq(
+            buffers.active.storage.codec.as_ref().unwrap(),
+            &model
+        ));
+        assert_eq!(archived.compression_ratio().data, initial_size);
+        let restored = buffers.get(first).unwrap();
+        for (index, text) in texts.iter().enumerate() {
+            assert_eq!(restored.get_index(index).as_deref(), Some(text.as_str()));
+        }
+        drop(restored);
+        // New active strings can contain bytes absent from the training sample.
+        for text in ["", "a\0b", "Unicode é🦀", "unseen data 123"] {
+            let (index, _) = buffers.active.add_string(text);
+            assert_eq!(buffers.active.get_index(index).as_deref(), Some(text));
+            assert_eq!(buffers.active.add_string(text).0, index);
+        }
+        let (active, archived_stats) = buffers.compression_parts();
+        assert!(active.overhead >= fsst::Table::allocation_bytes());
+        assert_eq!(archived_stats.overhead, size_of::<CompressedBuffer>() + 4);
+        // Exercise the extended length prefix after compression too: an unseen
+        // UTF-8 value can expand past 64 KiB under the frozen symbol table.
+        let large = "🦀".repeat(18_000);
+        let (large_index, _) = buffers.active.add_string(&large);
+        assert_eq!(
+            buffers.active.get_index(large_index).as_deref(),
+            Some(large.as_str())
+        );
+        assert_eq!(buffers.active.add_string(&large).0, large_index);
+        let second = buffers.active_index();
+        buffers.rotate_with_level(true, None);
+        assert_eq!(
+            buffers
+                .get(second)
+                .unwrap()
+                .get_index(large_index)
+                .as_deref(),
+            Some(large.as_str())
+        );
+        buffers.discard_before(buffers.active_index());
+        assert!(buffers.active.has_fsst());
+        assert_eq!(buffers.archived_ids().len(), 0);
+    }
+
+    #[test]
+    fn learned_fsst_rejects_tables_that_cost_more_than_they_save() {
+        let mut buffer = Buffer::with_fsst_training(1);
+        // Very small strings cannot amortize even a tiny learned dictionary.
+        buffer.add_string("tiny");
+        assert!(!buffer.has_fsst());
+        assert_eq!(buffer.get_index(0).as_deref(), Some("tiny"));
+    }
 
     #[test]
     fn full_buffers_force_chunk_rotation_and_preserve_rows() {
@@ -636,8 +936,8 @@ mod tests {
             assert_eq!(restored.len(), entries.len());
             assert_eq!(restored.byte_len(), buffer.byte_len());
             for &(text, address) in &entries {
-                assert_eq!(restored.get_index(address.0), Some(text));
-                assert_eq!(restored.get_offset(address.1), Some(text));
+                assert_eq!(restored.get_index(address.0).as_deref(), Some(text));
+                assert_eq!(restored.get_offset(address.1).as_deref(), Some(text));
             }
             assert_eq!(restored.get_index(entries.len()), None);
             assert_eq!(restored.get_offset(restored.byte_len()), None);
@@ -678,11 +978,17 @@ mod tests {
         for keep_index in [false, true] {
             let restored = buffer.clone().compress(keep_index).decompress().unwrap();
             for (text, address) in &expected {
-                assert_eq!(restored.get_index(address.0), Some(text.as_str()));
-                assert_eq!(restored.get_offset(address.1), Some(text.as_str()));
+                assert_eq!(
+                    restored.get_index(address.0).as_deref(),
+                    Some(text.as_str())
+                );
+                assert_eq!(
+                    restored.get_offset(address.1).as_deref(),
+                    Some(text.as_str())
+                );
             }
             assert_eq!(
-                restored.get_offset(short.1),
+                restored.get_offset(short.1).as_deref(),
                 Some("short after large shader")
             );
         }
@@ -736,7 +1042,7 @@ mod tests {
         assert!(buffers.get_compressed(StringBufferId::new(0)).is_none());
         assert!(buffers.get_compressed(StringBufferId::new(1)).is_some());
         let retained = buffers.get(StringBufferId::new(1)).unwrap();
-        assert_eq!(retained.get_index(0), Some("second"));
+        assert_eq!(retained.get_index(0).as_deref(), Some("second"));
         drop(retained);
         // Even deleting all completed buffers must preserve the active ID.
         buffers.discard_before(StringBufferId::new(u32::MAX));

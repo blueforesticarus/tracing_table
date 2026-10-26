@@ -152,12 +152,14 @@ fn rejects_invalid_sections() -> Result<()> {
 }
 
 mod wrapper_fixture {
+    // Explicit logger arguments keep these DWARF fixtures on log's original
+    // backend when workspace feature unification enables native tracing macros.
     // Names deliberately have no special relationship to log/tracing names.
     macro_rules! relay {
         ($($args:tt)+) => { log::info!($($args)+) };
     }
     macro_rules! routed {
-        ($target:expr; $($args:tt)+) => { log::warn!(target: $target, $($args)+) };
+        ($target:expr; $($args:tt)+) => { log::warn!(logger: log::logger(), target: $target, $($args)+) };
     }
     macro_rules! trace_relay {
         ($($args:tt)+) => { tracing::info!($($args)+) };
@@ -165,9 +167,9 @@ mod wrapper_fixture {
     #[inline(never)]
     pub fn emit() -> [u32; 4] {
         let plain = line!() + 1;
-        relay!("forwarded {user}", user = 7);
+        relay!(logger: log::logger(), "forwarded {user}", user = 7);
         let multiline = line!() + 1;
-        relay!("forwarded {:?}", (1, 2));
+        relay!(logger: log::logger(), "forwarded {:?}", (1, 2));
         let unsupported = line!() + 1;
         routed!("fixture"; "routed {}", 42);
         let tracing = line!() + 1;
@@ -431,7 +433,7 @@ fn macro_text_capture_and_line_fallback_are_independent_of_template_parsing() ->
 #[rustfmt::skip]
 fn mixed_framework_line() -> u32 {
     let line = line!() + 1;
-    tracing::info!("tracing same line"); log::info!("log same line");
+    tracing::info!("tracing same line"); log::info!(logger: log::logger(), "log same line");
     line
 }
 
@@ -455,7 +457,7 @@ mod renamed_framework_fixture {
         // Also exercise the opposite rename with log's distinct field grammar.
         use ::log as tracing;
         let line = line!() + 1;
-        tracing::warn!(window = 7; "renamed log {}", 7);
+        tracing::warn!(logger: tracing::logger(), window = 7; "renamed log {}", 7);
         line
     }
 }
@@ -667,16 +669,17 @@ fn log_dwarf_to_templates() -> Result<()> {
     let unrelated = line!() + 1;
     let lvl = Level::Other;
     std::hint::black_box(lvl);
+    // Force the original facade: native tracing events have different markers.
     let plain = line!() + 1;
-    log::info!("log {}", 42);
+    log::info!(logger: log::logger(), "log {}", 42);
     let structured = line!() + 1;
     log::info!(logger: log::logger(), target: "fixture", code = 42, user = "Ada"; "structured {}", 7);
     let generic = line!() + 1;
-    log::log!(target: "fixture", log::Level::Warn, "generic {value:?}", value = (1, 2));
+    log::log!(logger: log::logger(), target: "fixture", log::Level::Warn, "generic {value:?}", value = (1, 2));
     let alias = line!() + 1;
-    aliased!("aliased warning");
+    aliased!(logger: log::logger(), "aliased warning");
     let unsupported = line!() + 1;
-    log::info!(concat!("joined ", "{}"), 42);
+    log::info!(logger: log::logger(), concat!("joined ", "{}"), 42);
     let ordinary = line!() + 1;
     let lvl = log::Level::Info;
     std::hint::black_box(lvl);
@@ -940,7 +943,7 @@ mod scope_fixture {
             let tracing_line = line!() + 1;
             tracing::info!("method tracing");
             let log_line = line!() + 1;
-            log::info!("method log");
+            log::info!(logger: log::logger(), "method log");
             ([tracing_line, log_line], module_path!())
         }
     }

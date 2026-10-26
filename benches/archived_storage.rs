@@ -2,6 +2,9 @@
 //! Defaults to the Bevy + Actix captures; use FIXTURE [SHIFT] for a single run.
 //! See doc/storage_chart.md; the CSV is the only interface to the renderer.
 
+#[path = "support/string_characters.rs"]
+mod string_characters;
+
 #[cfg(not(feature = "bit-compression"))]
 fn main() {
     panic!("enable --features bit-compression");
@@ -134,10 +137,7 @@ pub mod collect {
         // Shared strings intentionally also occur in the compressed archive set.
         indices
             .iter()
-            .map(|&index| {
-                let text = source.get_index(index).expect("stored active string");
-                text.len() + if text.len() < u16::MAX as usize { 2 } else { 6 }
-            })
+            .map(|&index| source.entry_byte_len(index).expect("stored active string"))
             .sum()
     }
 
@@ -182,7 +182,8 @@ pub mod collect {
             let block_total = allocated(arch.data.compression_ratio());
             let string_total = allocated(arch.strings.compression_ratio());
             let writable = allocated(arch.strings.active.compression_ratio());
-            let raw = arch.strings.active.byte_len();
+            // "Raw" here means before outer LZ4; active payload can be FSST codes.
+            let raw = arch.strings.active.stored_byte_len();
             let schema =
                 size_of::<PerArchData>() - size_of::<BlockCache>() - size_of::<BufferCollection>()
                     + arch.archetype.field_types.capacity() * size_of::<Option<ValueKind>>()
@@ -212,7 +213,10 @@ pub mod collect {
                 self.active_message_overhead += active_frame - used + active_dictionary;
                 let frozen = arch.strings.compression_parts().1;
                 let frozen_payload = frozen.compressed + 4 * arch.strings.archived_ids().len();
-                let writable_heap = writable - size_of::<Buffer>();
+                // The shared codec belongs to archive metadata once archived
+                // rows exist, even though its Arc owner is the writable buffer.
+                let writable_heap = writable - size_of::<Buffer>()
+                    - arch.strings.active.fsst_table_bytes();
                 self.archived_string_overhead += string_total - writable_heap - frozen_payload;
                 self.writable_string_overhead += writable_heap - raw;
             }
@@ -299,6 +303,8 @@ pub mod collect {
 
         let (active, frozen) = arch.strings.compression_parts();
         let writable = arch.strings.active.compression_ratio();
+        // Include the shared table once; frozen buffers only hold Arc handles.
+        let fsst_tables = arch.strings.active.fsst_table_bytes();
         // Full BufferCollection includes its inline writable Buffer header. Its
         // heap is excluded; the pruned compressed snapshot contributes data only.
         let string_spare = active.overalloc - writable.overalloc;
@@ -327,6 +333,7 @@ pub mod collect {
             ("string_collection_structs", size_of::<BufferCollection>()),
             ("string_descriptors", string_descriptors),
             ("string_spare", string_spare),
+            ("fsst_tables", fsst_tables),
             ("archetype_structs", archetype_structs),
             ("archetype_fields", archetype_fields),
         ]);
@@ -339,6 +346,7 @@ pub mod collect {
             - allocated(arch.data.active.compression_ratio())
             - arch.data.active_parent_offsets_heap_bytes()
             - (allocated(writable) - size_of::<Buffer>())
+            + fsst_tables
             + (snapshot_payload - frozen_payload);
         assert_eq!(
             block_payload + snapshot_payload + parts.values().sum::<usize>(),
@@ -378,10 +386,31 @@ pub mod collect {
     ];
     struct Csv<W: Write> {
         writer: W,
+        // Optional offline corpus export shares the exact character-count population.
+        entries: Option<io::BufWriter<File>>,
         // Run names scope every callsite/archetype/block ID in combined evidence.
         run: String,
     }
     impl<W: Write> Csv<W> {
+        fn string_entry(
+            &mut self,
+            callsite: usize,
+            archetype: usize,
+            buffer: u32,
+            index: usize,
+            text: &str,
+        ) -> io::Result<()> {
+            if let Some(entries) = &mut self.entries {
+                writeln!(
+                    entries,
+                    "\"{}\",{callsite},{archetype},{buffer},{index},\"{}\"",
+                    self.run.replace('"', "\"\""),
+                    text.replace('"', "\"\"")
+                )?;
+            }
+            Ok(())
+        }
+
         fn row(&mut self, identity: &[(&str, String)], cells: &[(&str, String)]) -> io::Result<()> {
             for (index, column) in COLUMNS.iter().enumerate() {
                 if index != 0 {
@@ -425,6 +454,7 @@ pub mod collect {
         let mut min_rows = settings.message_block_min_rows;
         let mut replay = ReplayOptions::default();
         let mut inputs = Vec::new();
+        let mut entries_path = None;
         let mut args = args.by_ref().peekable();
         // Preserve the historical FIXTURE [SHIFT] invocation for investigations.
         if args.peek().is_some_and(|arg| !arg.starts_with("--")) {
@@ -445,6 +475,12 @@ pub mod collect {
         }
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--string-entries" => {
+                    if entries_path.is_some() {
+                        return Err("--string-entries may only be supplied once".into());
+                    }
+                    entries_path = Some(args.next().ok_or("missing string entries path")?);
+                }
                 "--format-args" | "--templates" | "--column-sharing" | "--integer-widths"
                 | "--float-widths" => {
                     let enabled = match args.next().as_deref() {
@@ -501,8 +537,15 @@ pub mod collect {
         STRING_BUFFER_TARGET_SIZE.store(32768, Ordering::Relaxed);
         let mut output = Csv {
             writer: io::BufWriter::new(io::stdout().lock()),
+            entries: entries_path
+                .map(File::create)
+                .transpose()?
+                .map(io::BufWriter::new),
             run: String::new(),
         };
+        if let Some(entries) = &mut output.entries {
+            writeln!(entries, "run,callsite,archetype,buffer,index,text")?;
+        }
         writeln!(output.writer, "{}", COLUMNS.join(","))?;
         for (run, path) in inputs {
             eprintln!("collecting run={run}: {path}");
@@ -510,6 +553,9 @@ pub mod collect {
             collect_fixture(&mut output, &path, shift, min_rows, replay)?;
         }
         output.writer.flush()?;
+        if let Some(entries) = &mut output.entries {
+            entries.flush()?;
+        }
         Ok(())
     }
 
@@ -546,6 +592,7 @@ pub mod collect {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut output = Csv {
             writer,
+            entries: None,
             run: run.into(),
         };
         writeln!(output.writer, "{}", COLUMNS.join(","))?;
@@ -666,9 +713,13 @@ pub mod collect {
                 // Count stored entries once per retained buffer, rather than
                 // counting repeated row references or globally distinct text.
                 let mut archived_string_entries = 0;
+                // The collector is also nested inside both capture examples.
+                let mut characters = super::string_characters::CharacterCounts::default();
                 // Natural metadata units include each retained writable buffer,
                 // whose inline header is charged alongside frozen descriptors.
                 let (mut archived_archetypes, mut string_buffers) = (0, 0);
+                // Natural population for the legend's bytes per trained archetype.
+                let mut fsst_archetypes = 0;
                 let mut archived_field_columns = BTreeMap::<&str, usize>::new();
                 for arch in &site.cache {
                     active_rows += arch.data.active.length;
@@ -809,14 +860,22 @@ pub mod collect {
                         let payload = if id == arch.strings.active_index() {
                             // Recompress only archived references, in original order.
                             // Shared writable strings also remain in the active set.
-                            let mut filtered = Buffer::default();
+                            let mut filtered = arch.strings.active.empty_with_same_encoding();
                             for &index in &active_indices {
-                                filtered.add_string(
-                                    arch.strings
-                                        .active
-                                        .get_index(index)
-                                        .expect("stored string index"),
-                                );
+                                let text = arch
+                                    .strings
+                                    .active
+                                    .get_index(index)
+                                    .expect("stored string index");
+                                characters.add(&text);
+                                output.string_entry(
+                                    callsite,
+                                    arch.id as usize,
+                                    id.get(),
+                                    index,
+                                    &text,
+                                )?;
+                                filtered.add_string(&text);
                             }
                             assert_eq!(filtered.len(), active_indices.len());
                             archived_string_entries += filtered.len();
@@ -830,7 +889,20 @@ pub mod collect {
                                 .strings
                                 .get_compressed(id)
                                 .expect("retained string buffer");
-                            archived_string_entries += buffer.decompress()?.len();
+                            // Expand once and exclude length prefixes/index bytes.
+                            let expanded = buffer.decompress()?;
+                            archived_string_entries += expanded.len();
+                            for index in 0..expanded.len() {
+                                let text = expanded.get_index(index).expect("stored string index");
+                                characters.add(&text);
+                                output.string_entry(
+                                    callsite,
+                                    arch.id as usize,
+                                    id.get(),
+                                    index,
+                                    &text,
+                                )?;
+                            }
                             let bytes = buffer.byte_len();
                             frozen_bytes += bytes;
                             bytes
@@ -879,6 +951,7 @@ pub mod collect {
                     lifetime.frozen_strings += frozen_bytes;
                     string_bytes += arch_string_bytes;
                     lifetime.observe_active(arch, &ranges);
+                    fsst_archetypes += usize::from(arch.strings.active.fsst_table_bytes() != 0);
                     for (key, bytes) in
                         metadata_overhead(arch, arch_block_bytes, frozen_bytes, arch_string_bytes)
                     {
@@ -939,6 +1012,7 @@ pub mod collect {
                     ("active_rows", active_rows),
                     ("archived_blocks", blocks),
                     ("archived_archetypes", archived_archetypes),
+                    ("fsst_archetypes", fsst_archetypes),
                     ("string_buffers", string_buffers),
                     ("span_starts", span_starts),
                     (
@@ -962,6 +1036,26 @@ pub mod collect {
                 }
                 for (group, count) in archived_field_columns {
                     output.counter(&identity, &format!("archived_columns.{group}"), count)?;
+                }
+                assert_eq!(characters.strings, archived_string_entries);
+                // Emit zero buckets too, distinguishing absence from old evidence
+                // that predates character profiling. ASCII IDs are decimal 0..127.
+                for bucket in 0..129 {
+                    let name = if bucket == 128 {
+                        "non_ascii".to_owned()
+                    } else {
+                        format!("ascii.{bucket}")
+                    };
+                    output.counter(
+                        &identity,
+                        &format!("string_characters.occurrences.{name}"),
+                        characters.occurrences[bucket],
+                    )?;
+                    output.counter(
+                        &identity,
+                        &format!("string_characters.strings_containing.{name}"),
+                        characters.strings_containing[bucket],
+                    )?;
                 }
                 // Trailer bytes are payload, never container overhead. Their exact
                 // per-block leaves above replace the old stderr reclassification.

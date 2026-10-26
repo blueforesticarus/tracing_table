@@ -121,7 +121,13 @@ impl PerCallsiteData {
                 self.cache.push(
                     PerArchData {
                         data,
-                        strings: BufferCollection::default(),
+                        // Production rows use stable indexes. Retain the legacy
+                        // explicit offset mode without moving its byte addresses.
+                        strings: if archetype.string_storage == StringStorage::Offset {
+                            BufferCollection::with_fsst_training(0)
+                        } else {
+                            BufferCollection::default()
+                        },
                         chunk_string_start: 0,
                         strings_per_row,
                         // id_counter: 1.into(),
@@ -1997,7 +2003,10 @@ mod test {
                 assert!(arch.data.ring.is_empty());
                 assert!(arch.strings.get(StringBufferId::new(0)).is_none());
                 assert_eq!(arch.data.active.length, 1);
-                assert_eq!(arch.strings.active.get_index(0), Some("protected"));
+                assert_eq!(
+                    arch.strings.active.get_index(0).as_deref(),
+                    Some("protected")
+                );
             }
         }
     }
@@ -2076,6 +2085,6 @@ mod test {
             StringBufferId::new(1)
         );
         let old = arch.strings.get(StringBufferId::new(0)).unwrap();
-        assert_eq!(old.get_index(0), Some(text.as_str()));
+        assert_eq!(old.get_index(0).as_deref(), Some(text.as_str()));
     }
 }

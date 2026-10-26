@@ -249,6 +249,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "fsst-rs"
+version = "0.0.0"
+source = "git+https://github.com/spiraldb/fsst?rev=d67bf742d783255bf828c8d964564f342332a735#d67bf742d783255bf828c8d964564f342332a735"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "gimli"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -541,6 +549,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "ruzstd"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -767,6 +781,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "foldhash",
+ "fsst-rs",
  "hashbrown",
  "introspect-fmt",
  "log",

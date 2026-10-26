@@ -49,6 +49,8 @@ lz4 = "1"
 # Buffer hashes are transient and byte equality resolves collisions.
 foldhash = "0.2"
 hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
+# Pin the requested Rust trainer/decoder; retain compact per-archetype tables.
+fsst-codec = { package = "fsst-rs", git = "https://github.com/spiraldb/fsst", rev = "d67bf742d783255bf828c8d964564f342332a735" }
 
 # Measurement collector has its own CLI and emits CSV rather than benchmark timings.
 [[bench]]

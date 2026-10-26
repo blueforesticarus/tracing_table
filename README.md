@@ -483,6 +483,25 @@ the default (HC3), `Some(1..=12)` selects native LZ4 HC, and `None` selects
 `flex` selects `lz4_flex`.
 Readers support both encoders without configuration.
 
+Indexed string buffers now learn an FSST8 table after 16 KiB of unique text per
+archetype, re-encode the warm-up strings, and reuse the table across active and
+archived buffers. Indexes stay stable while byte offsets may change. Active
+lookups decode one string; archived buffers retain outer LZ4 compression.
+Tables that cannot repay their storage cost are discarded. Set
+`STRING_FSST_TRAIN_BYTES` to tune the warm-up, or `0` to disable FSST for baseline
+measurements. `first-buffer` instead trains from every stored string at the first
+nonempty buffer rotation; see the [first-buffer experiment](doc/fsst_first_buffer_2026-10-26/report.md).
+Legacy explicit-offset recording stays UTF-8. The
+[live storage comparison](doc/fsst_live_2026-10-26/report.md) separates active and
+archived payload, overhead, shared tables, and spare capacity for Bevy and Actix.
+
+FSST training and decoding use [SpiralDB's Rust implementation](https://github.com/spiraldb/fsst),
+pinned to a specific commit. The retained encoder still uses compact first-byte
+buckets instead of keeping the upstream compressor's large lookup tables.
+Each shared table remains 3,080 bytes, including Arc counters. FSST no longer
+builds C++ or requires `libstdc++` at runtime. See the
+[performance comparison](doc/spiral_fsst_2026-10-26/report.md).
+
 `RecordingLayer::message_block_min_rows` defaults to `0` (no optional row floor),
 or the value of `MESSAGE_BLOCK_MIN_ROWS` in the environment. The byte target
 still applies, with capacity for at least one row.
@@ -737,6 +756,9 @@ TODO: choose when to compact based on when we lose a constant bit.
 Thu Oct 22 02:00:32 AM EDT 2026
 
 All string buffers. lz4 level comparison.
+
+For FSST8/12, Shoco (default and trained), SMAZ2, and the experimental nibble
+codecs on identical exported entries, see the [string codec comparison](doc/string_codecs_2026-10-26/report.md).
 
 Same 503 buffers, 7,409,798 raw bytes. Times are medians of seven release runs, measured separately. Times are total for all buffers.
 
@@ -1192,6 +1214,7 @@ tracing::trace!(
 );
 ```
 - store with single column, optimistically, promote whole active block to new format when assumption is invalidated. 
+- also store integers as lower size integers untill out of bounds value is encountered(mostly to save active space)
 
 | Capture | Feature | Archived saved | Active saved |
 |---|---|---:|---:|
@@ -1244,3 +1267,66 @@ delta or delta of delta encoding ts could reduce size more than stride
 conclusion: not worth it
 
 # string crunching
+
+I tried to come up with a 4bit based encoding for strings based on pallate shifts. Ended up being only 10% better than raw utf8 and 6% larger after lz4.
+
+trying our fsst which is promising as it is not block compression.
+could be helpfull to compress active buffers
+
+tried unishox2 and 3. codex reported bugs and they did not work as well as fsst.
+
+getting a report with fsst shoco and smaz2
+
+| Encoding | Actix before HC3 | Actix after HC3 | Bevy before HC3 | Bevy after HC3 |
+|---|---:|---:|---:|---:|
+| Raw UTF-8 | 2,269,790 | 691,228 | 4,837,713 | 960,367 |
+| Nibble chain7 | 1,816,115 | 709,824 | 4,347,008 | 1,049,238 |
+| Nibble flat15 | 1,816,115 | 708,729 | 4,347,008 | 1,048,773 |
+| FSST8 per buffer | **731,573** | **542,722** | **1,972,039** | 912,079 |
+| FSST8 per capture | 761,551 | 546,432 | 2,602,288 | **856,659** |
+| FSST12 per buffer | 1,559,963 | 1,267,384 | 2,417,856 | 1,719,043 |
+| FSST12 per capture | 928,707 | 626,195 | 1,991,074 | 1,025,199 |
+| Shoco | 1,894,681 | 690,663 | 4,259,788 | 929,509 |
+| Trained Shoco | 1,411,028 | 676,754 | 3,419,157 | 946,347 |
+| SMAZ2 | 1,825,350 | 688,625 | 4,070,170 | 918,203 |
+
+FSST wins. We will do it per archetype for perf reasons (need to train the symbol table on early strings.) 
+
+| Capture / buffer | Payload before → after | Payload change | Overhead before → after | Overhead change |
+|---|---:|---:|---:|---:|
+| Bevy active | 1,862,256 → 1,239,516 | −622,740 | 443,484 → 526,676 | +83,192 |
+| Bevy archived | 821,095 → 707,257 | −113,838 | 4,680 → 4,680 | 0 |
+| Actix active | 82,214 → 43,095 | −39,119 | 59,284 → 71,604 | +12,320 |
+| Actix archived | 658,179 → 496,280 | −161,899 | 3,952 → 3,952 | 0 |
+
+> Including spare capacity, total string storage falls 20.2% for Bevy and 23.5% for Actix.
+
+---
+
+TODO: string buffers need to be per callsite not arch,
+doesnt matter now because we have one arch per callsite.
+
+# static strings
+
+there are some static strings in the dataset but existing compaction compresses them to almost nothing
+
+| Static string field | Recorded rows¹ | Source |
+|---|---:|---|
+| `codec = "json"` | 127,176 | [workload.rs:134](/home/user/files/projects/dev/util/tracing_table/examples/actix_capture/src/workload.rs:134) |
+| `isolation = "read_committed"` on the `database.query` span | 8,830 | [workload.rs:95](/home/user/files/projects/dev/util/tracing_table/examples/actix_capture/src/workload.rs:95) |
+| `pool = "primary"` and `statement = "SELECT sku, price, stock FROM inventory WHERE tenant = $1"` | 8,830 | [workload.rs:97](/home/user/files/projects/dev/util/tracing_table/examples/actix_capture/src/workload.rs:97) |
+| `topic = "order.created"` | 5,106 | [workload.rs:158](/home/user/files/projects/dev/util/tracing_table/examples/actix_capture/src/workload.rs:158) |
+| `upstream = "payment-sandbox"` | 157 | [workload.rs:147](/home/user/files/projects/dev/util/tracing_table/examples/actix_capture/src/workload.rs:147) |
+
+| Literal fields | String payload | Field indices | Total |
+|---|---:|---:|---:|
+| `codec = "json"` | 11 B | 4,752 B | **4,763 B** |
+| `isolation = "read_committed"` | 22 B | 312 B | **334 B** |
+| `pool` + SQL `statement` | 74 B | 408 B | **482 B** |
+| `topic = "order.created"` | 21 B | 188 B | **209 B** |
+| `phase = "begin"` / `"end"` | 22 B | 8 B | **30 B** |
+| **Total** | **150 B** | **5,668 B** | **5,818 B** |
+
+TODO: might help active buffer though.
+
+# archetype on parent span id callsite

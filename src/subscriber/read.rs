@@ -309,12 +309,14 @@ impl PerCallsiteData {
                                 }
                                 ValueKind::Bool => InputValue::Bool(reader.bytes::<1>()[0] != 0),
                                 ValueKind::BufferOffset => InputValue::Text(
-                                    StringStorage::Offset.read(strings, reader.u32()).to_owned(),
+                                    StringStorage::Offset
+                                        .read(strings, reader.u32())
+                                        .into_owned(),
                                 ),
                                 ValueKind::BufferIndex => InputValue::Text(
                                     StringStorage::Index
                                         .read(strings, u32::from(reader.u16()))
-                                        .to_owned(),
+                                        .into_owned(),
                                 ),
                             }
                         }));
@@ -332,7 +334,7 @@ impl PerCallsiteData {
                     row.fields.truncate(self.metadata.fields().len());
                     if let Some(count) = a.template {
                         // Common templates fit inline, matching the ingestion path.
-                        let captures: SmallVec<[&str; 4]> = (0..count)
+                        let captures: SmallVec<[std::borrow::Cow<'_, str>; 4]> = (0..count)
                             .map(|_| {
                                 // Template captures follow the callsite's packed string mode.
                                 let reference = match self.string_storage {
@@ -342,11 +344,15 @@ impl PerCallsiteData {
                                 self.string_storage.read(strings, reference)
                             })
                             .collect();
+                        // Keep individually decoded captures alive during render;
+                        // raw warm-up strings continue to borrow their buffer.
+                        let capture_refs: SmallVec<[&str; 4]> =
+                            captures.iter().map(|s| s.as_ref()).collect();
                         let message = self
                             .template
                             .as_ref()
                             .expect("template archetype")
-                            .render(&captures);
+                            .render(&capture_refs);
                         let field = self.metadata.fields().field("message").unwrap().index();
                         row.fields[field] = Some(InputValue::Text(message));
                     }

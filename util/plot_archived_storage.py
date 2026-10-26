@@ -67,6 +67,7 @@ OVERHEAD_LABELS = {
     "string_collection_structs": "BufferCollection inline structs",
     "string_descriptors": "Occupied compressed-buffer descriptors",
     "string_spare": "Spare compressed-buffer descriptor capacity",
+    "fsst_tables": "Shared FSST table allocations",
     "archetype_structs": "PerArchData/schema headers excluding the two containers",
     "archetype_fields": "Archetype field-type and format-reference capacity",
     "format_recipes": "Callsite format recipes",
@@ -80,6 +81,12 @@ BLOCK_OVERVIEW_LABELS = {
     "block_scratch": "Block buffers: edit scratch",
     "block_span_refs": "Block buffers: span-reference lists",
 }
+# Detailed payload pies repeat only their owner's metadata; the overall archive
+# pie continues to keep all metadata in its separate slice.
+PAYLOAD_BLOCK_OVERHEAD_KEYS = tuple(key for key in BLOCK_OVERVIEW_LABELS if key != 'block_spare')
+PAYLOAD_STRING_OVERHEAD_KEYS = ('string_collection_structs', 'string_descriptors',
+                                'string_spare', 'fsst_tables')
+BLOCK_OVERHEAD_LABEL = 'Per-block overhead'
 OVERVIEW_COLORS = {
     "Span payload": COLORS[0],
     "Span rows + strings": COLORS[0],
@@ -107,10 +114,13 @@ METADATA_PIE_LABELS = {
     "string_collection_structs": "String buffers: inline structs",
     "string_descriptors": "String buffers: used descriptors",
     "string_spare": "String buffers: spare descriptors",
+    "fsst_tables": "FSST tables (trained archetypes)",
     "archetype_structs": "Archetypes: schema headers",
     "archetype_fields": "Archetypes: field and format capacity",
 }
 OVERVIEW_COLORS.update({
+    # Tune the shared-codec slice independently of string descriptors.
+    "FSST tables (trained archetypes)": (0.25, 0.60, 0.65),
     "String buffers: inline structs": (0.48, 0.33, 0.65),
     "String buffers: used descriptors": (0.64, 0.49, 0.77),
     "String buffers: spare descriptors": (0.76, 0.65, 0.85),
@@ -171,6 +181,8 @@ COMPONENT_COLORS[LABELS["parent_archetype_callsite"]] = (0.77, 0.49, 0.13)
 COMPONENT_COLORS[LABELS["timestamp_index"]] = (0.26, 0.65, 0.39)
 COMPONENT_COLORS[LABELS["row_padding"]] = (0.83, 0.35, 0.40)
 COMPONENT_COLORS[LABELS["end_buffer"]] = OVERVIEW_COLORS[LABELS["end_buffer"]]
+# Keep the fully overhead wedge distinct from field and string hues.
+COMPONENT_COLORS[BLOCK_OVERHEAD_LABEL] = (0.55, 0.32, 0.16)
 SPAN_ONLY_COMPONENTS = {"end_timestamp", "follows_from", "spanfieldsref", "update_span"}
 METRICS = ["first_bytes", "mask_bytes", "varying_bytes", "padding_bytes", "compressed_bytes", "total_bytes"]
 LEAF_METRICS = METRICS + ["column_values"]
@@ -373,6 +385,30 @@ def component_breakdown(values, owner, split_indices=False):
     return result
 
 
+def payload_breakdown(values, owner, sites=None, denominator=None):
+    """Add owned block/string metadata using the same weighting as row payload."""
+    selected = eligible_sites(sites, owner) if sites is not None else []
+    def cost(keys):
+        # Weight each callsite's bytes per row before averaging, including zero
+        # costs. Never attribute another record kind's tables or containers.
+        return sum(sum(site['values'].get('metadata.' + key, 0) for key in keys) /
+                   (site['values'][denominator] if denominator else 1)
+                   for site in selected) / (len(selected) if denominator and selected else 1)
+    block, strings = cost(PAYLOAD_BLOCK_OVERHEAD_KEYS), cost(PAYLOAD_STRING_OVERHEAD_KEYS)
+    result = []
+    for name, value, overhead, varying, compressed in component_breakdown(values, owner):
+        if name == LABELS['compressed_payload']:
+            value += strings
+            overhead += strings
+        result.append((name, value, overhead, varying, compressed))
+    # This entire component is overhead: show a solid wedge, without an inner
+    # overhead region or a redundant overhead/payload legend breakdown.
+    result.append((BLOCK_OVERHEAD_LABEL, block, 0, 0, block))
+    assert math.isclose(sum(row[1] for row in result),
+                        total(values, owner=owner) + block + strings, abs_tol=1e-5)
+    return result
+
+
 def overhead_color(color):
     # A shared tint preserves the component hue while identifying inner overhead.
     return tuple(channel + (1 - channel) * OVERHEAD_LIGHTEN for channel in color)
@@ -401,7 +437,7 @@ def radial_component_pie(ctx, x, y, slices, rows):
         inner_radius = RADIUS * math.sqrt(overhead / value)
         if overhead:
             wedge(ctx, x, y, inner_radius, angle, end, overhead_color(color))
-            if varying:
+            if varying or compressed:
                 ctx.arc(x, y, inner_radius, angle, end)
                 ctx.set_source_rgb(1, 1, 1)
                 ctx.set_line_width(RADIAL_BORDER_WIDTH)
@@ -1148,6 +1184,7 @@ def metadata_populations(sites):
         for key, name in METADATA_PIE_LABELS.items():
             counter, unit = (
                 (None, 'callsite') if key == 'format_recipes' else
+                ('fsst_archetypes', 'arch') if key == 'fsst_tables' else
                 ('string_buffers', 'buffer') if key.startswith('string_') else
                 ('archived_archetypes', 'arch') if key.startswith('archetype_') else
                 ('archived_blocks', 'block'))
@@ -1175,10 +1212,11 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
          rows + lifetime['active_rows'], 'retained rows; row-weighted includes active-only callsites'),
         ('overview', 'Archive-only payload + metadata', solid_slices(owners), rows,
          'archived rows; end buffers remain in their owning payload'),
-        ('span', 'Span payload', component_breakdown(values, ('span',)), kinds['span_starts'],
-         'archived span starts; deferred-update storage charged to its callsite'),
-        ('event', 'Event / log payload', component_breakdown(values, ('event', 'log')),
-         kinds['events'] + kinds['logs'], 'archived event/log rows'),
+        ('span', 'Span payload', payload_breakdown(values, ('span',), sites), kinds['span_starts'],
+         'archived span starts; includes owned block/string overhead; excludes spare block descriptors'),
+        ('event', 'Event / log payload', payload_breakdown(values, ('event', 'log'), sites),
+         kinds['events'] + kinds['logs'],
+         'archived event/log rows; includes owned block/string overhead; excludes spare block descriptors'),
         ('metadata', 'Metadata overhead', solid_slices(metadata_slices(metadata)), rows,
          'archived rows; container metadata only'),
     ]
@@ -1192,6 +1230,10 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
     nonfield = {key: dict(rows=sum(total(values, owner=owner, group=group)
                                   for group in ('metadata', 'end_buffer')), callsites=None)
                 for key, owner in [('span', ('span',)), ('event', ('event', 'log'))]}
+    # Block containers count as nonfield cost; string containers stay with strings.
+    for key, _, slices, _, _ in definitions:
+        if key in nonfield:
+            nonfield[key]['rows'] += next(row[1] for row in slices if row[0] == BLOCK_OVERHEAD_LABEL)
     if sites is not None:
         eligible = eligible_sites(sites)
         archive = average_leaves(eligible, 'archived_rows')
@@ -1210,12 +1252,14 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
                                         ('event', ('event', 'log'), 'archived_rows')]:
             selected = eligible_sites(sites, owner)
             averaged = average_leaves(selected, denominator)
-            averages[key] = component_breakdown(averaged, owner)
+            averages[key] = payload_breakdown(averaged, owner, sites, denominator)
             # Both numerator and denominator use the common callsite cohort.
             # Their ratio weights column occurrences consistently with this 
             columns[key]['callsites'] = column_populations(averaged, owner)
             nonfield[key]['callsites'] = sum(total(averaged, owner=owner, group=group)
                                              for group in ('metadata', 'end_buffer'))
+            nonfield[key]['callsites'] += next(row[1] for row in averages[key]
+                                               if row[0] == BLOCK_OVERHEAD_LABEL)
             cohorts[key] = len(selected)
     populations = metadata_populations(sites) if sites is not None else {}
     return [dict(key=key, title=title, rows=slices, denominator=denominator, note=note,
@@ -1319,7 +1363,12 @@ def key_lines(group, style, row):
         varying_rate = per_row(8 * varying, rate_denominator) if rate_denominator else '—'
         frequency = per_row(count, denominator) if count else '—'
         unit = 'bits/col' if field else 'bits per row'
-        detail = f'Constant (first + mask) {constant_rate} · varying {varying_rate} {unit}'
+        if name == LABELS['compressed_payload']:
+            # Container metadata is overhead, rather than a field's first/mask.
+            payload_rate = per_row(8 * (varying + unsplit), rate_denominator)
+            detail = f'Buffer overhead {constant_rate} · payload {payload_rate} {unit}'
+        else:
+            detail = f'Constant (first + mask) {constant_rate} · varying {varying_rate} {unit}'
         # Omit the redundant one-column-per-row frequency outside fields/args.
         if field or (count and not math.isclose(count / denominator, 1, abs_tol=1e-9)):
             detail += f' · {frequency} col/row'
@@ -1525,7 +1574,7 @@ def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
              size=23, bold=True)
     text(ctx, MARGIN, 198, 'Row-weighted: summed bytes / summed rows. Equal-callsite: mean of each eligible callsite’s bytes / rows.', size=20)
     text(ctx, MARGIN, 228, 'Equal-callsite cohort: at least one archived block; all archetypes combined. Zero component costs still count.', size=20)
-    text(ctx, MARGIN, 258, 'Pie angles use each component’s rate / total rate. Light = constant (first + mask); dark = varying. Solid = unsplit cost.', size=19)
+    text(ctx, MARGIN, 258, 'Pie angles use component / total rate. Light = overhead (first + mask or buffers); dark = payload. Solid = unsplit cost.', size=19)
     text(ctx, MARGIN, 282, 'Fields/args use bits/col; other breakdowns use bits per row. Fixed 1 col/row is omitted outside fields/args.', size=17)
     top = HEADER_HEIGHT
     for group in groups:
