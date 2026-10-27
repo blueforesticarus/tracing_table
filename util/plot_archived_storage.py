@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 import math
 import statistics
 import textwrap
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,7 +35,7 @@ DATASET_GUTTER = 220
 DATASET_PIE_X = 130
 # Left selectors can use more of the section height than the weighting pie.
 DATASET_PIE_SCALE = 0.5
-DATASET_PIE_Y = (250, 500)
+DATASET_PIE_Y = (240, 530)
 START_ANGLE = -math.pi / 2
 FONT_SIZE = 19
 SLICE_LABEL_MIN_PERCENT = 5.0
@@ -47,6 +47,9 @@ INDEX_MODE_LABELS = {'constant': 'constant', 'raw': 'raw', 'offset': 'offset res
                      'cycle': 'cycle residual', 'dictionary': 'dictionary',
                      'dictionary_cycle': 'dictionary + cycle', 'residual': 'residual'}
 OVERHEAD_LIGHTEN = 0.62
+# Each extra inner tier is lightened further, so the innermost stays lightest.
+TIER_LIGHTEN_STEP = 0.14
+MAX_TIER_LIGHTEN = 0.92
 RADIAL_LABEL_RADIUS = 0.80
 RADIAL_BORDER_WIDTH = 1.5
 COLORS = [
@@ -55,7 +58,8 @@ COLORS = [
     (0.73, 0.57, 0.31), (0.53, 0.64, 0.27), (0.68, 0.49, 0.63),
     (0.38, 0.46, 0.51), (0.72, 0.73, 0.76),
 ]
-GROUPS = ["metadata", "string_field_index", "format_args_index", "non_string_fields", "compressed_payload", "compressed_index", "end_buffer"]
+# Pie order follows storage: block metadata, row fields, then the string buffers.
+GROUPS = ["metadata", "non_string_fields", "string_field_index", "format_args_index", "compressed_payload", "compressed_index", "end_buffer"]
 OVERHEAD_LABELS = {
     "block_cache_structs": "BlockCache inline structs",
     "block_scratch": "Block edit-scratch capacity",
@@ -74,62 +78,36 @@ OVERHEAD_LABELS = {
     # The collector charges the shared weak parent lookup once, as metadata.
     "parent_timestamp_registry": "Parent timestamp weak index",
 }
-BLOCK_OVERVIEW_LABELS = {
-    "block_entries": "Block buffers: used descriptors",
-    "frame_headers": "Block buffers: heap headers",
-    "frame_padding": "Block buffers: alignment padding",
-    "block_spare": "Block buffers: spare descriptors",
-    "block_cache_structs": "Block buffers: cache structs",
-    "block_scratch": "Block buffers: edit scratch",
-    "block_span_refs": "Block buffers: span-reference lists",
-}
-# Detailed payload pies repeat only their owner's metadata; the overall archive
-# pie continues to keep all metadata in its separate slice.
-PAYLOAD_BLOCK_OVERHEAD_KEYS = tuple(key for key in BLOCK_OVERVIEW_LABELS if key != 'block_spare')
-PAYLOAD_STRING_OVERHEAD_KEYS = ('string_collection_structs', 'string_descriptors',
-                                'string_spare', 'fsst_tables')
+# Detailed payload pies charge every container to exactly one slice. Costs that
+# exist once per archived block form the solid per-block slice, string-buffer
+# costs become inner tiers of the compressed-string slice, and the remaining
+# owned containers share one slice. The overall archive pie keeps one
+# metadata slice, and the metadata pie lists every item.
+PER_BLOCK_OVERHEAD_KEYS = ("block_entries", "frame_headers", "frame_padding", "block_span_refs")
+FSST_OVERHEAD_KEYS = ("fsst_tables",)
+STRING_BUFFER_OVERHEAD_KEYS = ("string_collection_structs", "string_descriptors", "string_spare")
+OTHER_OVERHEAD_KEYS = tuple(key for key in OVERHEAD_LABELS if key not in
+                            PER_BLOCK_OVERHEAD_KEYS + FSST_OVERHEAD_KEYS + STRING_BUFFER_OVERHEAD_KEYS)
 BLOCK_OVERHEAD_LABEL = 'Per-block overhead'
-OVERVIEW_COLORS = {
-    "Span payload": COLORS[0],
-    "Span rows + strings": COLORS[0],
-    # Tune event and bridged-log hues independently in the archive overview.
-    "Event payload": COLORS[1],
-    "Log payload": (0.02, 0.32, 0.30),
-    "Event/log rows + strings": COLORS[1],
-    "Block buffers: used descriptors": (0.82, 0.39, 0.10),
-    "Block buffers: heap headers": (0.95, 0.59, 0.20),
-    # Give alignment its own tunable hue beside the heap-header slice.
-    "Block buffers: alignment padding": (0.98, 0.80, 0.45),
-    "Block buffers: spare descriptors": (0.70, 0.52, 0.28),
-    "Block buffers: cache structs": (0.95, 0.75, 0.40),
-    "Block buffers: edit scratch": (0.55, 0.32, 0.16),
-    "Block buffers: span-reference lists": (0.62, 0.43, 0.32),
-    # Trailer payload uses a distinct hue from container metadata.
-    "End buffer: parent table": (0.40, 0.49, 0.25),
-    "String-buffer collection overhead": COLORS[3],
-    "Archetype overhead": COLORS[4],
-    "Metadata overhead": COLORS[2],
-}
+OTHER_OVERHEAD_LABEL = 'Other overhead'
+# Grouped like the detailed pies: other containers, per-block costs, string buffers.
 METADATA_PIE_LABELS = {
     "format_recipes": "Callsite format recipes",
     "parent_timestamp_registry": "Parent timestamp weak index",
-    **BLOCK_OVERVIEW_LABELS,
+    "archetype_structs": "Archetypes: schema headers",
+    "archetype_fields": "Archetypes: field and format capacity",
+    "block_cache_structs": "Block buffers: cache structs",
+    "block_scratch": "Block buffers: edit scratch",
+    "block_spare": "Block buffers: spare descriptors",
+    "block_span_refs": "Block buffers: span-reference lists",
+    "block_entries": "Block buffers: used descriptors",
+    "frame_headers": "Block buffers: heap headers",
+    "frame_padding": "Block buffers: alignment padding",
     "string_collection_structs": "String buffers: inline structs",
     "string_descriptors": "String buffers: used descriptors",
     "string_spare": "String buffers: spare descriptors",
     "fsst_tables": "FSST tables (trained archetypes)",
-    "archetype_structs": "Archetypes: schema headers",
-    "archetype_fields": "Archetypes: field and format capacity",
 }
-OVERVIEW_COLORS.update({
-    # Tune the shared-codec slice independently of string descriptors.
-    "FSST tables (trained archetypes)": (0.25, 0.60, 0.65),
-    "String buffers: inline structs": (0.48, 0.33, 0.65),
-    "String buffers: used descriptors": (0.64, 0.49, 0.77),
-    "String buffers: spare descriptors": (0.76, 0.65, 0.85),
-    "Archetypes: schema headers": (0.77, 0.27, 0.36),
-    "Archetypes: field and format capacity": (0.91, 0.53, 0.59),
-})
 LIFETIME_LABELS = {
     "archived_messages": "Messages: archived / compacted",
     "active_messages": "Messages: active / uncompressed",
@@ -142,10 +120,44 @@ LIFETIME_OVERHEAD_KEYS = {
     "archived_strings": "archived_string_overhead",
     "writable_active_raw": "writable_string_overhead",
 }
-OVERVIEW_COLORS.update(zip(LIFETIME_LABELS.values(), [
-    (0.20, 0.42, 0.70), (0.43, 0.67, 0.87),
-    (0.12, 0.62, 0.55), (0.35, 0.73, 0.48),
-]))
+# No color is shared between unrelated slices. Related items share a hue:
+# indigo for shared containers, brown for per-block costs, slate for strings.
+SPAN_PAYLOAD_COLOR = (0.10, 0.20, 0.48)
+EVENT_PAYLOAD_COLOR = (0.72, 0.18, 0.55)
+OTHER_OVERHEAD_COLOR = (0.42, 0.40, 0.72)
+BLOCK_OVERHEAD_COLOR = (0.55, 0.32, 0.16)
+STRING_BUFFER_COLOR = (0.30, 0.40, 0.46)
+ARCHETYPE_COLOR = (0.52, 0.49, 0.80)
+OVERVIEW_COLORS = {
+    "Span payload": SPAN_PAYLOAD_COLOR,
+    "Event payload": EVENT_PAYLOAD_COLOR,
+    "Log payload": (0.42, 0.10, 0.34),
+    "Metadata overhead": (0.88, 0.72, 0.12),
+    # Legacy reports use these names for the same combined slices.
+    "Span rows + strings": SPAN_PAYLOAD_COLOR,
+    "Event/log rows + strings": EVENT_PAYLOAD_COLOR,
+    "String-buffer collection overhead": STRING_BUFFER_COLOR,
+    "Archetype overhead": ARCHETYPE_COLOR,
+    "Messages: archived / compacted": (0.00, 0.52, 0.66),
+    "Messages: active / uncompressed": (0.55, 0.82, 0.88),
+    "Strings: archived / LZ4": (0.78, 0.30, 0.12),
+    "Strings: writable / uncompressed": (0.93, 0.64, 0.52),
+    "Callsite format recipes": (0.20, 0.18, 0.45),
+    "Parent timestamp weak index": (0.30, 0.27, 0.60),
+    "Archetypes: schema headers": ARCHETYPE_COLOR,
+    "Archetypes: field and format capacity": (0.72, 0.70, 0.92),
+    "Block buffers: cache structs": (0.50, 0.20, 0.55),
+    "Block buffers: edit scratch": (0.64, 0.34, 0.68),
+    "Block buffers: span-reference lists": (0.85, 0.72, 0.58),
+    "Block buffers: spare descriptors": (0.88, 0.72, 0.90),
+    "Block buffers: used descriptors": (0.45, 0.26, 0.12),
+    "Block buffers: heap headers": (0.62, 0.40, 0.22),
+    "Block buffers: alignment padding": (0.78, 0.60, 0.42),
+    "String buffers: inline structs": STRING_BUFFER_COLOR,
+    "String buffers: used descriptors": (0.48, 0.58, 0.64),
+    "String buffers: spare descriptors": (0.68, 0.76, 0.80),
+    "FSST tables (trained archetypes)": (0.08, 0.32, 0.40),
+}
 LABELS = {
     "metadata": "Block metadata",
     "string_field_index": "String-field indices",
@@ -165,27 +177,32 @@ LABELS = {
     "update_span": "Span-update SpanId",
     "row_padding": "Row padding",
 }
+# Listed in row-storage order: timestamps, span references, then the parent.
 METADATA_COMPONENTS = {
     "timestamp": ("timestamp",),
     "timestamp_index": ("timestamp_index",),
     "end_timestamp": ("end_timestamp",),
-    "parent_archetype_callsite": ("parent.archetype", "parent.callsite", "parent.table_index"),
-    "parent_index": ("parent.index",),
     # All span references can use a residual plus shared identity-table key.
-    "follows_from": ("follows_from.index", "follows_from.callsite", "follows_from.archetype", "follows_from.table_index"),
     "update_span": ("update_span.index", "update_span.callsite", "update_span.archetype", "update_span.table_index"),
+    "follows_from": ("follows_from.index", "follows_from.callsite", "follows_from.archetype", "follows_from.table_index"),
+    "parent_index": ("parent.index",),
+    "parent_archetype_callsite": ("parent.archetype", "parent.callsite", "parent.table_index"),
 }
-COMPONENT_ORDER = ("timestamp", "timestamp_index", "end_timestamp", "parent_archetype_callsite",
-                   "parent_index", "follows_from", "spanfieldsref", "update_span", *GROUPS[1:])
-COMPONENT_COLORS = {LABELS[name]: COLORS[index % len(COLORS)]
-                    for index, name in enumerate(name for name in COMPONENT_ORDER
-                                                 if name not in {"parent_archetype_callsite", "timestamp_index"})}
-COMPONENT_COLORS[LABELS["parent_archetype_callsite"]] = (0.77, 0.49, 0.13)
-COMPONENT_COLORS[LABELS["timestamp_index"]] = (0.26, 0.65, 0.39)
-COMPONENT_COLORS[LABELS["row_padding"]] = (0.83, 0.35, 0.40)
-COMPONENT_COLORS[LABELS["end_buffer"]] = OVERVIEW_COLORS[LABELS["end_buffer"]]
-# Keep the fully overhead wedge distinct from field and string hues.
-COMPONENT_COLORS[BLOCK_OVERHEAD_LABEL] = (0.55, 0.32, 0.16)
+# Fixed per-component colors keep the span and event pies stable.
+COMPONENT_BASE_COLORS = {
+    "timestamp": (0.20, 0.42, 0.70), "timestamp_index": (0.26, 0.65, 0.39),
+    "end_timestamp": (0.12, 0.62, 0.55), "update_span": (0.34, 0.66, 0.83),
+    "follows_from": (0.58, 0.42, 0.72), "parent_index": (0.94, 0.57, 0.22),
+    "parent_archetype_callsite": (0.77, 0.49, 0.13), "spanfieldsref": (0.88, 0.62, 0.70),
+    "non_string_fields": (0.68, 0.49, 0.63),
+    # Forest green sits beside the olive format-argument indices it resembles.
+    "string_field_index": (0.10, 0.38, 0.20), "format_args_index": (0.53, 0.64, 0.27),
+    "compressed_payload": (0.38, 0.46, 0.51), "compressed_index": (0.72, 0.73, 0.76),
+    "end_buffer": (0.40, 0.49, 0.25), "row_padding": (0.83, 0.35, 0.40),
+}
+COMPONENT_COLORS = {LABELS[key]: color for key, color in COMPONENT_BASE_COLORS.items()}
+COMPONENT_COLORS[BLOCK_OVERHEAD_LABEL] = BLOCK_OVERHEAD_COLOR
+COMPONENT_COLORS[OTHER_OVERHEAD_LABEL] = OTHER_OVERHEAD_COLOR
 SPAN_ONLY_COMPONENTS = {"end_timestamp", "follows_from", "spanfieldsref", "update_span"}
 METRICS = ["footer_bytes", "first_bytes", "mask_bytes", "varying_bytes", "padding_bytes", "compressed_bytes", "total_bytes"]
 LEAF_METRICS = METRICS + ["column_values"]
@@ -230,7 +247,7 @@ MUTED = (0.39, 0.43, 0.49)
 
 
 # Pie/key geometry; adjust independently of histogram geometry.
-HEADER_HEIGHT = 300
+HEADER_HEIGHT = 360
 ROW_MIN_HEIGHT = 700
 ROW_GAP = 28
 PIE_CENTER_X = 225
@@ -299,8 +316,38 @@ def format_rate(value):
 
 
 def per_row(value, rows):
-    # The caller chooses the explicitly labeled total-row or per-kind denominator.
-    return format_rate(value / rows)
+    # The caller chooses the explicitly labeled total-row or per-kind denominator;
+    # an empty population has no rate.
+    return format_rate(value / rows) if rows else '—'
+
+
+def share(part, whole):
+    """Percent of a pie; an all-zero pie has no shares."""
+    return 100 * part / whole if whole else 0
+
+
+def format_percent(value):
+    """Share with two decimals, without printing a false 0.00% for a nonzero slice."""
+    return '<0.01%' if 0 < value < 0.005 else f'{value:.2f}%'
+
+
+def ordered_runs(runs):
+    """The Bevy reference leads in every place runs are listed; others follow alphabetically."""
+    return tuple(sorted(runs, key=lambda run: (run != 'bevy', run)))
+
+
+def run_label(run):
+    return run[:1].upper() + run[1:]
+
+
+# A slice is a named total plus radial tiers, innermost first. Tier bytes sum to
+# the total; every tier but the last is drawn as a lighter inner region.
+Slice = namedtuple('Slice', 'name value tiers')
+FIELD_TIERS = ('constant', 'footer', 'varying')
+
+
+def solid(name, value):
+    return Slice(name, value, ((name, value),))
 
 
 def overview_slices(values, metadata):
@@ -379,46 +426,62 @@ def component_breakdown(values, owner, split_indices=False):
         if name == LABELS['end_buffer'] and value == 0:
             continue
         value -= metrics["padding_bytes"][name]
-        overhead = sum(metrics[metric][name] for metric in ("first_bytes", "mask_bytes", "footer_bytes"))
+        constant = metrics["first_bytes"][name] + metrics["mask_bytes"][name]
+        footer = metrics["footer_bytes"][name]
         varying = metrics["varying_bytes"][name]
         compressed = metrics["compressed_bytes"][name]
-        assert math.isclose(overhead + varying + compressed, value, abs_tol=1e-5)
-        assert compressed == 0 or overhead + varying == 0
-        result.append((name, value, overhead, varying, compressed))
+        assert math.isclose(constant + footer + varying + compressed, value, abs_tol=1e-5)
+        assert compressed == 0 or constant + footer + varying == 0
+        # Compressed bytes have no meaningful split, so they stay one solid tier.
+        tiers = (('payload', compressed),) if compressed else tuple(zip(FIELD_TIERS, (constant, footer, varying)))
+        result.append(Slice(name, value, tiers))
     padding = total(values, owner=owner, metric="padding_bytes")
-    # Solid slice: padding is neither a field's first/mask nor meaningful bits.
-    result.append((LABELS["row_padding"], padding, 0, 0, padding))
+    # Solid slice: padding is neither a field's constant bits nor meaningful bits.
+    result.append(solid(LABELS["row_padding"], padding))
     assert math.isclose(sum(row[1] for row in result), total(values, owner=owner), abs_tol=1e-5)
     return result
 
 
+def payload_sites(sites, owner, denominator=None):
+    """Archived callsites of this owner; a weighting denominator must also be positive."""
+    return [site for site in eligible_sites(sites, owner)
+            if not denominator or site['values'][denominator] > 0]
+
+
 def payload_breakdown(values, owner, sites=None, denominator=None):
-    """Add owned block/string metadata using the same weighting as row payload."""
-    selected = eligible_sites(sites, owner) if sites is not None else []
+    """Add owned container overhead using the same weighting as row payload."""
+    selected = payload_sites(sites, owner, denominator) if sites is not None else []
     def cost(keys):
         # Weight each callsite's bytes per row before averaging, including zero
         # costs. Never attribute another record kind's tables or containers.
         return sum(sum(site['values'].get('metadata.' + key, 0) for key in keys) /
                    (site['values'][denominator] if denominator else 1)
                    for site in selected) / (len(selected) if denominator and selected else 1)
-    block, strings = cost(PAYLOAD_BLOCK_OVERHEAD_KEYS), cost(PAYLOAD_STRING_OVERHEAD_KEYS)
+    block, other = cost(PER_BLOCK_OVERHEAD_KEYS), cost(OTHER_OVERHEAD_KEYS)
+    tables, buffers = cost(FSST_OVERHEAD_KEYS), cost(STRING_BUFFER_OVERHEAD_KEYS)
     result = []
-    for name, value, overhead, varying, compressed in component_breakdown(values, owner):
-        if name == LABELS['compressed_payload']:
-            value += strings
-            overhead += strings
-        result.append((name, value, overhead, varying, compressed))
-    # This entire component is overhead: show a solid wedge, without an inner
-    # overhead region or a redundant overhead/payload legend breakdown.
-    result.append((BLOCK_OVERHEAD_LABEL, block, 0, 0, block))
+    for name, value, tiers in component_breakdown(values, owner):
+        if name == LABELS['compressed_payload'] and tables + buffers:
+            # String-buffer containers surround the compressed bytes as inner tiers.
+            tiers = (('FSST tables', tables), ('other buffer overhead', buffers), ('payload', value))
+            value += tables + buffers
+        result.append(Slice(name, value, tiers))
+    # These entire components are overhead: solid wedges without inner regions.
+    result += [solid(BLOCK_OVERHEAD_LABEL, block), solid(OTHER_OVERHEAD_LABEL, other)]
     assert math.isclose(sum(row[1] for row in result),
-                        total(values, owner=owner) + block + strings, abs_tol=1e-5)
+                        total(values, owner=owner) + block + other + tables + buffers, abs_tol=1e-5)
     return result
 
 
-def overhead_color(color):
+def overhead_color(color, lighten=OVERHEAD_LIGHTEN):
     # A shared tint preserves the component hue while identifying inner overhead.
-    return tuple(channel + (1 - channel) * OVERHEAD_LIGHTEN for channel in color)
+    return tuple(channel + (1 - channel) * lighten for channel in color)
+
+
+def tier_tints(count):
+    """Innermost tiers are lightest; a single inner tier keeps the base tint."""
+    return [min(MAX_TIER_LIGHTEN, OVERHEAD_LIGHTEN + TIER_LIGHTEN_STEP * (count - 1 - index))
+            for index in range(count)]
 
 
 def wedge(ctx, x, y, radius, start, end, color):
@@ -431,21 +494,28 @@ def wedge(ctx, x, y, radius, start, end, color):
 
 
 def radial_component_pie(ctx, x, y, slices, rows):
-    """Angles encode component totals; inner/outer areas encode their byte costs."""
-    size = sum(value for _, value, *_ in slices)
+    """Angles encode component totals; nested radii encode each tier's byte cost."""
+    size = sum(row[1] for row in slices)
+    if size == 0:
+        return
     angle = START_ANGLE
-    for index, (name, value, overhead, varying, compressed) in enumerate(slices):
+    for index, (name, value, tiers) in enumerate(slices):
         if value == 0:
             continue
         end = angle + math.tau * value / size
         color = slice_color(name, index)
         wedge(ctx, x, y, RADIUS, angle, end, color)
         # Squared radii, rather than ring thickness, keep the displayed areas honest.
-        inner_radius = RADIUS * math.sqrt(overhead / value)
-        if overhead:
-            wedge(ctx, x, y, inner_radius, angle, end, overhead_color(color))
-            if varying or compressed:
-                ctx.arc(x, y, inner_radius, angle, end)
+        radii, running = [], 0
+        for _, amount in tiers[:-1]:
+            running += amount
+            radii.append(RADIUS * math.sqrt(min(1, running / value)))
+        # Paint outermost first so each lighter tier covers the one beyond it.
+        for radius, tint in reversed(list(zip(radii, tier_tints(len(radii))))):
+            wedge(ctx, x, y, radius, angle, end, overhead_color(color, tint))
+        for (_, amount), radius in zip(tiers, radii):
+            if amount and radius < RADIUS * (1 - 1e-9):
+                ctx.arc(x, y, radius, angle, end)
                 ctx.set_source_rgb(1, 1, 1)
                 ctx.set_line_width(RADIAL_BORDER_WIDTH)
                 ctx.stroke()
@@ -460,12 +530,12 @@ def radial_component_pie(ctx, x, y, slices, rows):
         if percent >= SLICE_LABEL_MIN_PERCENT:
             mid = (angle + end) / 2
             label_radius = RADIAL_LABEL_RADIUS * RADIUS
+            inner_radius = radii[-1] if radii else 0
+            label_color = INK if label_radius < inner_radius + 15 else (1, 1, 1)
             text(ctx, x + label_radius * math.cos(mid), y + label_radius * math.sin(mid) + 6,
-                 per_row(8 * value, rows), size=19, bold=True, center=True,
-                 color=(0.14, 0.18, 0.23) if label_radius < inner_radius + 15 else (1, 1, 1))
+                 per_row(8 * value, rows), size=19, bold=True, center=True, color=label_color)
             text(ctx, x + label_radius * math.cos(mid), y + label_radius * math.sin(mid) + 22,
-                 "bits/row", size=11, center=True,
-                 color=(0.14, 0.18, 0.23) if label_radius < inner_radius + 15 else (1, 1, 1))
+                 "bits/row", size=11, center=True, color=label_color)
         angle = end
     assert math.isclose(angle, START_ANGLE + math.tau)
 
@@ -1120,6 +1190,20 @@ def write_evidence(prefix, modes, sites):
                                          panel['site_y_scale']['max'], panel['edges'][panel['plot_start']]])
 
 
+def prune_zero_components(group):
+    """Hide components that cost nothing under every weighting and capture.
+
+    Keys stay stable across the interactive states, without empty entries.
+    """
+    variants = [group, *(variant for variant in (group.get('datasets') or {}).values() if variant)]
+    keep = {row[0] for variant in variants for style in ('rows', 'callsites')
+            for row in variant.get(style) or [] if row[1] > 0}
+    for variant in variants:
+        for style in ('rows', 'callsites'):
+            if variant.get(style):
+                variant[style] = [row for row in variant[style] if row[0] in keep]
+
+
 def pie_layout(groups, style):
     """Fit either key in the shared slot when paired pies can swap."""
     ctx = cairo.Context(cairo.RecordingSurface(cairo.CONTENT_COLOR_ALPHA, None))
@@ -1130,7 +1214,7 @@ def pie_layout(groups, style):
         widest = 0
         for group in groups:
             for variant in group.get('datasets', {'combined': group}).values():
-                for row in variant[current]:
+                for row in (variant or {}).get(current, ()):
                     for line, size in zip(key_lines(variant, current, row),
                                           (LEGEND_NAME_SIZE, LEGEND_RATE_SIZE, LEGEND_BREAKDOWN_SIZE)):
                         ctx.select_font_face('sans-serif')
@@ -1178,8 +1262,8 @@ def average_counters(sites, keys, denominator):
 
 
 def solid_slices(slices):
-    # A common five-value format lets solid pies share the radial renderer.
-    return [(name, value, 0, 0, value) for name, value in slices]
+    # Single-tier slices let solid pies share the radial renderer.
+    return [solid(name, value) for name, value in slices]
 
 
 def metadata_populations(sites):
@@ -1210,37 +1294,44 @@ def metadata_populations(sites):
     return result
 
 
+def overhead_cost(slices):
+    return sum(row[1] for row in slices if row[0] in (BLOCK_OVERHEAD_LABEL, OTHER_OVERHEAD_LABEL))
+
+
 def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
-    """Build five measures, each with a row-weighted and equal-callsite view."""
+    """Build the measures a capture has, each with a row-weighted and equal-callsite view."""
     # Combine raw and residual index leaves in both pies and column denominators.
     owners = overview_slices(values, metadata)
+    # A capture without spans, or without events and logs, simply has no such pie.
+    payloads = [(key, title, owner, count, denominator, note)
+                for key, title, owner, count, denominator, note in [
+                    ('span', 'Span payload', ('span',), kinds['span_starts'], 'span_starts',
+                     'archived span starts; payload plus every owned container'),
+                    ('event', 'Event / log payload', ('event', 'log'), kinds['events'] + kinds['logs'],
+                     'archived_rows', 'archived event/log rows; payload plus every owned container')]
+                if count > 0]
     definitions = [
         ('lifetime', 'Active vs archived', solid_slices(lifetime_slices(lifetime)),
          rows + lifetime['active_rows'], 'retained rows; row-weighted includes active-only callsites'),
         ('overview', 'Archive-only payload + metadata', solid_slices(owners), rows,
          'archived rows; end buffers remain in their owning payload'),
-        ('span', 'Span payload', payload_breakdown(values, ('span',), sites), kinds['span_starts'],
-         'archived span starts; includes owned block/string overhead; excludes spare block descriptors'),
-        ('event', 'Event / log payload', payload_breakdown(values, ('event', 'log'), sites),
-         kinds['events'] + kinds['logs'],
-         'archived event/log rows; includes owned block/string overhead; excludes spare block descriptors'),
+        *[(key, title, payload_breakdown(values, owner, sites), count, note)
+          for key, title, owner, count, _, note in payloads],
         ('metadata', 'Metadata overhead', solid_slices(metadata_slices(metadata)), rows,
          'archived rows; container metadata only'),
     ]
+    slices = {key: group_slices for key, _, group_slices, _, _ in definitions}
     averages, cohorts = {}, {}
     # Denominators count stored values (rows times columns actually present),
     # including metadata, pooled across encoding modes for each component.
-    columns = {key: dict(rows=column_populations(values, owner))
-               for key, owner in [('span', ('span',)), ('event', ('event', 'log'))]}
-    # Nonfield cost includes metadata's attributed padding:
-    # timestamps, span/parent links and end tables; exclude fields and strings.
+    columns = {key: dict(rows=column_populations(values, owner)) for key, _, owner, *_ in payloads}
+    # Nonfield cost includes metadata's attributed padding: timestamps, span/parent
+    # links and end tables; exclude fields and strings. Block and other
+    # containers count as nonfield cost; string containers stay with strings.
     nonfield = {key: dict(rows=sum(total(values, owner=owner, group=group)
-                                  for group in ('metadata', 'end_buffer')), callsites=None)
-                for key, owner in [('span', ('span',)), ('event', ('event', 'log'))]}
-    # Block containers count as nonfield cost; string containers stay with strings.
-    for key, _, slices, _, _ in definitions:
-        if key in nonfield:
-            nonfield[key]['rows'] += next(row[1] for row in slices if row[0] == BLOCK_OVERHEAD_LABEL)
+                                  for group in ('metadata', 'end_buffer')) + overhead_cost(slices[key]),
+                          callsites=None)
+                for key, _, owner, *_ in payloads}
     if sites is not None:
         eligible = eligible_sites(sites)
         archive = average_leaves(eligible, 'archived_rows')
@@ -1255,32 +1346,31 @@ def build_groups(values, rows, kinds, metadata, lifetime, sites=None):
         averages['lifetime'] = solid_slices([(name, snapshot['lifetime.' + key])
                                             for key, name in LIFETIME_LABELS.items()])
         cohorts.update({key: len(eligible) for key in ('lifetime', 'overview', 'metadata')})
-        for key, owner, denominator in [('span', ('span',), 'span_starts'),
-                                        ('event', ('event', 'log'), 'archived_rows')]:
-            selected = eligible_sites(sites, owner)
+        for key, _, owner, _, denominator, _ in payloads:
+            selected = payload_sites(sites, owner, denominator)
             averaged = average_leaves(selected, denominator)
             averages[key] = payload_breakdown(averaged, owner, sites, denominator)
             # Both numerator and denominator use the common callsite cohort.
-            # Their ratio weights column occurrences consistently with this 
+            # Their ratio weights column occurrences consistently with the bytes.
             columns[key]['callsites'] = column_populations(averaged, owner)
             nonfield[key]['callsites'] = sum(total(averaged, owner=owner, group=group)
-                                             for group in ('metadata', 'end_buffer'))
-            nonfield[key]['callsites'] += next(row[1] for row in averages[key]
-                                               if row[0] == BLOCK_OVERHEAD_LABEL)
+                                             for group in ('metadata', 'end_buffer')) + overhead_cost(averages[key])
             cohorts[key] = len(selected)
     populations = metadata_populations(sites) if sites is not None else {}
-    return [dict(key=key, title=title, rows=slices, denominator=denominator, note=note,
+    return [dict(key=key, title=title, rows=group_slices, denominator=denominator, note=note,
                  callsites=averages.get(key), callsite_count=cohorts.get(key), nonfield=nonfield.get(key),
                  metadata_populations=populations if key == 'metadata' else {},
                  columns=columns.get(key))
-            for key, title, slices, denominator, note in definitions]
+            for key, title, group_slices, denominator, note in definitions]
 
 
 def build_dataset_groups(sites):
-    """Re-pool measured callsites per capture before applying either weighting."""
+    """Re-pool measured callsites per capture before applying either weighting.
+
+    Returns {run: {group key: group}}; a capture lacks the groups it has no rows for.
+    """
     result = {}
-    runs = sorted({identity[0] for identity in sites if isinstance(identity, tuple)},
-                  key=lambda run: (run != 'bevy', run))
+    runs = ordered_runs({identity[0] for identity in sites if isinstance(identity, tuple)})
     if len(runs) < 2:
         return result
     for run in runs:
@@ -1298,8 +1388,22 @@ def build_dataset_groups(sites):
         metadata = {key: counters('metadata.' + key) for key in OVERHEAD_LABELS}
         lifetime = {key: counters('lifetime.' + key) for key in LIFETIME_LABELS}
         lifetime['active_rows'] = counters('active_rows')
-        result[run] = build_groups(values, counters('archived_rows'), kinds, metadata, lifetime, selected)
+        groups = build_groups(values, counters('archived_rows'), kinds, metadata, lifetime, selected)
+        result[run] = {group['key']: group for group in groups}
     return result
+
+
+def dataset_slots(count):
+    """Vertical center and scale of each capture selector; many captures shrink to fit."""
+    if count <= 1:
+        return [(PIE_CENTER_Y, DATASET_PIE_SCALE)] * count
+    if count == 2:
+        return [(y, DATASET_PIE_SCALE) for y in DATASET_PIE_Y]
+    margin = SMALL_PIE_LABEL_GAP + SMALL_PIE_LABEL_SIZE
+    top = DATASET_PIE_Y[0] - RADIUS * DATASET_PIE_SCALE - margin
+    slot = (DATASET_PIE_Y[-1] + RADIUS * DATASET_PIE_SCALE + margin - top) / count
+    scale = max(0.08, min(DATASET_PIE_SCALE, (slot - 2 * margin) / (2 * RADIUS)))
+    return [(top + slot * (index + 0.5), scale) for index in range(count)]
 
 
 def dataset_choices(group, dataset):
@@ -1316,15 +1420,40 @@ def draw_dataset_content(ctx, group, current, top, key_x, paired, dataset='combi
     ctx.save()
     if variants:
         ctx.translate(DATASET_GUTTER, 0)
-    draw_pie_content(ctx, selected, current, top, key_x, paired,
-                     dataset.capitalize() if dataset != 'combined' else '')
+    if selected is None:
+        draw_missing_content(ctx, group, current, top, dataset)
+    else:
+        draw_pie_content(ctx, selected, current, top, key_x, paired,
+                         run_label(dataset) if dataset != 'combined' else '')
     ctx.restore()
     if variants:
         choices = dataset_choices(group, dataset)
-        for index, choice in enumerate(choices):
-            y = DATASET_PIE_Y[index] if len(choices) > 1 else PIE_CENTER_Y
-            draw_mini_pie(ctx, variants[choice], current, DATASET_PIE_X, top + y,
-                          choice.capitalize(), scale=DATASET_PIE_SCALE)
+        for (y, scale), choice in zip(dataset_slots(len(choices)), choices):
+            if variants[choice] is None:
+                draw_missing_pie(ctx, DATASET_PIE_X, top + y, run_label(choice), scale)
+            else:
+                draw_mini_pie(ctx, variants[choice], current, DATASET_PIE_X, top + y,
+                              run_label(choice), scale=scale)
+
+
+def draw_missing_content(ctx, group, current, top, dataset):
+    """A capture without this kind of row has nothing to plot."""
+    heading = 'Row weighted' if current == 'rows' else 'Equal callsite'
+    text(ctx, PIE_CENTER_X, top + 120, f'{run_label(dataset)} · {heading.lower()}', size=24, bold=True, center=True)
+    text(ctx, PIE_CENTER_X, top + PIE_CENTER_Y, f'No {group["title"].lower()} rows in this capture',
+         size=20, color=MUTED, center=True)
+
+
+def draw_missing_pie(ctx, x, y, label, scale):
+    radius = RADIUS * scale
+    text(ctx, x, y - radius - SMALL_PIE_LABEL_GAP, label, size=SMALL_PIE_LABEL_SIZE, bold=True, center=True)
+    ctx.arc(x, y, radius, 0, math.tau)
+    ctx.set_source_rgb(*MUTED)
+    ctx.set_dash([6, 6])
+    ctx.set_line_width(RADIAL_BORDER_WIDTH)
+    ctx.stroke()
+    ctx.set_dash([])
+    text(ctx, x, y + 5, 'no rows', size=SMALL_PIE_LABEL_SIZE, color=MUTED, center=True)
 
 
 def field_labels():
@@ -1341,10 +1470,10 @@ def column_populations(values, owner):
 
 def key_lines(group, style, row):
     """Share exact text between measurement and drawing to prevent clipping."""
-    name, cost, overhead, varying, unsplit = row
+    name, cost, tiers = row
     denominator = group['denominator'] if style == 'rows' else 1
     size = sum(item[1] for item in group[style])
-    info = f'{100 * cost / size:.2f}%'
+    info = format_percent(share(cost, size))
     if group['key'] == 'metadata':
         count, unit = group['metadata_populations'][style][name]
         rate = format_rate(cost / count) if count else '—'
@@ -1352,34 +1481,27 @@ def key_lines(group, style, row):
     else:
         info += f' · {per_row(8 * cost, denominator)} bits/row'
     columns = (group.get('columns') or {}).get(style, {})
-    if name in columns and name in field_labels():
-        rate = per_row(8 * cost, columns[name]) if columns[name] else '—'
+    count = columns.get(name, 0)
+    field = name in field_labels()
+    if name in columns and field:
+        rate = per_row(8 * cost, count) if count else '—'
         info += f' · {rate} bits/col'
+    # Fields/args always show their column frequency; other members omit a fixed
+    # one-per-row count so optional members still reveal how often they occur.
+    if name in columns and (field or (count and not math.isclose(count / denominator, 1, abs_tol=1e-9))):
+        info += f' · {per_row(count, denominator) if count else "—"} col/row'
     if style == 'rows':
         info += f' · {kib(cost)} KiB'
     lines = [name, info]
-    # Solid storage (trailers, padding and compressed strings) has no meaningful
-    # overhead/varying split. Empty components likewise need no breakdown line.
-    if group['key'] in ('span', 'event') and (overhead or varying):
-        # Fields/args retain per-column rates; metadata uses the pie's row
+    # Solid storage (trailers, padding and block overhead) has no tiers to break out.
+    if group['key'] in ('span', 'event') and cost and len(tiers) > 1:
+        # Fields/args retain per-column rates; everything else uses the pie's row
         # denominator so optional members still show their actual cost per row.
-        count = columns.get(name, 0)
-        field = name in field_labels()
         rate_denominator = count if field else denominator
-        overhead_rate = per_row(8 * overhead, rate_denominator) if rate_denominator else '—'
-        varying_rate = per_row(8 * varying, rate_denominator) if rate_denominator else '—'
-        frequency = per_row(count, denominator) if count else '—'
-        unit = 'bits/col' if field else 'bits per row'
-        if name == LABELS['compressed_payload']:
-            # Container metadata is overhead, rather than a field's first/mask.
-            payload_rate = per_row(8 * (varying + unsplit), rate_denominator)
-            detail = f'Buffer overhead {overhead_rate} · payload {payload_rate} {unit}'
-        else:
-            detail = f'Overhead {overhead_rate} · varying {varying_rate} {unit}'
-        # Omit the redundant one-column-per-row frequency outside fields/args.
-        if field or (count and not math.isclose(count / denominator, 1, abs_tol=1e-9)):
-            detail += f' · {frequency} col/row'
-        lines.append(detail)
+        unit = 'bits/col' if field else 'bits/row'
+        parts = [f'{label} {per_row(8 * amount, rate_denominator) if rate_denominator else "—"}'
+                 for label, amount in tiers]
+        lines.append(' · '.join([parts[0][:1].upper() + parts[0][1:], *parts[1:]]) + f' {unit}')
     return lines
 
 
@@ -1393,7 +1515,7 @@ def legend_step(group, style, row):
 def group_height(group):
     # Paired keys can have different zero-cost entries; fit the taller partner.
     if group.get('datasets'):
-        return max(group_height(variant) for variant in group['datasets'].values())
+        return max(group_height(variant) for variant in group['datasets'].values() if variant)
     key_height = max(sum(legend_step(group, style, row) for row in (group.get(style) or []))
                      for style in ('rows', 'callsites'))
     return max(ROW_MIN_HEIGHT, LEGEND_TOP + key_height + 45)
@@ -1423,13 +1545,13 @@ def draw_pie_content(ctx, group, current, top, key_x, paired=False, dataset_labe
     denominator = group['denominator'] if current == 'rows' else 1
     heading = 'Row weighted' if current == 'rows' else 'Equal callsite'
     if dataset_label:
-        heading = f'{dataset_label} - {heading.lower()}'
+        heading = f'{dataset_label} · {heading.lower()}'
     text(ctx, x, top + 120, heading, size=24, bold=True, center=True)
     if group['nonfield'] is not None:
         nonfield = group['nonfield'][current]
         total = sum(row[1] for row in slices)
         text(ctx, x, top + NONFIELD_TOP,
-                 f'Nonfield data: {100 * nonfield / total:.2f}% · {per_row(8 * nonfield, denominator)} bits/row',
+                 f'Nonfield data: {share(nonfield, total):.2f}% · {per_row(8 * nonfield, denominator)} bits/row',
                  size=NONFIELD_FONT_SIZE, center=True)
     radial_component_pie(ctx, x, top + PIE_CENTER_Y, slices, denominator)
     rate = 8 * sum(row[1] for row in slices) / denominator
@@ -1472,12 +1594,11 @@ def pie_controls(group, dataset, weighting):
     shift = DATASET_GUTTER if group.get('datasets') else 0
     other = 'callsites' if weighting == 'rows' else 'rows'
     controls = [('weight', (dataset, other), PIE_CENTER_X + SMALL_PIE_DX + shift,
-                 PIE_CENTER_Y + SMALL_PIE_DY, 'Swap weighting for all pies and keys')]
+                 PIE_CENTER_Y + SMALL_PIE_DY, 'Swap weighting for all pies and keys', SMALL_PIE_SCALE)]
     choices = dataset_choices(group, dataset)
-    for index, choice in enumerate(choices):
-        y = DATASET_PIE_Y[index] if len(choices) > 1 else PIE_CENTER_Y
+    for (y, scale), choice in zip(dataset_slots(len(choices)), choices):
         controls.append(('select' + choice, (choice, weighting), DATASET_PIE_X, y,
-                         f'Show {choice} in all main pies and keys'))
+                         f'Show {choice} in all main pies and keys', scale))
     return controls
 
 
@@ -1530,12 +1651,12 @@ def append_interactive_pies(path, groups, layout):
                 **{'data-section': group['key'], 'data-dataset': dataset, 'data-weighting': current})
             for child in fragment:
                 layer.append(child)
-            for action, destination, x, y, label in pie_controls(group, dataset, current):
+            for action, destination, x, y, label, scale in pie_controls(group, dataset, current):
                 trigger = ET.SubElement(layer, f'{{{ns}}}circle',
                     id=pie_control_id(index, dataset, current, action),
                     cx=str(x), cy=str(top + y),
                     # Match each hitbox to its independently tunable pie radius.
-                    r=str(RADIUS * (DATASET_PIE_SCALE if action.startswith('select') else SMALL_PIE_SCALE)),
+                    r=str(RADIUS * scale),
                     fill='transparent', style='cursor:pointer', role='button',
                     **{'pointer-events': 'all', 'aria-label': label, 'data-action': action})
                 ET.SubElement(trigger, f'{{{ns}}}title').text = label
@@ -1556,13 +1677,15 @@ def replay_description(mode):
         raise ValueError('Recollect storage CSV with the current collector: replay mode and minimum block rows are required')
     policy = ('Format patch' if SETTINGS.get('format_args') else
               f"template extraction {'on' if mode == 'true' else 'off'}")
-    return f"{policy} · min rows {SETTINGS['min_block_rows']}"
+    arch = ('off', 'callsite', 'callsite+arch')[int(SETTINGS.get('parent_archetyping', 0))]
+    ts = 'relative' if int(SETTINGS.get('parent_timestamp_offsets', 0)) else 'absolute'
+    return f"{policy} · min rows {SETTINGS['min_block_rows']} · ts {ts} · parent arch {arch}"
 
 
 def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
     """Draw shared headings and the default main/satellite arrangement."""
     text(ctx, MARGIN, 55, 'Where recorded storage goes', size=35, bold=True)
-    runs = ' + '.join(name.capitalize() for name in SETTINGS.get('runs', ('bevy',)))
+    runs = ' + '.join(run_label(name) for name in SETTINGS.get('runs', ('bevy',)))
     text(ctx, MARGIN, 91, f"{runs} reference · {replay_description(mode)} · {timestamp_settings()[2]} ns ticks", size=22)
     # The lifetime snapshot partitions into archive-only and active-only totals.
     # Absolute sizing summaries share that partition for every pie style.
@@ -1579,10 +1702,14 @@ def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
     text(ctx, MARGIN, 161,
              f'Active-only overview: {kib(active_size)} KiB · {active_rows:,} active rows · {per_row(8 * active_size, active_rows)} bits/row',
              size=23, bold=True)
-    text(ctx, MARGIN, 198, 'Row-weighted: summed bytes / summed rows. Equal-callsite: mean of each eligible callsite’s bytes / rows.', size=20)
-    text(ctx, MARGIN, 228, 'Equal-callsite cohort: at least one archived block; all archetypes combined. Zero component costs still count.', size=20)
-    text(ctx, MARGIN, 258, 'Pie angles use component / total rate. Light = overhead (first + mask or buffers); dark = payload. Solid = unsplit cost.', size=19)
-    text(ctx, MARGIN, 282, 'Fields/args use bits/col; other breakdowns use bits per row. Fixed 1 col/row is omitted outside fields/args.', size=17)
+    text(ctx, MARGIN, 198, 'Row weighted: summed bytes / summed rows. Equal callsite: mean of each eligible callsite’s bytes / rows.', size=20)
+    text(ctx, MARGIN, 228, 'Equal callsite cohort: at least one archived block; all archetypes combined. Zero component costs still count.', size=20)
+    text(ctx, MARGIN, 258, 'Angles use component / total rate. Inner tints (area ∝ bytes, lightest innermost) mark overhead tiers; solid = unsplit.', size=19)
+    text(ctx, MARGIN, 282, 'Tiers: constant bits (first + mask) · footer · varying bits. Strings: FSST tables · other buffer overhead · payload.', size=17)
+    text(ctx, MARGIN, 306, 'Fields/args use bits/col; other breakdowns use bits/row. Fixed 1 col/row is omitted outside fields/args.', size=17)
+    if style == 'both':
+        # Interactivity is explained once here rather than beside each section.
+        text(ctx, MARGIN, 330, 'Click a small pie to swap weighting or capture in every section (SVG only).', size=17, bold=True)
     top = HEADER_HEIGHT
     for group in groups:
         ctx.set_source_rgb(0.97, 0.975, 0.98)
@@ -1598,32 +1725,43 @@ def draw_pie_groups(ctx, groups, mode, style, layout, interactive=False):
 
 
 def export_pie_rates(prefix, modes):
-    """Expose both denominators and rates so equal-callsite weighting is auditable."""
+    """Expose both denominators and rates so every weighting and capture is auditable.
+
+    A component row has an empty tier; multi-tier components add one row per tier.
+    """
     with prefix.with_suffix('.pie_rates.csv').open('w', newline='') as output:
         writer = csv.writer(output)
-        writer.writerow(['templates', 'measure', 'style', 'component', 'bits_per_row', 'percent',
-                         'archived_callsite_count', 'row_denominator', 'bits_per_column',
-                         'column_value_denominator', 'overhead_bits_per_row', 'varying_bits_per_row',
-                         'unsplit_bits_per_row', 'overhead_bits_per_column', 'varying_bits_per_column',
-                         'columns_per_row'])
+        writer.writerow(['templates', 'dataset', 'measure', 'style', 'component', 'tier', 'bits_per_row',
+                         'percent', 'archived_callsite_count', 'row_denominator', 'bits_per_column',
+                         'column_value_denominator', 'columns_per_row', 'bytes_per_unit', 'unit'])
         for mode, groups in modes.items():
             for group in groups:
-                for style in ('rows', 'callsites'):
-                    if group[style] is None:
+                variants = {'combined': group, **{run: variant for run, variant in (group.get('datasets') or {}).items()
+                                                  if run != 'combined'}}
+                for dataset, variant in variants.items():
+                    if variant is None:
                         continue
-                    denominator = group['denominator'] if style == 'rows' else 1
-                    size = sum(row[1] for row in group[style])
-                    for name, cost, overhead, varying, unsplit in group[style]:
-                        columns = (group.get('columns') or {}).get(style, {}).get(name, 0)
-                        writer.writerow([mode, group['key'], style, name, 8 * cost / denominator,
-                                         100 * cost / size, group['callsite_count'] or '',
-                                         group['denominator'] if style == 'rows' else '',
-                                         8 * cost / columns if columns else '', columns or '',
-                                         8 * overhead / denominator, 8 * varying / denominator,
-                                         8 * unsplit / denominator,
-                                         8 * overhead / columns if columns else '',
-                                         8 * varying / columns if columns else '',
-                                         columns / denominator if columns and (overhead or varying) else ''])
+                    for style in ('rows', 'callsites'):
+                        if variant[style] is None:
+                            continue
+                        denominator = variant['denominator'] if style == 'rows' else 1
+                        size = sum(row[1] for row in variant[style])
+                        for name, cost, tiers in variant[style]:
+                            columns = (variant.get('columns') or {}).get(style, {}).get(name, 0)
+                            count, unit = (variant['metadata_populations'][style][name]
+                                           if variant['key'] == 'metadata' else (None, ''))
+                            common = [mode, dataset, variant['key'], style, name]
+                            writer.writerow(common + ['', 8 * cost / denominator, share(cost, size),
+                                                      variant['callsite_count'] or '',
+                                                      variant['denominator'] if style == 'rows' else '',
+                                                      8 * cost / columns if columns else '', columns or '',
+                                                      columns / denominator if columns else '',
+                                                      cost / count if count else '', unit])
+                            if len(tiers) > 1:
+                                for label, amount in tiers:
+                                    writer.writerow(common + [label, 8 * amount / denominator, share(amount, size),
+                                                              '', '', 8 * amount / columns if columns else '',
+                                                              '', '', '', ''])
 
 
 def read_csv(path):
@@ -1693,7 +1831,7 @@ def load_evidence(prefix):
             if any(run_settings[row['run']] != settings for row in rows):
                 raise ValueError('missing or incompatible settings for run')
         SETTINGS = settings
-        SETTINGS['runs'] = tuple(sorted(run_settings)) if settings['schema'] == 2 else ('bevy',)
+        SETTINGS['runs'] = ordered_runs(run_settings) if settings['schema'] == 2 else ('bevy',)
         configure_labels()
         counters = [row for row in rows if row['record'] == 'counter']
         sources = [row for row in rows if row['record'] == 'source']
@@ -1770,23 +1908,24 @@ def generate(args, data, counts, kinds, metadata, lifetime, sites, blocks, sourc
     """Compose independently renderable pie and histogram areas in SVG and PNG."""
     need_pies = args.view != 'histograms'
     need_histograms = args.view != 'pies'
-    need_callsites = need_histograms or args.pie_style != 'rows'
     modes, histogram_modes = {}, {}
     # New captures select one mode; historical bundles may contain both.
     for mode in ('true', 'false'):
         if not counts[mode]:
             continue
-        groups = build_groups(data[mode], counts[mode], kinds[mode], metadata[mode], lifetime[mode],
-                              sites[mode] if need_callsites else None)
-        if need_pies and args.pie_style == 'both':
+        groups = build_groups(data[mode], counts[mode], kinds[mode], metadata[mode], lifetime[mode], sites[mode])
+        if need_pies:
             datasets = build_dataset_groups(sites[mode])
-            if datasets:
-                for index, group in enumerate(groups):
+            for group in groups:
+                if datasets:
+                    # A capture without this kind of row has no variant (None).
                     group['datasets'] = dict(combined=group.copy(),
-                                             **{run: variants[index] for run, variants in datasets.items()})
+                                             **{run: variants.get(group['key']) for run, variants in datasets.items()})
+                if group['key'] in ('span', 'event'):
+                    prune_zero_components(group)
         layout = pie_layout(groups, args.pie_style) if need_pies else None
         modes[mode] = groups
-        shares = {group['key']: {name: 100 * cost / sum(row[1] for row in group['callsites'])
+        shares = {group['key']: {name: share(cost, sum(row[1] for row in group['callsites']))
                                 for name, cost, *_ in group['callsites']}
                   for group in groups if group['key'] in ('span', 'event') and group['callsites'] is not None}
         columns = (make_panels(data[mode], blocks, mode, args.bins, args.bucket_width,

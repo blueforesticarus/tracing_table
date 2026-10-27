@@ -251,12 +251,14 @@ pub mod collect {
             .data
             .ring
             .iter()
-            .map(|block| {
+            .enumerate()
+            .map(|(ordinal, block)| {
                 size_of::<u16>() + block.data.frame.buffer().as_ptr() as usize
                     - block.data.as_ref() as *const _ as *const u8 as usize
-                    + block
-                        .data
-                        .retention_footer_bytes(&arch.archetype.column_layout())
+                    + block.data.retention_footer_bytes(arch.data.columns_for_block(
+                        arch.data.offset + ordinal,
+                        &arch.archetype.column_layout(),
+                    ))
             })
             .sum();
         let parent_tables: usize = arch
@@ -765,10 +767,11 @@ pub mod collect {
                     let mut active_indices = BTreeSet::new();
                     let mut arch_block_bytes = 0;
                     for (ordinal, block) in arch.data.ring.iter().enumerate() {
-                        if block
+                        let layout_fallback = arch.archetype.column_layout();
+                        let block_columns = arch
                             .data
-                            .timestamp_parent_relative(&arch.archetype.column_layout())
-                        {
+                            .columns_for_block(arch.data.offset + ordinal, &layout_fallback);
+                        if block.data.timestamp_parent_relative(block_columns) {
                             relative_blocks += 1;
                             relative_rows += block.data.frame.len();
                         }
