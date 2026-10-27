@@ -204,6 +204,19 @@ Only timestamp mask bits are recomputed. Readers use the frame's existing row
 count; archived edits retain the fitted stride, and late span closes only extend
 the timestamp range. Span ends store duration + 1, with zero reserved for an open span.
 
+Set `RecordingLayer::parent_timestamp_offsets = true` before registration, or
+`PARENT_TIMESTAMP_OFFSETS=on`, to try parent-relative archived starts. Parented
+active rows keep an extra trailing `u64` containing the exact parent start; this
+scratch column is omitted from every archive. At rollover, complete aligned
+absolute and parent-relative block allocations are compared, including payload
+codecs and trailers. Parent offsets are selected only when strictly smaller;
+ties, unavailable parent starts and negative offsets retain the current scheme.
+Parentless rows keep the current scheme. `ReplayOptions::parent_timestamp_offsets`
+accepts `Some(true/false)` for paired replay without changing the environment.
+Readers resolve elapsed starts through retained parent rows. Eviction is unchanged:
+a missing parent makes the child's absolute timestamp (and closed end time)
+unavailable. No parent pinning or retained expanded timestamp cache is introduced.
+
 Event id's are assigned as per-archetype sequential counters, to maximise how many bytes can be compacted. Archetypes ids themselves are also sequential.
 
 Because the archetype is part of the id, following parent/follows_from refs can also be fast.
@@ -1363,3 +1376,11 @@ Adds alot to active, but that is expected. Will be mostly fixed by optimistic co
 
 switching string buffer to per callsite not per arch could help here but the problem is that we may end up keeping around alot of strings which should be dropped. 
 - tested, increases compressed string bits/row
+
+# parent elapsed
+| Bits per start row | Current | Parent elapsed, bit-packed | With existing numeric codecs |
+|---|---:|---:|---:|
+| Bevy spans | 17.78 | 15.11 | **14.34** |
+| Actix spans | 22.18 | 14.66 | **14.54** |
+| Bevy all starts | 16.96 | 14.80 | **13.81** |
+| Actix all starts | 19.51 | 17.55 | **17.53** |

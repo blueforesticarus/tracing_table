@@ -71,6 +71,8 @@ OVERHEAD_LABELS = {
     "archetype_structs": "PerArchData/schema headers excluding the two containers",
     "archetype_fields": "Archetype field-type and format-reference capacity",
     "format_recipes": "Callsite format recipes",
+    # The collector charges the shared weak parent lookup once, as metadata.
+    "parent_timestamp_registry": "Parent timestamp weak index",
 }
 BLOCK_OVERVIEW_LABELS = {
     "block_entries": "Block buffers: used descriptors",
@@ -110,6 +112,7 @@ OVERVIEW_COLORS = {
 }
 METADATA_PIE_LABELS = {
     "format_recipes": "Callsite format recipes",
+    "parent_timestamp_registry": "Parent timestamp weak index",
     **BLOCK_OVERVIEW_LABELS,
     "string_collection_structs": "String buffers: inline structs",
     "string_descriptors": "String buffers: used descriptors",

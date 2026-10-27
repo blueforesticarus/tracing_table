@@ -215,8 +215,8 @@ pub mod collect {
                 let frozen_payload = frozen.compressed + 4 * arch.strings.archived_ids().len();
                 // The shared codec belongs to archive metadata once archived
                 // rows exist, even though its Arc owner is the writable buffer.
-                let writable_heap = writable - size_of::<Buffer>()
-                    - arch.strings.active.fsst_table_bytes();
+                let writable_heap =
+                    writable - size_of::<Buffer>() - arch.strings.active.fsst_table_bytes();
                 self.archived_string_overhead += string_total - writable_heap - frozen_payload;
                 self.writable_string_overhead += writable_heap - raw;
             }
@@ -481,8 +481,12 @@ pub mod collect {
                     }
                     entries_path = Some(args.next().ok_or("missing string entries path")?);
                 }
-                "--format-args" | "--templates" | "--column-sharing" | "--integer-widths"
-                | "--float-widths" => {
+                "--format-args"
+                | "--templates"
+                | "--column-sharing"
+                | "--integer-widths"
+                | "--float-widths"
+                | "--parent-timestamp-offsets" => {
                     let enabled = match args.next().as_deref() {
                         Some("on") => true,
                         Some("off") => false,
@@ -493,6 +497,9 @@ pub mod collect {
                         "--templates" => replay.extract_templates = enabled,
                         "--column-sharing" => replay.layout_policy.sharing = enabled,
                         "--integer-widths" => replay.layout_policy.integers = enabled,
+                        "--parent-timestamp-offsets" => {
+                            replay.parent_timestamp_offsets = Some(enabled)
+                        }
                         _ => replay.layout_policy.floats = enabled,
                     }
                 }
@@ -628,6 +635,10 @@ pub mod collect {
             ("float_widths", usize::from(replay.layout_policy.floats)),
             // Persist the actual partition mode alongside each measurement.
             ("parent_archetyping", recorder.parent_archetyping as usize),
+            (
+                "parent_timestamp_offsets",
+                usize::from(recorder.parent_timestamp_offsets),
+            ),
         ] {
             output.row(
                 &[],
@@ -675,6 +686,9 @@ pub mod collect {
         {
             let templates = replay.extract_templates;
             let sites = recorder.callsites.read();
+            // Recorder-wide weak lookup storage belongs to metadata once, not
+            // once per archetype. It contains no expanded timestamp values.
+            let mut timestamp_registry = recorder.parent_timestamp_registry_bytes();
             for (callsite, source) in fixture.callsites.iter().enumerate() {
                 let key = if let Some(ids) = ids {
                     *ids.iter()
@@ -711,6 +725,7 @@ pub mod collect {
                 let mut metadata = BTreeMap::new();
                 let (mut archived_rows, mut active_rows, mut blocks, mut span_starts) =
                     (0, 0, 0, 0);
+                let (mut relative_blocks, mut relative_rows) = (0, 0);
                 let (mut message_bytes, mut string_bytes) = (0, 0);
                 // Count stored entries once per retained buffer, rather than
                 // counting repeated row references or globally distinct text.
@@ -746,6 +761,10 @@ pub mod collect {
                     let mut active_indices = BTreeSet::new();
                     let mut arch_block_bytes = 0;
                     for (ordinal, block) in arch.data.ring.iter().enumerate() {
+                        if block.data.metadata.timestamp_parent_relative {
+                            relative_blocks += 1;
+                            relative_rows += block.data.frame.len();
+                        }
                         // Costs cover unique stored columns; logical ranges remain
                         // available separately for reconstructed string references.
                         let projection = arch.data.layout_for_block(arch.data.offset + ordinal);
@@ -780,8 +799,12 @@ pub mod collect {
                             ],
                         ]
                         .concat();
+                        // Rollover includes the active-only parent start column;
+                        // the archived unit is narrower after stripping it.
+                        let active_unit =
+                            frame.unit() + usize::from(arch.data.caches_parent_timestamps()) * 8;
                         assert!(
-                            rows >= min_rows && rows >= MESSAGE_BLOCK_TARGET_SIZE / frame.unit()
+                            rows >= min_rows && rows >= MESSAGE_BLOCK_TARGET_SIZE / active_unit
                         );
                         let bits: usize = frame
                             .mask()
@@ -976,11 +999,14 @@ pub mod collect {
                         .as_ref()
                         .map_or(0, |recipe| recipe.heap_bytes());
                 lifetime.resident_container_bytes += recipes;
+                let registry = std::mem::take(&mut timestamp_registry);
+                lifetime.resident_container_bytes += registry;
                 if blocks > 0 {
-                    lifetime.archived_message_overhead += recipes;
+                    lifetime.archived_message_overhead += recipes + registry;
                     metadata.insert("format_recipes", recipes);
+                    metadata.insert("parent_timestamp_registry", registry);
                 } else {
-                    lifetime.active_message_overhead += recipes;
+                    lifetime.active_message_overhead += recipes + registry;
                 }
                 let ends = metadata.get("parent_tables").copied().unwrap_or(0)
                     + metadata.get("string_starts").copied().unwrap_or(0);
@@ -1019,6 +1045,8 @@ pub mod collect {
                     ("fsst_archetypes", fsst_archetypes),
                     ("string_buffers", string_buffers),
                     ("span_starts", span_starts),
+                    ("parent_relative_blocks", relative_blocks),
+                    ("parent_relative_rows", relative_rows),
                     (
                         "lifetime.archived_messages",
                         message_bytes + lifetime.archived_message_overhead,

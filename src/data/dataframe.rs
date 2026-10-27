@@ -37,7 +37,10 @@ impl AnyFrame<'_> {
             Self::Frame(frame) => {
                 assert!(index < frame.length, "row index out of bounds");
                 let start = (index + 1) * frame.unit;
-                frame.buffer[start..start + frame.unit].copy_from_slice(row);
+                // Projected active writes cover the payload prefix; preserve
+                // any active-only parent timestamp column at the end.
+                assert!(row.len() <= frame.unit);
+                frame.buffer[start..start + row.len()].copy_from_slice(row);
                 frame.update_mask(index, true);
             }
             Self::Compact(frame) => {
@@ -163,7 +166,8 @@ impl<'a> Row<'a> {
                 let mut physical = smallvec::SmallVec::<[u8; 256]>::from_elem(0, projection.unit());
                 match &self.frame {
                     AnyFrame::Frame(frame) => physical.copy_from_slice(
-                        &frame.buffer[(self.index + 1) * frame.unit..(self.index + 2) * frame.unit],
+                        &frame.buffer[(self.index + 1) * frame.unit
+                            ..(self.index + 1) * frame.unit + projection.unit()],
                     ),
                     AnyFrame::Archived(block, columns) => {
                         block.read_row(self.index, &mut physical, columns)

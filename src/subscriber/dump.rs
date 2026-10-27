@@ -715,6 +715,9 @@ pub struct ReplayOptions {
     pub extract_templates: bool,
     pub string_storage: super::StringStorage,
     pub layout_policy: crate::data::column::physical::LayoutPolicy,
+    /// None keeps the recorder/environment default; Some supports paired replay
+    /// without mutating process-wide environment variables in tests or tools.
+    pub parent_timestamp_offsets: Option<bool>,
 }
 impl Default for ReplayOptions {
     fn default() -> Self {
@@ -723,6 +726,7 @@ impl Default for ReplayOptions {
             extract_templates: true,
             string_storage: super::StringStorage::default(),
             layout_policy: Default::default(),
+            parent_timestamp_offsets: None,
         }
     }
 }
@@ -999,8 +1003,12 @@ impl Fixture {
             extract_templates,
             string_storage,
             layout_policy,
+            parent_timestamp_offsets,
         } = options;
         let mut recorder = RecordingLayer::new();
+        if let Some(enabled) = parent_timestamp_offsets {
+            recorder.parent_timestamp_offsets = enabled;
+        }
         recorder.layout_policy = layout_policy;
         recorder.string_storage = string_storage;
         recorder.timestamp_bit_shift = self.timestamp_bit_shift;

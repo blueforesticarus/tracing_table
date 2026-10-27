@@ -183,6 +183,29 @@ pub fn write_recording(
                 while let Some(row) = rows.next() {
                     for (index, field) in fields.iter().enumerate() {
                         let value = match field.name.as_str() {
+                            "start_ts" if block.data.metadata.timestamp_parent_relative => {
+                                let offset = if arch.archetype.is_event { 10 } else { 16 };
+                                let bytes = &row[offset..offset + 10];
+                                let entry = parents
+                                    .entry(u16::from_ne_bytes(bytes[8..].try_into().unwrap()));
+                                let parent = crate::subscriber::SpanId {
+                                    callsite: entry.identity.callsite(),
+                                    archetype: entry.identity.archetype(),
+                                    index: entry.decode(
+                                        read_word(&bytes[..8]) as u64,
+                                        row_index,
+                                        frame.len(),
+                                    ),
+                                };
+                                let elapsed = read_word(&row[field.range.clone()]) as u64;
+                                // Missing ancestors are allowed; retain a usable
+                                // elapsed baseline when absolute time is lost.
+                                u128::from(
+                                    site.span_timestamp(parent)
+                                        .and_then(|v| v.checked_add(elapsed))
+                                        .unwrap_or(elapsed),
+                                )
+                            }
                             "start_ts" => u128::from(block.data.metadata.decode_timestamp(
                                 &block.descriptor,
                                 read_word(&row[field.range.clone()]) as u64,
@@ -226,7 +249,9 @@ pub fn write_recording(
                     let encoding = if field.alias.is_some() {
                         "alias"
                     } else if field.name == "start_ts" {
-                        if block.data.metadata.timestamp_stride.to_u64() == 0 {
+                        if block.data.metadata.timestamp_parent_relative {
+                            "parent_offset"
+                        } else if block.data.metadata.timestamp_stride.to_u64() == 0 {
                             "offset"
                         } else {
                             "offset+stride"

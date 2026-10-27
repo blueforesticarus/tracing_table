@@ -6,7 +6,7 @@ use std::{
     hash::Hash,
     ops::{Add, Deref, DerefMut},
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, SystemTime},
@@ -71,6 +71,10 @@ pub struct PerCallsiteData {
     pub formats: Vec<Arc<format::Format>>,
     /// Fixed at registration so previously stored rows keep their interpretation.
     pub string_storage: StringStorage,
+    // Weak entries resolve archived parent-relative starts without retaining
+    // expanded timestamps or creating ownership cycles between callsites.
+    span_registry: Weak<SpanRegistry>,
+    parent_timestamp_offsets: bool,
 
     // Reuse each field's string capacity across recordings.
     field_value_scratchpad: FieldValues,
@@ -113,11 +117,16 @@ impl PerCallsiteData {
                     "row exceeds string buffer capacity"
                 );
                 // A row floor takes precedence over the target for wide schemas.
-                let cap = (MESSAGE_BLOCK_TARGET_SIZE / unit).max(min_rows).max(1);
+                let cache_parent =
+                    self.parent_timestamp_offsets && archetype.parent && !archetype.is_span_end;
+                let cap = (MESSAGE_BLOCK_TARGET_SIZE / (unit + usize::from(cache_parent) * 8))
+                    .max(min_rows)
+                    .max(1);
                 let i = self.cache.len();
                 self.lookup.insert(archetype.clone(), i);
                 let mut data = BlockCache::new(unit, 1, cap);
                 data.configure_layout(physical, cap);
+                data.cache_parent_timestamps(cache_parent);
                 self.cache.push(
                     PerArchData {
                         data,
@@ -323,6 +332,7 @@ struct Time {
 // literally a &'static Metadata
 // cannot use tracing callsite id because tracing_log uses one callsite for all logs
 type CallsiteId = usize;
+type SpanRegistry = RwLock<Vec<Weak<RwLock<PerCallsiteData>>>>;
 
 /// Optional parent identity partitioning; row headers and dictionaries stay unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -386,6 +396,10 @@ pub struct RecordingLayer {
     /// Initialized from PARENT_ARCHETYPING: off (default), callsite, callsite+arch.
     /// Configure before recording; this changes schema selection only.
     pub parent_archetyping: ParentArchetyping,
+    /// Cache parent starts in active rows and choose smaller parent-relative
+    /// archives. Configure before recording; PARENT_TIMESTAMP_OFFSETS=on enables it.
+    pub parent_timestamp_offsets: bool,
+    span_registry: Arc<SpanRegistry>,
 
     /// Retained chunk/string storage limits in bytes; active storage is protected.
     pub global_memory_cap: usize,
@@ -425,6 +439,11 @@ impl RecordingLayer {
                 .unwrap_or_else(|| MESSAGE_BLOCK_MIN_ROWS.load(Ordering::Relaxed)),
             layout_policy: Default::default(),
             parent_archetyping: ParentArchetyping::from_env(),
+            parent_timestamp_offsets: matches!(
+                std::env::var("PARENT_TIMESTAMP_OFFSETS").as_deref(),
+                Ok("on") | Ok("true") | Ok("1")
+            ),
+            span_registry: Arc::default(),
             global_memory_cap: 20 * 1024 * 1024,
             callsite_memory_cap: 256 * 1024,
             started: Instant::now(),
@@ -485,13 +504,15 @@ impl RecordingLayer {
                 let template = resolve();
                 let acount = template.as_ref().map_or(0, |t| t.field_names.len());
                 let fields = FieldValues::new(vcount, acount, self.string_storage);
-                Arc::new(
+                let shared = Arc::new(
                     PerCallsiteData {
                         id,
                         metadata,
                         template,
                         formats: Vec::new(),
                         string_storage: self.string_storage,
+                        span_registry: Arc::downgrade(&self.span_registry),
+                        parent_timestamp_offsets: self.parent_timestamp_offsets,
                         field_value_scratchpad: fields,
                         template_pending: false,
                         cache: Default::default(),
@@ -513,7 +534,14 @@ impl RecordingLayer {
                         },
                     }
                     .into(),
-                )
+                );
+                if metadata.is_span() && self.parent_timestamp_offsets {
+                    let mut spans = self.span_registry.write();
+                    let length = (id as usize + 1).max(spans.len());
+                    spans.resize_with(length, Weak::new);
+                    spans[id as usize] = Arc::downgrade(&shared);
+                }
+                shared
             })
             .write_arc()
     }
@@ -938,6 +966,13 @@ impl RecordingLayer {
         is_log_compat: bool,
         record: impl FnOnce(&mut ValueRecorder<'_>),
     ) -> SpanId {
+        // Resolve before taking the child callsite's write lock: recursive
+        // spans can have a parent at the same callsite.
+        let parent_start = if self.parent_timestamp_offsets {
+            parent.and_then(|p| self.span_timestamp(p))
+        } else {
+            None
+        };
         let is_event = metadata.is_event();
         let mut guard = self.register(metadata);
         let site = guard.deref_mut();
@@ -1060,7 +1095,9 @@ impl RecordingLayer {
         } else {
             logical.clone()
         };
-        let (bytes, index, timestamp_offset) = arch.data.allocate_timestamp(time.value);
+        let (bytes, index, timestamp_offset) = arch
+            .data
+            .allocate_timestamp_with_parent(time.value, parent_start);
         physical[..8].copy_from_slice(&timestamp_offset.to_ne_bytes());
         bytes.copy_from_slice(&physical);
         let id = SpanId {
@@ -1085,6 +1122,13 @@ impl RecordingLayer {
         follow_from: Option<SpanId>,
         fields: Option<&mut FieldValues>,
     ) {
+        // Archived relative starts need a parent lookup; perform it before
+        // acquiring the mutable child site. Missing ancestors are allowed.
+        let resolved_start = if self.parent_timestamp_offsets {
+            self.span_timestamp(id)
+        } else {
+            None
+        };
         let mut callsite_guard = self.register(metadata);
         let callsite_data = callsite_guard.deref_mut();
         let callsite = callsite_data.id;
@@ -1175,7 +1219,14 @@ impl RecordingLayer {
             let retained = if let Some((descriptor, mut row)) =
                 data.get_mut_physical(id.index as usize, &columns)
             {
-                let start = row.decode_timestamp(descriptor);
+                let start = if self.parent_timestamp_offsets {
+                    resolved_start
+                } else {
+                    Some(row.decode_timestamp(descriptor))
+                };
+                let Some(start) = start else {
+                    return;
+                };
                 let mut packer = BytePacker::new(row.get_mut());
                 packer.skip::<PackedTimestamp>(false);
                 // Bias the duration so a zero-tick closed span differs from an open span.
@@ -1522,6 +1573,129 @@ mod test {
         ]
     }
 
+    #[test]
+    fn parent_timestamp_offsets_decode_active_archived_late_closes_and_evicted_parents() {
+        let [event, span] = timestamp_metadata();
+        let mut recorder = RecordingLayer::new();
+        recorder.parent_timestamp_offsets = true;
+        recorder.parent_archetyping = super::ParentArchetyping::CallsiteArch;
+        recorder.global_memory_cap = usize::MAX;
+        recorder.callsite_memory_cap = usize::MAX;
+        let mut children = Vec::new();
+        for i in 0..40u64 {
+            let start = 1_000_000 + i * i * 10_000;
+            let parent = recorder.record_start(span, timestamp(start), None, false, |_| {});
+            let child =
+                recorder.record_start(span, timestamp(start + 7), Some(parent), false, |_| {});
+            recorder.record_start(event, timestamp(start + 11), Some(child), false, |_| {});
+            children.push((child, start));
+            if i % 2 == 0 {
+                recorder.close_span(span, child, timestamp(start + 100), None, None);
+            }
+        }
+        // Force both parent and child archives without depending on byte targets.
+        for site in recorder.callsites.read().values() {
+            let mut site = site.write();
+            for arch in &mut site.cache {
+                let columns = arch.archetype.column_layout();
+                arch.data.cycle_with_columns(&columns);
+            }
+        }
+        for &(child, start) in &children {
+            assert_eq!(recorder.span_timestamp(child), Some(start + 7));
+            recorder.close_span(span, child, timestamp(start + 100), None, None);
+        }
+        let sites = recorder.callsites.read();
+        let shared = sites[&(span as *const _ as usize)].clone();
+        drop(sites);
+        {
+            let site = shared.read();
+            let mut count = 0;
+            site.visit_rows(|r| {
+                if r.parent.is_some() {
+                    count += 1;
+                    let start = children[(r.index - 1) as usize].1;
+                    assert_eq!(r.timestamp, Some(start + 7));
+                    assert_eq!(r.end_timestamp, Some(start + 100));
+                }
+            });
+            assert_eq!(count, 40);
+            assert!(site.cache.iter().any(|a| {
+                a.data
+                    .ring
+                    .iter()
+                    .any(|b| b.data.metadata.timestamp_parent_relative)
+            }));
+        }
+        // Losing ancestors is explicitly allowed; report missing time instead
+        // of interpreting elapsed ticks as an absolute timestamp.
+        {
+            let mut site = shared.write();
+            let roots = site.cache.iter_mut().find(|a| !a.archetype.parent).unwrap();
+            while let Some(block) = roots.data.ring.front() {
+                let index = block.descriptor.index;
+                roots.data.drop_chunk(index).unwrap();
+            }
+        }
+        assert_eq!(recorder.span_timestamp(children[0].0), None);
+        shared.read().visit_rows(|r| {
+            if r.parent.is_some() {
+                assert_eq!(r.timestamp, None);
+                assert_eq!(r.end_timestamp, None);
+            }
+        });
+    }
+
+    #[test]
+    fn parent_timestamp_cache_survives_field_width_promotion_and_projected_edits() {
+        use tracing_core::Callsite;
+        let metadata=tracing::callsite!(name:"parent timestamp promotions",kind:tracing_core::Kind::SPAN,fields:value).metadata();
+        let field = metadata.fields().field("value").unwrap();
+        let mut recorder = RecordingLayer::new();
+        recorder.parent_timestamp_offsets = true;
+        recorder.global_memory_cap = usize::MAX;
+        recorder.callsite_memory_cap = usize::MAX;
+        let values = [1, 70_000, u64::MAX, 19];
+        let mut children = Vec::new();
+        for (i, &value) in values.iter().enumerate() {
+            let start = 1_000_000 + (i * i) as u64 * 100_000;
+            let parent = recorder.record_start(metadata, timestamp(start), None, false, |_| {});
+            children.push(recorder.record_start(
+                metadata,
+                timestamp(start + 3),
+                Some(parent),
+                false,
+                |v| tracing::field::Visit::record_u64(v, &field, value),
+            ));
+        }
+        let shared = recorder.callsites.read().values().next().unwrap().clone();
+        {
+            let mut site = shared.write();
+            let arch = site.cache.iter_mut().find(|a| a.archetype.parent).unwrap();
+            assert_eq!(
+                arch.data.active.unit,
+                arch.data.layouts.last().unwrap().unit() + 8
+            );
+            let columns = arch.archetype.column_layout();
+            // Logical edits repack only the payload prefix and preserve scratch.
+            {
+                let (_, mut row) = arch
+                    .data
+                    .get_mut(children[0].index as usize, &columns)
+                    .unwrap();
+                row.get_mut()[8..16].copy_from_slice(&2u64.to_ne_bytes());
+            }
+            arch.data.cycle_with_columns(&columns);
+        }
+        shared.read().visit_rows(|r| {
+            if r.parent.is_some() {
+                let i = (r.index - 1) as usize;
+                assert_eq!(r.timestamp, Some(1_000_003 + (i * i) as u64 * 100_000));
+                assert_eq!(r.fields, vec![Some(super::InputValue::U64(values[i]))]);
+            }
+        });
+    }
+
     fn timestamp(value: u64) -> super::Time {
         super::Time { value, shift: 0 }
     }
@@ -1602,19 +1776,46 @@ mod test {
     fn parent_partitioning_preserves_parent_rows() {
         use super::{ParentArchetyping, SpanId};
         // Vary identity independently of the parent index; roots remain separate.
-        let parents = [None, Some(SpanId {callsite: 1, archetype: 0, index: 10}),
-            Some(SpanId {callsite: 1, archetype: 1, index: 20}),
-            Some(SpanId {callsite: 2, archetype: 0, index: 30}),
-            Some(SpanId {callsite: 1, archetype: 0, index: 40})];
-        for (mode, expected) in [(ParentArchetyping::Off, 2),
-            (ParentArchetyping::Callsite, 3), (ParentArchetyping::CallsiteArch, 4)] {
+        let parents = [
+            None,
+            Some(SpanId {
+                callsite: 1,
+                archetype: 0,
+                index: 10,
+            }),
+            Some(SpanId {
+                callsite: 1,
+                archetype: 1,
+                index: 20,
+            }),
+            Some(SpanId {
+                callsite: 2,
+                archetype: 0,
+                index: 30,
+            }),
+            Some(SpanId {
+                callsite: 1,
+                archetype: 0,
+                index: 40,
+            }),
+        ];
+        for (mode, expected) in [
+            (ParentArchetyping::Off, 2),
+            (ParentArchetyping::Callsite, 3),
+            (ParentArchetyping::CallsiteArch, 4),
+        ] {
             for metadata in timestamp_metadata() {
                 let mut recorder = RecordingLayer::new();
                 recorder.parent_archetyping = mode;
                 let mut ids = Vec::new();
                 for (i, parent) in parents.into_iter().enumerate() {
-                    ids.push(recorder.record_start(metadata, timestamp(100 + i as u64),
-                        parent, metadata.is_event(), |_| {}));
+                    ids.push(recorder.record_start(
+                        metadata,
+                        timestamp(100 + i as u64),
+                        parent,
+                        metadata.is_event(),
+                        |_| {},
+                    ));
                 }
                 let sites = recorder.callsites.read();
                 let mut site = sites.values().next().unwrap().write();
@@ -1629,8 +1830,10 @@ mod test {
                 site.visit_rows(|r| decoded.push((r.timestamp.unwrap(), r.parent)));
                 decoded.sort_by_key(|r| r.0);
                 let identity = |p: Option<SpanId>| p.map(|p| (p.callsite, p.archetype, p.index));
-                assert_eq!(decoded.iter().map(|r| identity(r.1)).collect::<Vec<_>>(),
-                    parents.map(identity));
+                assert_eq!(
+                    decoded.iter().map(|r| identity(r.1)).collect::<Vec<_>>(),
+                    parents.map(identity)
+                );
             }
         }
     }

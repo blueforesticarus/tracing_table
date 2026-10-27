@@ -1,7 +1,8 @@
 //! Fit timestamp predictors once, keeping active writes as unsigned offsets.
-use super::{CollocatedMetadata, Descriptor};
+use super::{ArchivedBlock, BlockCache, CollocatedMetadata, Descriptor, parent_offsets};
 use crate::data::column;
 use crate::data::dataframe::{AnyFrame, Frame, Row};
+use crate::data::util::smallbox::SmallBox;
 
 impl CollocatedMetadata {
     /// The frame owns its row count; coefficients never duplicate that count.
@@ -12,6 +13,10 @@ impl CollocatedMetadata {
         row: usize,
         length: usize,
     ) -> u64 {
+        assert!(
+            !self.timestamp_parent_relative,
+            "parent-relative timestamps require the parent start"
+        );
         let offset = if self.timestamp_stride.to_u64() == 0 {
             encoded
         } else {
@@ -27,6 +32,71 @@ impl CollocatedMetadata {
     /// Preserve the timestamp policy: fixed zero origin and optional FloatU16 line.
     pub(super) fn fit_timestamp_stride(&mut self, frame: &mut Frame) {
         self.timestamp_stride = column::fit_timestamp(frame);
+    }
+}
+
+impl BlockCache {
+    /// Strip active-only parent starts before fitting either complete archive.
+    /// Compare real aligned allocations, retaining the old scheme on ties.
+    pub(super) fn parent_timestamp_archive(
+        &self,
+        columns: &[column::Layout],
+    ) -> SmallBox<ArchivedBlock> {
+        let source = || {
+            let mut frame = Frame::new(self.unit, self.active.length);
+            for row in self.active.iter() {
+                frame.push(&row[..self.unit]);
+            }
+            // Preserve editable end slots and other structural mask locks.
+            frame.buffer[..self.unit].copy_from_slice(&self.active.mask()[..self.unit]);
+            frame
+        };
+        let finish = |mut frame: Box<Frame>, relative: bool| {
+            let mut metadata = CollocatedMetadata::default();
+            metadata.timestamp_parent_relative = relative;
+            if !relative && self.active_timestamp_header {
+                metadata.fit_timestamp_stride(&mut frame);
+            }
+            let mut trailer = self.active_parent_offsets.clone();
+            if !trailer.is_empty() {
+                parent_offsets::fit_strides(
+                    &mut frame,
+                    &mut trailer,
+                    &self.active_parent_row_offsets,
+                );
+            }
+            column::fit(&mut frame, &mut trailer, columns);
+            ArchivedBlock::new_with_trailer(&frame, metadata, &trailer)
+        };
+        let absolute = finish(source(), false);
+        if !self.active_parent_timestamps_valid || !self.active_timestamp_header {
+            return absolute;
+        }
+        let mut relative = source();
+        let mut elapsed = Vec::with_capacity(self.active.length);
+        for row in self.active.iter() {
+            let offset = u64::from_ne_bytes(row[..8].try_into().unwrap());
+            let parent = u64::from_ne_bytes(row[self.unit..self.unit + 8].try_into().unwrap());
+            let Some(value) = self
+                .active_descriptor
+                .decode_timestamp(offset)
+                .checked_sub(parent)
+            else {
+                return absolute;
+            };
+            elapsed.push(value);
+        }
+        column::rewrite(
+            &mut relative,
+            column::Layout::new(0, 8, false),
+            |_, row, _| u128::from(elapsed[row]),
+        );
+        let relative = finish(relative, true);
+        if relative.allocation_size() < absolute.allocation_size() {
+            relative
+        } else {
+            absolute
+        }
     }
 }
 
@@ -59,6 +129,53 @@ mod tests {
         row[..8].copy_from_slice(&offset.to_ne_bytes());
         cache.update_mask_after_append();
         cache.update_ts_range(ts as usize, None);
+    }
+
+    #[test]
+    fn active_parent_column_is_omitted_and_smaller_archives_win() {
+        let mut cache = BlockCache::new(8, 32, 32);
+        cache.cache_parent_timestamps(true);
+        for r in 0..32u64 {
+            let parent = 1_000_000 + r * r * 10_000;
+            let (row, _, offset) = cache.allocate_timestamp_with_parent(parent + 7, Some(parent));
+            row.copy_from_slice(&offset.to_ne_bytes());
+            cache.update_mask_after_append();
+        }
+        assert_eq!(cache.active.unit, 16);
+        assert_eq!(
+            u64::from_ne_bytes(cache.active.iter().nth(7).unwrap()[8..].try_into().unwrap()),
+            1_490_000
+        );
+        cache.cycle();
+        let block = &cache.ring[0];
+        assert!(block.data.metadata.timestamp_parent_relative);
+        assert_eq!(block.data.frame.unit(), 8);
+        assert_eq!(block.data.frame.mask()[..8], [0; 8]);
+        assert_eq!(
+            u64::from_ne_bytes(block.data.frame.first()[..8].try_into().unwrap()),
+            7
+        );
+        assert_eq!(cache.active.unit, 16);
+    }
+
+    #[test]
+    fn cache_keeps_absolute_prediction_when_relative_is_larger_or_unavailable() {
+        for missing in [false, true] {
+            let mut cache = BlockCache::new(8, 50, 50);
+            cache.cache_parent_timestamps(true);
+            for r in 0..50 {
+                let (row, _, offset) = cache.allocate_timestamp_with_parent(
+                    1_000 + r * 2,
+                    if missing { None } else { Some(0) },
+                );
+                row.copy_from_slice(&offset.to_ne_bytes());
+                cache.update_mask_after_append();
+            }
+            cache.cycle();
+            assert!(!cache.ring[0].data.metadata.timestamp_parent_relative);
+            assert_eq!(cache.ring[0].data.frame.unit(), 8);
+            check_archived(&cache, &(0..50).map(|r| 1_000 + r * 2).collect::<Vec<_>>());
+        }
     }
 
     fn check_archived(cache: &BlockCache, times: &[u64]) {

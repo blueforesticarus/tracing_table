@@ -1,6 +1,8 @@
 //! CODEX GENERATED
 //! Full row decoding, shared by verification, benchmarks, and future viewers.
-use super::{InputValue, PerCallsiteData, SpanFieldsRef, SpanId, StringStorage};
+use super::{
+    InputValue, PerCallsiteData, RecordingLayer, SpanFieldsRef, SpanId, SpanRegistry, StringStorage,
+};
 use crate::data::{CompressionStats, blockbuffer::ArchivedFrameIter, dyntuple::ValueKind};
 use smallvec::SmallVec;
 use streaming_iterator::StreamingIterator;
@@ -48,6 +50,64 @@ pub struct DecodedRow {
 
 // Explicit scalar reads avoid forming references to unaligned row contents.
 struct Reader<'a>(&'a [u8]);
+
+#[derive(Clone, Copy)]
+enum StartTime {
+    Absolute(u64),
+    Parent(u64, SpanId),
+}
+
+// Copy one node under a short read guard, then release it before following
+// another parent. A caller already borrowing its own site must not relock it.
+fn resolve_start(
+    registry: &SpanRegistry,
+    local: Option<&PerCallsiteData>,
+    mut span: SpanId,
+) -> Option<u64> {
+    let mut elapsed = 0u64;
+    let mut visited = SmallVec::<[SpanId; 8]>::new();
+    loop {
+        if visited.iter().any(|v| {
+            (v.callsite, v.archetype, v.index) == (span.callsite, span.archetype, span.index)
+        }) {
+            return None;
+        }
+        visited.push(span);
+        let node = if let Some(site) = local.filter(|site| site.id == u64::from(span.callsite)) {
+            site.start_time(span)?
+        } else {
+            let shared = registry.read().get(span.callsite as usize)?.upgrade()?;
+            let node = shared.read().start_time(span)?;
+            node
+        };
+        match node {
+            StartTime::Absolute(start) => return start.checked_add(elapsed),
+            StartTime::Parent(offset, parent) => {
+                elapsed = elapsed.checked_add(offset)?;
+                span = parent;
+            }
+        }
+    }
+}
+
+impl RecordingLayer {
+    /// Resolve immutable starts through retained parents. Evicted nodes return
+    /// None; this optional encoding deliberately does not pin ancestor blocks.
+    /// The lookup index is populated only when parent_timestamp_offsets was
+    /// enabled before registration; normal visit_rows works in both modes.
+    pub fn span_timestamp(&self, span: SpanId) -> Option<u64> {
+        resolve_start(&self.span_registry, None, span)
+    }
+
+    /// Dense weak index only, not a cache of expanded timestamps. The storage
+    /// benchmark charges this optional recorder-wide allocation once.
+    pub fn parent_timestamp_registry_bytes(&self) -> usize {
+        let registry = self.span_registry.read();
+        16 + size_of::<SpanRegistry>()
+            + registry.capacity()
+                * size_of::<std::sync::Weak<parking_lot::RwLock<PerCallsiteData>>>()
+    }
+}
 impl Reader<'_> {
     fn bytes<const N: usize>(&mut self) -> [u8; N] {
         let (head, tail) = self.0.split_at(N);
@@ -81,6 +141,66 @@ impl Reader<'_> {
     }
 }
 impl PerCallsiteData {
+    fn start_time(&self, span: SpanId) -> Option<StartTime> {
+        let arch = self.cache.get(span.archetype as usize)?;
+        if arch.archetype.is_span_end || arch.archetype.is_event {
+            return None;
+        }
+        let index = usize::try_from(span.index).ok()?;
+        let data = &arch.data;
+        if index >= data.active_descriptor.index {
+            let row = index - data.active_descriptor.index;
+            if row >= data.active.length {
+                return None;
+            }
+            let at = (row + 1) * data.active.unit;
+            return Some(StartTime::Absolute(
+                data.active_descriptor.decode_timestamp(u64::from_ne_bytes(
+                    data.active.buffer[at..at + 8].try_into().unwrap(),
+                )),
+            ));
+        }
+        let block = data.ring.iter().rev().find(|b| {
+            index >= b.descriptor.index && index - b.descriptor.index < b.data.frame.len()
+        })?;
+        let row = index - block.descriptor.index;
+        let mut encoded = [0; 8];
+        block.data.frame.read_column(row, 0, &mut encoded);
+        let value = u64::from_ne_bytes(encoded);
+        if !block.data.metadata.timestamp_parent_relative {
+            return Some(StartTime::Absolute(block.data.metadata.decode_timestamp(
+                &block.descriptor,
+                value,
+                row,
+                block.data.frame.len(),
+            )));
+        }
+        if !arch.archetype.parent {
+            return None;
+        }
+        let fallback = arch.archetype.column_layout();
+        let ordinal = data
+            .ring
+            .iter()
+            .position(|b| b.descriptor.index == block.descriptor.index)?;
+        let columns = data.columns_for_block(data.offset + ordinal, &fallback);
+        let mut bytes = [0; 10];
+        block.data.frame.read_column(row, 16, &mut bytes);
+        let parent = Reader(&bytes).span(
+            block.data.parent_offsets(columns),
+            row,
+            block.data.frame.len(),
+        );
+        Some(StartTime::Parent(value, parent))
+    }
+
+    /// Site-level visitors can resolve same-site parents without recursively
+    /// acquiring their own RwLock, including when a writer is waiting.
+    /// Cross-callsite lookup uses the optional parent-offset registry.
+    pub fn span_timestamp(&self, span: SpanId) -> Option<u64> {
+        let registry = self.span_registry.upgrade()?;
+        resolve_start(&registry, Some(self), span)
+    }
     /// Locate deferred data using only this start block's deduplicated candidates.
     /// Missing/evicted candidates are harmless; other rows in a candidate block
     /// must not be mistaken for the requested span.
@@ -223,12 +343,18 @@ impl PerCallsiteData {
                         row.span = Some(reader.span(parent_offsets, local_row, count));
                     } else {
                         // Span end edits never move the block's decoding origin.
-                        row.timestamp = Some(metadata.decode_timestamp(
-                            descriptor,
-                            reader.u64(),
-                            local_row,
-                            count,
-                        ));
+                        let encoded_start = reader.u64();
+                        row.timestamp = if metadata.timestamp_parent_relative {
+                            None
+                        } else {
+                            Some(metadata.decode_timestamp(
+                                descriptor,
+                                encoded_start,
+                                local_row,
+                                count,
+                            ))
+                        };
+                        let mut duration = None;
                         if a.is_event {
                             row.timestamp_index = Some(reader.u16());
                         } else {
@@ -240,11 +366,7 @@ impl PerCallsiteData {
                             // Stored ends are duration + 1; preserve the public
                             // nominal timestamp and existing zero-for-open API.
                             let offset = reader.u64();
-                            row.end_timestamp = Some(if offset == 0 {
-                                0
-                            } else {
-                                row.timestamp.unwrap() + (offset - 1)
-                            });
+                            duration = Some(offset);
                             row.extra_fields = self.span_fields_ref_from_candidates(
                                 row.span.unwrap(),
                                 metadata.span_fields().unwrap_or_default(),
@@ -260,6 +382,20 @@ impl PerCallsiteData {
                                 callsite: entry.identity.callsite(),
                                 archetype: entry.identity.archetype(),
                             });
+                        }
+                        if metadata.timestamp_parent_relative {
+                            row.timestamp = row
+                                .parent
+                                .and_then(|parent| self.span_timestamp(parent))
+                                .and_then(|start| start.checked_add(encoded_start));
+                        }
+                        if let Some(duration) = duration {
+                            row.end_timestamp = if duration == 0 {
+                                Some(0)
+                            } else {
+                                row.timestamp
+                                    .and_then(|start| start.checked_add(duration - 1))
+                            };
                         }
                     }
                     if a.follows_from {

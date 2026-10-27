@@ -69,6 +69,10 @@ pub struct BlockCache {
     // These describe writable rows only; archived frames need neither field.
     active_parent_row_offsets: smallvec::SmallVec<[u16; 2]>,
     active_timestamp_header: bool,
+    // A trailing active-only u64 caches each row's parent start. It is stripped
+    // before either archive candidate is fitted and never changes payload layout.
+    parent_timestamp_cache: bool,
+    active_parent_timestamps_valid: bool,
 }
 
 pub struct Data {
@@ -185,6 +189,8 @@ impl BlockCache {
             active_parent_offsets: Vec::new(),
             active_parent_row_offsets: smallvec::SmallVec::new(),
             active_timestamp_header: false,
+            parent_timestamp_cache: false,
+            active_parent_timestamps_valid: true,
         }
     }
 
@@ -195,6 +201,18 @@ impl BlockCache {
         self.frame_size_max = max_cap;
         self.edit_buffer.resize(layout.logical_unit(), 0);
         self.layouts.push(layout);
+    }
+
+    /// Configure before appending. The cache column is physical scratch only;
+    /// callers and archived frames continue to use the original row width.
+    pub fn cache_parent_timestamps(&mut self, enabled: bool) {
+        assert!(self.ring.is_empty() && self.active.length == 0);
+        self.parent_timestamp_cache = enabled;
+        self.active = Frame::new(self.unit + usize::from(enabled) * 8, self.active.capacity());
+    }
+
+    pub fn caches_parent_timestamps(&self) -> bool {
+        self.parent_timestamp_cache
     }
 
     pub fn layout_for_block(&self, index: usize) -> Option<&PhysicalLayout> {
@@ -236,18 +254,23 @@ impl BlockCache {
         };
         next.block_index = self.offset + self.ring.len();
         let capacity = self.active.capacity();
-        let mut converted = Frame::new(next.unit(), capacity);
+        let extra = usize::from(self.parent_timestamp_cache) * 8;
+        let mut converted = Frame::new(next.unit() + extra, capacity);
         let mut row = smallvec::SmallVec::<[u8; 256]>::from_elem(0, old.logical_unit());
-        let mut packed = smallvec::SmallVec::<[u8; 256]>::from_elem(0, next.unit());
+        let mut packed = smallvec::SmallVec::<[u8; 256]>::from_elem(0, next.unit() + extra);
         for previous in self.active.iter() {
             old.unpack(previous, &mut row);
-            next.pack(&row, &mut packed);
+            next.pack(&row, &mut packed[..next.unit()]);
+            if extra != 0 {
+                packed[next.unit()..].copy_from_slice(&previous[self.unit..]);
+            }
             converted.push(&packed);
         }
         // Preserve structural edit locks; payload masks are rebuilt at their new positions.
         converted.buffer[..next.header()].copy_from_slice(&self.active.mask()[..next.header()]);
         self.unit = next.unit();
-        self.frame_size_max = (crate::subscriber::MESSAGE_BLOCK_TARGET_SIZE / next.unit())
+        self.frame_size_max = (crate::subscriber::MESSAGE_BLOCK_TARGET_SIZE
+            / (next.unit() + extra))
             .max(min_rows)
             .max(1);
         self.active = converted;
@@ -356,23 +379,29 @@ impl BlockCache {
         if self.active.length == 0 {
             return;
         }
-        if self.active_timestamp_header {
-            self.active_metadata.fit_timestamp_stride(&mut self.active);
-        }
-        if !self.active_parent_offsets.is_empty() {
-            parent_offsets::fit_strides(
-                &mut self.active,
-                &mut self.active_parent_offsets,
-                &self.active_parent_row_offsets,
-            );
-        }
-        // Reuse the transient parent scratch for the combined footer. The active
-        // dictionary is cleared below before it can be read or appended again.
         let columns = self
             .layouts
             .last()
             .map_or(columns, |layout| layout.columns.as_slice());
-        column::fit(&mut self.active, &mut self.active_parent_offsets, columns);
+        let mut data = if self.parent_timestamp_cache {
+            self.parent_timestamp_archive(columns)
+        } else {
+            if self.active_timestamp_header {
+                self.active_metadata.fit_timestamp_stride(&mut self.active);
+            }
+            if !self.active_parent_offsets.is_empty() {
+                parent_offsets::fit_strides(
+                    &mut self.active,
+                    &mut self.active_parent_offsets,
+                    &self.active_parent_row_offsets,
+                );
+            }
+            // The ordinary path retains its existing fitting order and layout.
+            column::fit(&mut self.active, &mut self.active_parent_offsets, columns);
+            let mut metadata = CollocatedMetadata::default();
+            metadata.timestamp_stride = self.active_metadata.timestamp_stride;
+            ArchivedBlock::new_with_trailer(&self.active, metadata, &self.active_parent_offsets)
+        };
         let length = self.active.length;
         // The active buffer ID stays until prepare_chunk selects the next one;
         // timestamp range and deferred references start fresh for the new frame.
@@ -382,10 +411,11 @@ impl BlockCache {
         };
         let mut next_metadata = CollocatedMetadata::default();
         next_metadata.string_buffer = self.active_metadata.string_buffer;
-        // Pack directly into the final archive and retain the active capacity for reuse.
-        let metadata = std::mem::replace(&mut self.active_metadata, next_metadata);
-        let data =
-            ArchivedBlock::new_with_trailer(&self.active, metadata, &self.active_parent_offsets);
+        // Move sparse span-update references once, after choosing the archive.
+        let mut metadata = std::mem::replace(&mut self.active_metadata, next_metadata);
+        metadata.timestamp_stride = data.metadata.timestamp_stride;
+        metadata.timestamp_parent_relative = data.metadata.timestamp_parent_relative;
+        data.metadata = metadata;
         self.ring.push_back(Data {
             data,
             descriptor: std::mem::replace(&mut self.active_descriptor, next),
@@ -394,21 +424,37 @@ impl BlockCache {
         self.active_parent_offsets.clear();
         self.active_parent_row_offsets.clear();
         self.active_timestamp_header = false;
+        self.active_parent_timestamps_valid = true;
     }
 
     /// Initialize the origin after rollover and validate before committing a row.
     /// Return its encoded timestamp alongside the bytes and absolute row index.
     pub fn allocate(&mut self, ts: u64) -> (&mut [u8], usize, u64) {
-        self.allocate_inner(ts, false)
+        self.allocate_inner(ts, false, None)
     }
 
     /// Allocate an event/span start with a timestamp in the first eight bytes.
     /// Generic payloads and deferred span updates continue to use allocate().
     pub fn allocate_timestamp(&mut self, ts: u64) -> (&mut [u8], usize, u64) {
-        self.allocate_inner(ts, true)
+        self.allocate_timestamp_with_parent(ts, None)
     }
 
-    fn allocate_inner(&mut self, ts: u64, timestamp_header: bool) -> (&mut [u8], usize, u64) {
+    /// Cache an exact parent start alongside the active row. Missing parents
+    /// disable relative encoding for this block; zero is a valid parent start.
+    pub fn allocate_timestamp_with_parent(
+        &mut self,
+        ts: u64,
+        parent: Option<u64>,
+    ) -> (&mut [u8], usize, u64) {
+        self.allocate_inner(ts, true, parent)
+    }
+
+    fn allocate_inner(
+        &mut self,
+        ts: u64,
+        timestamp_header: bool,
+        parent: Option<u64>,
+    ) -> (&mut [u8], usize, u64) {
         self.cycle_if_needed();
         // A block has one row schema; generic payloads must never be rewritten.
         assert!(self.active.length == 0 || self.active_timestamp_header == timestamp_header);
@@ -421,8 +467,18 @@ impl BlockCache {
             assert!(self.unit >= size_of::<u64>());
         }
         self.active_timestamp_header = timestamp_header;
+        if self.parent_timestamp_cache && parent.is_none() {
+            self.active_parent_timestamps_valid = false;
+        }
         let (buffer, index) = self.active.allocate().unwrap();
-        (buffer, index + self.active_descriptor.index, offset)
+        if self.parent_timestamp_cache {
+            buffer[self.unit..self.unit + 8].copy_from_slice(&parent.unwrap_or(0).to_ne_bytes());
+        }
+        (
+            &mut buffer[..self.unit],
+            index + self.active_descriptor.index,
+            offset,
+        )
     }
 
     /// Find metadata by absolute retained row index, including after eviction.
@@ -446,14 +502,16 @@ impl BlockCache {
         }
         self.ring.iter().rev().find_map(|block| {
             let row = index.checked_sub(block.descriptor.index)?;
-            (row < block.data.frame.len()).then(|| {
-                block.data.metadata.decode_timestamp(
-                    &block.descriptor,
-                    encoded,
-                    row,
-                    block.data.frame.len(),
-                )
-            })
+            (row < block.data.frame.len() && !block.data.metadata.timestamp_parent_relative).then(
+                || {
+                    block.data.metadata.decode_timestamp(
+                        &block.descriptor,
+                        encoded,
+                        row,
+                        block.data.frame.len(),
+                    )
+                },
+            )
         })
     }
 
@@ -641,7 +699,10 @@ impl BlockCache {
 
     pub fn active_rows(&self) -> impl StreamingIterator<Item = [u8]> + '_ {
         super::dataframe::ProjectedIter::new(
-            self.active.iter().into_streaming_iter_ref(),
+            self.active
+                .iter()
+                .map(|row| &row[..self.unit])
+                .into_streaming_iter_ref(),
             self.layouts.last(),
         )
     }
@@ -729,7 +790,7 @@ mod test {
             let (expected, _) =
                 super::SmallBox::<super::ArchivedBlock>::layout(value_layout.pad_to_align());
             // No fixed padding remains between metadata, frame, or u16 prefix.
-            assert_eq!(offset, 14);
+            assert_eq!(offset, 16);
             assert_eq!(expected.align(), 2);
             assert_eq!(
                 Layout::for_value(block.data.as_ref()),

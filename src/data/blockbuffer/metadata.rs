@@ -79,13 +79,16 @@ pub struct CollocatedMetadata {
     /// Predicted increase across the existing frame length, in shifted ticks.
     /// Zero disables prediction and retains unsigned timestamp offsets.
     pub timestamp_stride: crate::data::util::float_u16::FloatU16,
+    /// True only when archived starts are unsigned elapsed ticks from their
+    /// referenced parent. Active rows always retain the ordinary absolute basis.
+    pub timestamp_parent_relative: bool,
 }
 
 const _: () = assert!(align_of::<CollocatedMetadata>() == 2);
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<Option<SmallBox<[SpanFieldsRef]>>>() == 8);
-    assert!(size_of::<CollocatedMetadata>() == 14);
+    assert!(size_of::<CollocatedMetadata>() == 16);
     assert!(std::mem::offset_of!(CollocatedMetadata, span_fields) == 0);
 };
 
