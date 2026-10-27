@@ -1,52 +1,37 @@
-//! Borrowed column codecs. Schemas and decoded coefficients are temporary views;
+//! Borrowed column storage. Schemas and decoded coefficients are temporary views;
 //! archives retain only selected metadata records and one size byte per field.
+use super::encoding::common::*;
+use super::encoding::dictionary::select_dictionary;
+use super::{blockbuffer::ArchivedFrame, dataframe::Frame};
 use smallvec::SmallVec;
+// Preserve existing column imports while encoding owns every codec implementation.
+pub use super::encoding::{
+    AnyEncoding, DictionaryEncoding, Encoding, ExceptionsEncoding, Footer, MAX_CYCLE,
+    MAX_CYCLE_CANDIDATES, MAX_DICTIONARY_VALUES, MAX_RECORD_BYTES, MIN_ENCODING_SAVINGS,
+    OriginEncoding, PredictionEncoding, RawEncoding, UNSIGNED_MASK_CANDIDATES,
+    UNSIGNED_MASK_STRIDE, UNSIGNED_MINIMAX_STRIDE, dictionary, exceptions, prediction, raw,
+    reference,
+    SplitDictionaryEncoding, split_dictionary,
+};
 
-use super::{blockbuffer::ArchivedFrame, dataframe::Frame, util::float_u16::FloatU16};
-pub mod exceptions;
-pub use exceptions::ExceptionEncoding;
 pub mod physical;
 
-/// Tuning bounds fitting work and dictionary metadata; neither is a wire capacity.
-pub const MAX_DICTIONARY_VALUES: usize = 64;
-pub const MAX_CYCLE: u8 = 255;
-// Tuning: favor predictable fitting work and simpler encodings over tiny savings.
-pub const MAX_CYCLE_CANDIDATES: usize = 4;
-pub const MIN_ENCODING_SAVINGS: usize = 8;
-/// Directory bytes count two-byte units; zero still means no encoding.
-pub const MAX_RECORD_BYTES: usize = u8::MAX as usize * 2;
-const CYCLE_ANCHORS: usize = 8;
-
-fn record_storage_bytes(bytes: usize) -> usize {
-    bytes.div_ceil(2) * 2
+/// Policy occupies the former string boolean byte; schemas retain their size.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    Values,
+    Strings,
+    Unsigned,
+    TaggedOrigin,
 }
-
-/// Standalone fitting records may be unpadded; archived records have at most
-/// one trailing zero byte. Never interpret that byte as codec data.
-fn check_record_size(record: &[u8], payload: usize) {
-    assert!(
-        record.len() == payload
-            || (record.len() == record_storage_bytes(payload)
-                && record[payload..].iter().all(|&byte| byte == 0)),
-        "column encoding size/padding mismatch"
-    );
-}
-
-/// Tuning: minimize actual packed timestamp mask cost with a bounded search.
-/// Disable both search flags to restore the original endpoint-only fit.
-pub const TIMESTAMP_MASK_STRIDE: bool = true;
-/// Maximum mask-scoring passes per block (at least one for the endpoint baseline).
-pub const TIMESTAMP_MASK_CANDIDATES: usize = 64;
-/// Seed mask search with minimax; also selects minimax when mask search is off.
-/// Computing this seed adds about 18 scans, only when archiving.
-pub const TIMESTAMP_MINIMAX_STRIDE: bool = true;
 
 /// Supplied by the caller, never copied into each block or its footer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub offset: u16,
     pub width: u8,
-    pub strings: bool,
+    pub policy: Policy,
 }
 
 impl Layout {
@@ -56,76 +41,42 @@ impl Layout {
         Self {
             offset: offset.try_into().expect("column position exceeds u16"),
             width: width as u8,
-            strings,
+            policy: if strings {
+                Policy::Strings
+            } else {
+                Policy::Values
+            },
         }
+    }
+    /// Select the fixed-u64 origin predictor at a caller-supplied field position.
+    pub fn unsigned(offset: usize, width: usize) -> Self {
+        assert_eq!(width, 8, "unsigned-origin fitting requires u64 words");
+        Self {
+            policy: Policy::Unsigned,
+            ..Self::new(offset, width, false)
+        }
+    }
+    pub fn is_strings(self) -> bool {
+        self.policy == Policy::Strings
+    }
+    pub fn is_unsigned(self) -> bool {
+        matches!(self.policy, Policy::Unsigned | Policy::TaggedOrigin)
+    }
+    /// Caller chooses a 60-bit origin with a packed representation tag; ordinary
+    /// unsigned columns retain their full-width coefficients and wire format.
+    pub fn tagged_origin(offset: usize) -> Self {
+        Self {
+            policy: Policy::TaggedOrigin,
+            ..Self::unsigned(offset, 8)
+        }
+    }
+    pub fn is_tagged_origin(self) -> bool {
+        self.policy == Policy::TaggedOrigin
     }
     pub fn range(self) -> std::ops::Range<usize> {
         let start = usize::from(self.offset);
         start..start + usize::from(self.width)
     }
-}
-
-#[inline]
-fn word_mask(width: usize) -> u128 {
-    u128::MAX >> (128 - width * 8)
-}
-
-/// Modular ZigZag is shared by native-width fields and fixed structural columns.
-#[inline]
-pub(crate) fn residual(value: u128, prediction: u128, width: usize) -> u128 {
-    let delta = value.wrapping_sub(prediction) & word_mask(width);
-    ((delta << 1) ^ 0u128.wrapping_sub(delta >> (width * 8 - 1))) & word_mask(width)
-}
-#[inline]
-pub(crate) fn restore(encoded: u128, prediction: u128, width: usize) -> u128 {
-    prediction.wrapping_add((encoded >> 1) ^ 0u128.wrapping_sub(encoded & 1)) & word_mask(width)
-}
-
-/// Preserve the existing timestamp/parent rational rounding, without float math.
-#[inline]
-pub(crate) fn advance(stride: u64, row: usize, length: usize) -> u64 {
-    if stride == 0 {
-        return 0;
-    }
-    assert!(row < length);
-    ((u128::from(stride) * row as u128 + length as u128 / 2) / length as u128) as u64
-}
-
-/// Endpoint fitting is shared; only parents quantize their origin as well.
-pub(crate) fn fit_line(
-    first: usize,
-    start: u128,
-    last: usize,
-    end: u128,
-    length: usize,
-    quantized_origin: bool,
-) -> (u128, FloatU16) {
-    let quantize = |value: u128| {
-        if quantized_origin {
-            u128::from(FloatU16::from_u64_lossy(value.min(u64::MAX as u128) as u64).to_u64())
-        } else {
-            value
-        }
-    };
-    if first == last || end <= start {
-        return (quantize(start), FloatU16::default());
-    }
-    let run = (last - first) as u128;
-    let rise = end - start;
-    let origin = start.saturating_mul(run);
-    let projected = rise.saturating_mul(first as u128);
-    let (offset, stride) = if origin < projected {
-        (0, end.saturating_mul(length as u128) / last as u128)
-    } else {
-        (
-            quantize((origin - projected) / run),
-            rise.saturating_mul(length as u128) / run,
-        )
-    };
-    (
-        offset,
-        FloatU16::from_u64_lossy(stride.min(u64::MAX as u128) as u64),
-    )
 }
 
 /// Mutate one physical column and replace only its mask; unrelated edit locks survive.
@@ -150,209 +101,7 @@ pub(crate) fn rewrite(
     write_word(&mut frame.buffer[layout.range()], mask);
 }
 
-/// Measure ordinary absolute time errors, using the decoder's exact rounding.
-/// Underprediction falls monotonically with stride; overprediction rises.
-fn timestamp_errors(frame: &Frame, stride: FloatU16) -> (u64, u64) {
-    let mut under = 0;
-    let mut over = 0;
-    for (row, bytes) in frame.buffer[frame.unit..(frame.length + 1) * frame.unit]
-        .chunks_exact(frame.unit)
-        .enumerate()
-    {
-        let value = read_word(&bytes[..8]) as u64;
-        let predicted = advance(stride.to_u64(), row, frame.length);
-        under = under.max(value.saturating_sub(predicted));
-        over = over.max(predicted.saturating_sub(value));
-    }
-    (under, over)
-}
-
-/// Search ordered FloatU16 codes directly so quantization is part of the fit.
-/// The minimum of max(under, over) lies on either side of their crossing.
-fn minimax_timestamp_stride(frame: &Frame) -> FloatU16 {
-    let mut low = 0u16;
-    let mut high = u16::MAX;
-    while low < high {
-        let mid = low + (high - low) / 2;
-        let (under, over) = timestamp_errors(frame, FloatU16::from_bits(mid));
-        if under > over {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    let upper = FloatU16::from_bits(low);
-    let lower = FloatU16::from_bits(low.saturating_sub(1));
-    let score = |stride| {
-        let (under, over) = timestamp_errors(frame, stride);
-        under.max(over)
-    };
-    // Prefer the smaller coefficient when neighboring fits tie.
-    if score(lower) <= score(upper) {
-        lower
-    } else {
-        upper
-    }
-}
-
-/// Match the archive's mask exactly, including zero's unsigned-offset encoding.
-fn timestamp_mask(frame: &Frame, stride: FloatU16) -> u64 {
-    let mut first = 0;
-    let mut mask = 0;
-    for (row, bytes) in frame.buffer[frame.unit..(frame.length + 1) * frame.unit]
-        .chunks_exact(frame.unit)
-        .enumerate()
-    {
-        let value = read_word(&bytes[..8]);
-        let encoded = if stride.to_u64() == 0 {
-            value as u64
-        } else {
-            residual(
-                value,
-                u128::from(advance(stride.to_u64(), row, frame.length)),
-                8,
-            ) as u64
-        };
-        if row == 0 {
-            first = encoded;
-        }
-        mask |= encoded ^ first;
-    }
-    mask
-}
-
-/// Bit packing stores set bits; byte packing stores whole nonzero mask bytes.
-fn timestamp_mask_cost(mask: u64) -> u32 {
-    if cfg!(feature = "bit-compression") {
-        mask.count_ones()
-    } else {
-        mask.to_ne_bytes().iter().filter(|&&byte| byte != 0).count() as u32 * 8
-    }
-}
-
-/// A bounded, deduplicated candidate list makes tuning independent of block size.
-/// Strict improvement preserves the endpoint on ties and prevents regressions.
-fn consider_timestamp_stride(
-    frame: &Frame,
-    stride: FloatU16,
-    best: &mut (FloatU16, u32),
-    seen: &mut SmallVec<[u16; 64]>,
-    budget: usize,
-) {
-    if seen.len() >= budget || best.1 == 0 || seen.contains(&stride.to_bits()) {
-        return;
-    }
-    seen.push(stride.to_bits());
-    let cost = timestamp_mask_cost(timestamp_mask(frame, stride));
-    if cost < best.1 {
-        *best = (stride, cost);
-    }
-}
-
-/// Heuristic only: mask cost is nonmonotonic, so sampled strides need not include
-/// the global optimum. Always keep the endpoint as a no-regression baseline.
-fn mask_timestamp_stride(frame: &Frame, budget: usize) -> FloatU16 {
-    let endpoint = endpoint_timestamp_stride(frame);
-    let mut best = (
-        endpoint,
-        timestamp_mask_cost(timestamp_mask(frame, endpoint)),
-    );
-    let mut seen = SmallVec::<[u16; 64]>::new();
-    seen.push(endpoint.to_bits());
-    let budget = budget.max(1);
-    if best.1 == 0 || budget == 1 {
-        return best.0;
-    }
-    consider_timestamp_stride(frame, FloatU16::default(), &mut best, &mut seen, budget);
-    let minimax = if TIMESTAMP_MINIMAX_STRIDE && best.1 != 0 && seen.len() < budget {
-        minimax_timestamp_stride(frame)
-    } else {
-        endpoint
-    };
-    consider_timestamp_stride(frame, minimax, &mut best, &mut seen, budget);
-
-    // Sample the plausible numeric slope range before a sparse global code grid.
-    let limit = endpoint
-        .to_u64()
-        .max(minimax.to_u64())
-        .saturating_mul(2)
-        .min(FloatU16::MAX);
-    for part in 1..=8 {
-        let stride = FloatU16::from_u64_lossy((u128::from(limit) * part / 8) as u64);
-        consider_timestamp_stride(frame, stride, &mut best, &mut seen, budget);
-    }
-    for part in 1..=8 {
-        let stride = FloatU16::from_bits((u32::from(u16::MAX) * part / 8) as u16);
-        consider_timestamp_stride(frame, stride, &mut best, &mut seen, budget);
-    }
-    // Refine the current winner from coarse code steps down to adjacent codes.
-    for shift in (0..=10).rev() {
-        let center = best.0.to_bits();
-        let step = 1u16 << shift;
-        for bits in [center.saturating_sub(step), center.saturating_add(step)] {
-            consider_timestamp_stride(
-                frame,
-                FloatU16::from_bits(bits),
-                &mut best,
-                &mut seen,
-                budget,
-            );
-        }
-    }
-    // Spend the remaining budget near the winner; freeze the center for coverage.
-    let center = best.0.to_bits();
-    for distance in 1..=budget.min(u16::MAX as usize) {
-        if seen.len() >= budget || best.1 == 0 {
-            break;
-        }
-        for bits in [
-            center.saturating_sub(distance as u16),
-            center.saturating_add(distance as u16),
-        ] {
-            consider_timestamp_stride(
-                frame,
-                FloatU16::from_bits(bits),
-                &mut best,
-                &mut seen,
-                budget,
-            );
-        }
-    }
-    best.0
-}
-
-/// Fit immutable starts, never late close/range-end values. Zero keeps unsigned
-/// offsets; nonzero coefficients store exact modular ZigZag residuals.
-pub(crate) fn fit_timestamp(frame: &mut Frame) -> FloatU16 {
-    if frame.length < 2 {
-        return FloatU16::default();
-    }
-    let stride = if TIMESTAMP_MASK_STRIDE {
-        mask_timestamp_stride(frame, TIMESTAMP_MASK_CANDIDATES)
-    } else if TIMESTAMP_MINIMAX_STRIDE {
-        minimax_timestamp_stride(frame)
-    } else {
-        endpoint_timestamp_stride(frame)
-    };
-    if stride.to_u64() != 0 {
-        let length = frame.length;
-        rewrite(frame, Layout::new(0, 8, false), |value, row, _| {
-            residual(value, u128::from(advance(stride.to_u64(), row, length)), 8)
-        });
-    }
-    stride
-}
-
-/// Preserve the original endpoint fit, including its out-of-range fallback.
-fn endpoint_timestamp_stride(frame: &Frame) -> FloatU16 {
-    let end = read_word(&frame.buffer[frame.length * frame.unit..frame.length * frame.unit + 8]);
-    let stride = end * frame.length as u128 / (frame.length - 1) as u128;
-    if stride > u128::from(FloatU16::MAX) {
-        return FloatU16::default();
-    }
-    FloatU16::from_u64_lossy(stride as u64)
-}
-
+#[inline]
 pub(crate) fn read_word(bytes: &[u8]) -> u128 {
     let mut word = [0; 16];
     // Rows use native byte order, matching BytePacker on either endian target.
@@ -362,6 +111,7 @@ pub(crate) fn read_word(bytes: &[u8]) -> u128 {
     word[16 - bytes.len()..].copy_from_slice(bytes);
     u128::from_ne_bytes(word)
 }
+#[inline]
 pub(crate) fn write_word(bytes: &mut [u8], value: u128) {
     let word = value.to_ne_bytes();
     #[cfg(target_endian = "little")]
@@ -370,111 +120,10 @@ pub(crate) fn write_word(bytes: &mut [u8], value: u128) {
     bytes.copy_from_slice(&word[16 - bytes.len()..]);
 }
 
-// Only the selected form is serialized. Row mode is retained for experimental
-// string-index behavior; general fields use the two-byte custom-float stride.
-const OFFSET: u8 = 1;
-const LINEAR: u8 = 2;
-const ROW: u8 = 3;
-const CYCLE: u8 = 4;
-const ROW_CYCLE: u8 = 5;
-const DICTIONARY: u8 = 6;
-const DICTIONARY_CYCLE: u8 = 7;
-// Predict slowly advancing dictionary keys without wrapping at a cycle boundary.
-const DICTIONARY_STRIDE: u8 = 8;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Prediction {
-    origin: u128,
-    stride: u64,
-    period: u8,
-    phase: u8,
-    row: bool,
-    descending: bool,
-}
-
-impl Prediction {
-    fn at(self, row: usize, length: usize) -> u128 {
-        let (row, length) = if self.period == 0 {
-            (row, length)
-        } else {
-            (
-                (row % usize::from(self.period) + usize::from(self.phase))
-                    % usize::from(self.period),
-                usize::from(self.period),
-            )
-        };
-        let increase = if self.row {
-            row as u128
-        } else {
-            advance(self.stride, row, length) as u128
-        };
-        if self.descending {
-            self.origin.wrapping_sub(increase)
-        } else {
-            self.origin.wrapping_add(increase)
-        }
-    }
-    fn record(self, width: usize) -> SmallVec<[u8; 24]> {
-        let tag = match (self.row, self.period, self.stride) {
-            (true, 0, _) => ROW,
-            (true, _, _) => ROW_CYCLE,
-            (false, _, 0) => OFFSET,
-            (false, 0, _) => LINEAR,
-            _ => CYCLE,
-        };
-        let mut bytes = SmallVec::new();
-        bytes.push(tag | if self.descending { 0x80 } else { 0 });
-        bytes.extend_from_slice(&self.origin.to_le_bytes()[..width]);
-        if matches!(tag, LINEAR | CYCLE) {
-            bytes.extend_from_slice(
-                &FloatU16::from_u64_lossy(self.stride)
-                    .to_bits()
-                    .to_le_bytes(),
-            );
-        }
-        if matches!(tag, CYCLE | ROW_CYCLE) {
-            bytes.extend_from_slice(&[self.period, self.phase]);
-        }
-        bytes
-    }
-    fn parse(bytes: &[u8], width: usize) -> Self {
-        let tag = bytes[0] & 0x7f;
-        assert!(
-            matches!(tag, OFFSET | LINEAR | ROW | CYCLE | ROW_CYCLE),
-            "unknown column prediction"
-        );
-        let mut origin = [0; 16];
-        origin[..width].copy_from_slice(&bytes[1..1 + width]);
-        let mut prediction = Self {
-            origin: u128::from_le_bytes(origin),
-            row: matches!(tag, ROW | ROW_CYCLE),
-            descending: bytes[0] & 0x80 != 0,
-            ..Self::default()
-        };
-        let mut end = 1 + width;
-        if matches!(tag, LINEAR | CYCLE) {
-            prediction.stride =
-                FloatU16::from_bits(u16::from_le_bytes(bytes[end..end + 2].try_into().unwrap()))
-                    .to_u64();
-            end += 2;
-        }
-        if matches!(tag, CYCLE | ROW_CYCLE) {
-            prediction.period = bytes[end];
-            prediction.phase = bytes[end + 1];
-            end += 2;
-            assert!(
-                prediction.period != 0 && prediction.phase < prediction.period,
-                "invalid column cycle"
-            );
-        }
-        check_record_size(bytes, end);
-        prediction
-    }
-}
-
-/// The directory is schema-sized. Prefix sums locate records, so the combined
-/// metadata region has no per-record limit. Each directory byte counts two-byte
-/// units, allowing up to 510 bytes per record including even-length padding.
+/// The directory is schema-sized. Sizes count backward from the directory start,
+/// with entry zero adjacent to it; the combined metadata has no per-record limit.
+/// Each directory byte counts two-byte units, allowing up to 510 bytes per record
+/// including even-length padding.
 #[derive(Clone, Copy)]
 pub struct Metadata<'a, 's> {
     records: &'a [u8],
@@ -508,16 +157,31 @@ impl<'a, 's> Metadata<'a, 's> {
     pub fn has_encodings(self) -> bool {
         !self.records.is_empty()
     }
+    /// Immutable codecs can be excluded from a physical payload edit. Their
+    /// presence alone must not turn an otherwise direct write into a scratch copy.
+    pub fn has_encodings_selected(self, unsigned: bool) -> bool {
+        if unsigned {
+            return self.has_encodings();
+        }
+        let skipped: usize = self
+            .layout
+            .iter()
+            .zip(self.widths.iter())
+            .filter(|(layout, _)| layout.is_unsigned())
+            .map(|(_, width)| usize::from(*width) * 2)
+            .sum();
+        self.records.len() > skipped
+    }
     pub fn entries(self) -> impl Iterator<Item = (Layout, &'a [u8])> {
-        let mut position = 0;
+        let mut position = self.records.len();
         self.layout
             .iter()
             .copied()
             .zip(self.widths.iter().copied())
             .map(move |(layout, width)| {
-                let start = position;
-                position += usize::from(width) << 1;
-                (layout, &self.records[start..position])
+                let end = position;
+                position -= usize::from(width) << 1;
+                (layout, &self.records[position..end])
             })
     }
     pub fn is_encoded(self, offset: usize) -> bool {
@@ -525,13 +189,37 @@ impl<'a, 's> Metadata<'a, 's> {
             .any(|(layout, record)| usize::from(layout.offset) == offset && !record.is_empty())
     }
     pub fn decode(self, frame: &ArchivedFrame, row: &mut [u8], index: usize) {
-        for (layout, record) in self.entries().filter(|(_, record)| !record.is_empty()) {
+        self.decode_selected(frame, row, index, true);
+    }
+    pub fn decode_selected(
+        self,
+        frame: &ArchivedFrame,
+        row: &mut [u8],
+        index: usize,
+        unsigned: bool,
+    ) {
+        for (layout, record) in self
+            .entries()
+            .filter(|(c, record)| !record.is_empty() && (unsigned || !c.is_unsigned()))
+        {
             let column = Column::new(frame, layout, record);
             column.decode_row(row, index);
         }
     }
     pub fn encode(self, frame: &ArchivedFrame, row: &mut [u8], index: usize) -> bool {
-        for (layout, record) in self.entries().filter(|(_, record)| !record.is_empty()) {
+        self.encode_selected(frame, row, index, true)
+    }
+    pub fn encode_selected(
+        self,
+        frame: &ArchivedFrame,
+        row: &mut [u8],
+        index: usize,
+        unsigned: bool,
+    ) -> bool {
+        for (layout, record) in self
+            .entries()
+            .filter(|(c, record)| !record.is_empty() && (unsigned || !c.is_unsigned()))
+        {
             let column = Column::new(frame, layout, record);
             let Some(value) = column.encode(read_word(&row[layout.range()]), index) else {
                 return false;
@@ -540,416 +228,6 @@ impl<'a, 's> Metadata<'a, 's> {
         }
         true
     }
-}
-
-/// Temporary view: no schema references, native pointers, or expanded predictors
-/// are stored in the archive. Dictionary bases borrow the physical first slot.
-pub struct Column<'a> {
-    frame: &'a ArchivedFrame,
-    layout: Layout,
-    codec: Codec<'a>,
-}
-
-enum Codec<'a> {
-    Raw,
-    Predicted(Prediction),
-    Exceptions(ExceptionEncoding<'a>),
-    Dictionary {
-        entries: &'a [u8],
-        count: usize,
-        bits: usize,
-        prediction: KeyPrediction,
-    },
-}
-
-// Key prediction always starts at zero, preserving the first slot's dictionary base.
-#[derive(Clone, Copy)]
-enum KeyPrediction {
-    Raw,
-    Cycle(u8, u8),
-    Stride(u64),
-}
-impl KeyPrediction {
-    fn at(self, row: usize, length: usize) -> u128 {
-        match self {
-            Self::Raw => 0,
-            Self::Cycle(period, phase) => key_prediction(row, period, phase),
-            Self::Stride(stride) => u128::from(advance(stride, row, length)),
-        }
-    }
-    fn encode(self, id: u128, row: usize, length: usize, width: usize) -> u128 {
-        if matches!(self, Self::Raw) {
-            id
-        } else {
-            residual(id, self.at(row, length), width)
-        }
-    }
-    fn decode(self, encoded: u128, row: usize, length: usize, width: usize) -> u128 {
-        if matches!(self, Self::Raw) {
-            encoded
-        } else {
-            restore(encoded, self.at(row, length), width)
-        }
-    }
-}
-
-impl<'a> Column<'a> {
-    pub fn new(frame: &'a ArchivedFrame, layout: Layout, record: &'a [u8]) -> Self {
-        assert!(
-            layout.range().end <= frame.unit(),
-            "column exceeds frame row"
-        );
-        let codec = match record.first().copied() {
-            None => Codec::Raw,
-            Some(exceptions::TAG) => Codec::Exceptions(ExceptionEncoding::new(
-                record,
-                usize::from(layout.width),
-                frame.len(),
-            )),
-            Some(DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE) => {
-                let count = usize::from(record[1]);
-                let bits = usize::from(record[2]);
-                assert!((2..=MAX_DICTIONARY_VALUES).contains(&count));
-                assert!((1..=usize::from(layout.width) * 8).contains(&bits));
-                let (prediction, header) = if record[0] == DICTIONARY_CYCLE {
-                    assert!(
-                        record[3] != 0 && record[4] < record[3],
-                        "invalid dictionary cycle"
-                    );
-                    (KeyPrediction::Cycle(record[3], record[4]), 5)
-                } else if record[0] == DICTIONARY_STRIDE {
-                    let stride =
-                        FloatU16::from_bits(u16::from_le_bytes(record[3..5].try_into().unwrap()));
-                    (KeyPrediction::Stride(stride.to_u64()), 5)
-                } else {
-                    (KeyPrediction::Raw, 3)
-                };
-                let end = header + (count * bits).div_ceil(8);
-                check_record_size(record, end);
-                Codec::Dictionary {
-                    entries: &record[header..end],
-                    count,
-                    bits,
-                    prediction,
-                }
-            }
-            _ => Codec::Predicted(Prediction::parse(record, usize::from(layout.width))),
-        };
-        Self {
-            frame,
-            layout,
-            codec,
-        }
-    }
-    pub fn is_dictionary(&self) -> bool {
-        matches!(self.codec, Codec::Dictionary { .. })
-    }
-    pub(crate) fn decode_row(&self, row: &mut [u8], index: usize) {
-        let value = self.decode(read_word(&row[self.layout.range()]), index);
-        write_word(&mut row[self.layout.range()], value);
-    }
-    /// Selective random access borrows packed rows and needs at most one word of scratch.
-    pub fn read(&self, index: usize) -> u128 {
-        let mut bytes = [0; 16];
-        let width = usize::from(self.layout.width);
-        self.frame
-            .read_column(index, usize::from(self.layout.offset), &mut bytes[..width]);
-        self.decode(read_word(&bytes[..width]), index)
-    }
-    pub fn decode(&self, encoded: u128, index: usize) -> u128 {
-        let width = usize::from(self.layout.width);
-        match self.codec {
-            Codec::Raw => encoded,
-            Codec::Exceptions(encoding) => {
-                encoding.decode(encoded, index, exceptions::ZERO_SPECIAL)
-            }
-            Codec::Predicted(prediction) => {
-                restore(encoded, prediction.at(index, self.frame.len()), width)
-            }
-            Codec::Dictionary {
-                entries,
-                count,
-                bits,
-                prediction,
-            } => {
-                let base = read_word(&self.frame.first()[self.layout.range()]);
-                let id = prediction.decode(encoded ^ base, index, self.frame.len(), width) as usize;
-                assert!(id < count, "dictionary key exceeds entry count");
-                base.checked_add(unpack(entries, id, bits))
-                    .expect("dictionary value exceeds u128")
-            }
-        }
-    }
-    pub fn encode(&self, value: u128, index: usize) -> Option<u128> {
-        let width = usize::from(self.layout.width);
-        Some(match self.codec {
-            Codec::Raw => value,
-            Codec::Exceptions(encoding) => {
-                let first = read_word(&self.frame.first()[self.layout.range()]);
-                return encoding.encode(value, index, first, exceptions::ZERO_SPECIAL);
-            }
-            Codec::Predicted(prediction) => {
-                residual(value, prediction.at(index, self.frame.len()), width)
-            }
-            Codec::Dictionary {
-                entries,
-                count,
-                bits,
-                prediction,
-            } => {
-                let base = read_word(&self.frame.first()[self.layout.range()]);
-                let delta = value.checked_sub(base)?;
-                let id = (0..count).find(|&id| unpack(entries, id, bits) == delta)?;
-                // Row zero owns the immutable base, rather than a mutable key.
-                if index == 0 && id != 0 {
-                    return None;
-                }
-                base ^ prediction.encode(id as u128, index, self.frame.len(), width)
-            }
-        })
-    }
-}
-
-fn key_prediction(row: usize, period: u8, phase: u8) -> u128 {
-    (((row % usize::from(period) + usize::from(phase)) % usize::from(period)) as u128)
-        .wrapping_sub(u128::from(phase))
-}
-fn unpack(entries: &[u8], id: usize, bits: usize) -> u128 {
-    // Consume byte fragments, including the seventeenth byte of an unaligned
-    // 128-bit entry, without overreading the record or shifting by 128.
-    let mut value = 0;
-    let mut done = 0;
-    while done < bits {
-        let position = id * bits + done;
-        let count = (8 - position % 8).min(bits - done);
-        value |= u128::from((entries[position / 8] >> (position % 8)) & (u8::MAX >> (8 - count)))
-            << done;
-        done += count;
-    }
-    value
-}
-
-fn varying_bits(value: u128, width: usize) -> usize {
-    if cfg!(feature = "bit-compression") {
-        value.count_ones() as usize
-    } else {
-        value.to_le_bytes()[..width]
-            .iter()
-            .filter(|&&v| v != 0)
-            .count()
-            * 8
-    }
-}
-fn frame_bits(frame: &Frame) -> usize {
-    frame
-        .mask()
-        .iter()
-        .map(|&byte| varying_bits(u128::from(byte), 1))
-        .sum()
-}
-fn payload_size(frame: &Frame, bits: usize) -> usize {
-    let stride = if cfg!(feature = "bit-compression") && super::dataframe::CONTINUOUS_BIT_PACKING {
-        bits
-    } else {
-        bits.div_ceil(8) * 8
-    };
-    2 * frame.unit + ((frame.length - 1) * stride).div_ceil(8)
-}
-
-/// Frame packing is the baseline: it omits any constant bit, not just leading zeros.
-struct Cost<'a> {
-    frame: &'a Frame,
-    total_bits: usize,
-    original_bits: usize,
-    footer: usize,
-    width: usize,
-}
-impl Cost<'_> {
-    fn size(&self, bits: usize, metadata: usize) -> usize {
-        (payload_size(self.frame, self.total_bits - self.original_bits + bits)
-            + self.footer
-            + record_storage_bytes(metadata))
-        .div_ceil(2)
-            * 2
-    }
-}
-
-/// Dictionary economics are deliberately explicit. First/mask slots and the
-/// one-byte directory entry are shared; the minimum reuses the first slot.
-fn dictionary_cost(unique: &[u128], cost: &Cost<'_>) -> (usize, usize) {
-    let minimum = *unique.iter().min().unwrap();
-    let entry_mask = unique
-        .iter()
-        .fold(0, |mask, &value| mask | (value - minimum));
-    let entry_bits = (u128::BITS - entry_mask.leading_zeros()) as usize;
-    let key_bits = (usize::BITS - (unique.len() - 1).leading_zeros()) as usize;
-    let key_bits = if cfg!(feature = "bit-compression") {
-        key_bits
-    } else {
-        key_bits.div_ceil(8) * 8
-    };
-    let metadata_bytes = 3 + (unique.len() * entry_bits).div_ceil(8);
-    // Every discovery-order key in 0..K occurs, so the direct mask is exact.
-    // Predicted keys require inspecting their residuals separately.
-    (cost.size(key_bits, metadata_bytes), entry_bits)
-}
-
-struct Candidate {
-    record: SmallVec<[u8; 24]>,
-    encoded: SmallVec<[u128; 256]>,
-    mask: u128,
-    size: usize,
-}
-impl Candidate {
-    // Scale the threshold by this column's current first/mask slots, packed
-    // values, directory byte, and codec record. Unrelated columns and shared
-    // footer bytes must not make a useful encoding harder to select.
-    fn worthwhile(&self, size: usize, cost: &Cost<'_>) -> bool {
-        let column_bytes = 2 * cost.width
-            + ((cost.frame.length - 1) * varying_bits(self.mask, cost.width)).div_ceil(8)
-            + 1
-            + record_storage_bytes(self.record.len());
-        // Compare actual frame allocations to retain packing/alignment effects;
-        // only the relative savings threshold is column-local.
-        size.saturating_add(MIN_ENCODING_SAVINGS.max(column_bytes / 64)) <= self.size
-    }
-
-    /// Only shortlisted predictors reach this pass. Residual masks cannot be
-    /// inferred from range alone because compaction omits arbitrary constant bits.
-    fn consider(
-        &mut self,
-        record: &[u8],
-        values: &[u128],
-        cost: &Cost<'_>,
-        encode: impl Fn(u128, usize) -> u128,
-    ) {
-        if record.len() > MAX_RECORD_BYTES || !self.worthwhile(cost.size(0, record.len()), cost) {
-            return;
-        }
-        let first = encode(values[0], 0);
-        let mut mask = 0;
-        for (row, &value) in values.iter().enumerate().skip(1) {
-            let previous = mask;
-            mask |= encode(value, row) ^ first;
-            if mask != previous
-                && !self.worthwhile(
-                    cost.size(varying_bits(mask, cost.width), record.len()),
-                    cost,
-                )
-            {
-                return;
-            }
-        }
-        self.size = cost.size(varying_bits(mask, cost.width), record.len());
-        self.mask = mask;
-        self.record = SmallVec::from_slice(record);
-        self.encoded.clear();
-        self.encoded.extend(
-            values
-                .iter()
-                .enumerate()
-                .map(|(row, &value)| encode(value, row)),
-        );
-    }
-}
-
-/// Fit either a line or a line evaluated at cyclic row positions. The exact
-/// origin compensates for FloatU16 quantization; residuals retain every value bit.
-fn prediction(values: &[u128], layout: Layout, period: u8, phase: u8) -> Prediction {
-    let length = if period == 0 {
-        values.len()
-    } else {
-        usize::from(period)
-    };
-    let position = |row: usize| {
-        if period == 0 {
-            row
-        } else {
-            (row + usize::from(phase)) % length
-        }
-    };
-    let mut p = Prediction {
-        origin: values[0],
-        period,
-        phase,
-        row: layout.strings,
-        ..Prediction::default()
-    };
-    if layout.strings {
-        p.origin = p.origin.wrapping_sub(u128::from(phase));
-        return p;
-    }
-    let (low, high) = if period == 0 {
-        (0, values.len() - 1)
-    } else {
-        // A complete cycle supplies both endpoints directly, avoiding another scan.
-        (
-            (length - usize::from(phase)) % length,
-            (2 * length - 1 - usize::from(phase)) % length,
-        )
-    };
-    let run = position(high) - position(low);
-    if run == 0 {
-        return Prediction {
-            origin: p.origin,
-            ..Prediction::default()
-        };
-    }
-    let mask = word_mask(usize::from(layout.width));
-    let delta = values[high].wrapping_sub(values[low]) & mask;
-    p.descending = delta >> (usize::from(layout.width) * 8 - 1) != 0;
-    let rise = if p.descending {
-        values[low].wrapping_sub(values[high]) & mask
-    } else {
-        delta
-    };
-    p.stride = fit_line(0, 0, run, rise, length, false).1.to_u64();
-    let increase = u128::from(advance(p.stride, position(low), length));
-    p.origin = if p.descending {
-        values[low].wrapping_add(increase)
-    } else {
-        values[low].wrapping_sub(increase)
-    } & mask;
-    // A flat fit needs neither cyclic row arithmetic nor stored stride/phase bytes.
-    if p.stride == 0 {
-        p.period = 0;
-        p.phase = 0;
-        p.descending = false;
-    }
-    p
-}
-
-/// Discover likely periods from repeated anchor values, rather than trying every
-/// period. Eight anchors bound comparisons; vote counts rank at most four fits.
-/// Exact and approximate codecs remain lossless even if this heuristic misses a cycle.
-fn cycle_periods(values: &[u128]) -> SmallVec<[u8; MAX_CYCLE_CANDIDATES]> {
-    let mut anchors = SmallVec::<[(u128, usize); CYCLE_ANCHORS]>::new();
-    let mut votes = [0usize; 256];
-    for (row, &value) in values.iter().enumerate() {
-        if let Some((_, previous)) = anchors.iter_mut().find(|(anchor, _)| *anchor == value) {
-            let distance = row - *previous;
-            *previous = row;
-            // Adjacent equal values are runs, not useful cyclic predictions.
-            if (2..=usize::from(MAX_CYCLE)).contains(&distance) {
-                votes[distance] += 1;
-            }
-        } else if anchors.len() < CYCLE_ANCHORS {
-            anchors.push((value, row));
-        }
-    }
-    let mut periods = SmallVec::new();
-    for _ in 0..MAX_CYCLE_CANDIDATES {
-        // Prefer a shorter period when the evidence ties.
-        let Some(period) = (2..=usize::from(MAX_CYCLE))
-            .filter(|&period| votes[period] != 0)
-            .max_by_key(|&period| (votes[period], std::cmp::Reverse(period)))
-        else {
-            break;
-        };
-        periods.push(period as u8);
-        votes[period] = 0;
-    }
-    periods
 }
 
 /// Cheap forms come first. Bounds eliminate whole families before discovery or
@@ -973,220 +251,144 @@ fn select(values: &[u128], layout: Layout, frame: &Frame, footer_bytes: usize) -
     if values.len() < 2 || cost.original_bits == 0 {
         return best;
     }
-    let origin = Prediction {
-        origin: values[0],
-        ..Prediction::default()
-    };
-    consider_prediction(&mut best, origin, values, &cost);
-    let line = prediction(values, layout, 0, 0);
-    // A flat endpoint fit collapses to the exact origin already considered.
-    if line.row || line.stride != 0 {
-        consider_prediction(&mut best, line, values, &cost);
-    }
-    // A compact arithmetic cycle is simpler than an identity dictionary.
-    select_cycles(&mut best, values, layout, &cost);
+    prediction::fit_candidates(&mut best, values, layout, &cost);
     select_dictionary(&mut best, values, &cost);
-    if !layout.strings {
+    if !layout.is_strings() {
         // Zero policy is supplied in code, never in a column descriptor/record.
         // Keeping zero special also preserves duration open sentinels exactly.
-        ExceptionEncoding::fit(&mut best, values, &cost, exceptions::ZERO_SPECIAL);
+        ExceptionsEncoding::<true>::fit(&mut best, values, &cost);
     }
     best
-}
-
-fn consider_prediction(
-    best: &mut Candidate,
-    prediction: Prediction,
-    values: &[u128],
-    cost: &Cost<'_>,
-) {
-    best.consider(
-        &prediction.record(cost.width),
-        values,
-        cost,
-        |value, row| residual(value, prediction.at(row, values.len()), cost.width),
-    );
-}
-
-fn select_cycles(best: &mut Candidate, values: &[u128], layout: Layout, cost: &Cost<'_>) {
-    let metadata_bytes = 1 + cost.width + if layout.strings { 2 } else { 4 };
-    if !best.worthwhile(cost.size(0, metadata_bytes), cost) {
-        return;
-    }
-    let periods = cycle_periods(values);
-    if periods.is_empty() {
-        return;
-    }
-    // Locate rotation anchors only when a plausible cycle can afford its footer.
-    let distance = |value: u128| {
-        let delta = value.wrapping_sub(values[0]) & word_mask(cost.width);
-        (delta << (128 - cost.width * 8)) as i128
-    };
-    let minimum = (0..values.len())
-        .min_by_key(|&row| distance(values[row]))
-        .unwrap();
-    let maximum = (0..values.len())
-        .max_by_key(|&row| distance(values[row]))
-        .unwrap();
-    let descending = values
-        .iter()
-        .skip(1)
-        .find(|&&value| value != values[0])
-        .is_some_and(|&value| distance(value) < 0);
-    for period in periods {
-        let rotate =
-            |row| ((usize::from(period) - row % usize::from(period)) % usize::from(period)) as u8;
-        // Start at the low value for ascending cycles and the high value for
-        // descending ones, avoiding a poor rotated fit before the obvious one.
-        let phases = if layout.strings {
-            [rotate(minimum), 0, 0]
-        } else if descending {
-            [rotate(maximum), rotate(minimum), 0]
-        } else {
-            [rotate(minimum), rotate(maximum), 0]
-        };
-        for (choice, phase) in phases.into_iter().enumerate() {
-            if phases[..choice].contains(&phase) {
-                continue;
-            }
-            let p = prediction(values, layout, period, phase);
-            // Degenerate cycles are the offset case, not another candidate scan.
-            if p.period == 0 {
-                continue;
-            }
-            let previous = best.size;
-            consider_prediction(best, p, values, cost);
-            if best.size < previous {
-                return;
-            }
-        }
-    }
-}
-
-fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
-    // The smallest dictionary has a tag, count, width and at least one entry byte.
-    if !best.worthwhile(cost.size(0, 4), cost) {
-        return;
-    }
-    let width = cost.width;
-    let mut unique = SmallVec::<[u128; 64]>::new();
-    let mut ids = SmallVec::<[u128; 256]>::new();
-    for &value in values {
-        let id = match unique.iter().position(|&entry| entry == value) {
-            Some(id) => id,
-            None if unique.len() < MAX_DICTIONARY_VALUES => {
-                unique.push(value);
-                unique.len() - 1
-            }
-            _ => return,
-        };
-        ids.push(id as u128);
-    }
-    if unique.len() < 2 {
-        return;
-    }
-    let (direct_cost, entry_bits) = dictionary_cost(&unique, cost);
-    let record_bytes = 3 + (unique.len() * entry_bits).div_ceil(8);
-    // Even perfect key prediction must pay for the packed entries and cycle bytes.
-    if !best.worthwhile(direct_cost, cost) && !best.worthwhile(cost.size(0, record_bytes + 2), cost)
-    {
-        return;
-    }
-    if record_bytes > MAX_RECORD_BYTES {
-        return;
-    }
-    let base = *unique.iter().min().unwrap();
-    let mut dictionary = SmallVec::<[u8; 24]>::new();
-    dictionary.extend_from_slice(&[DICTIONARY, unique.len() as u8, entry_bits as u8]);
-    dictionary.resize(record_bytes, 0);
-    for (id, &value) in unique.iter().enumerate() {
-        for bit in 0..entry_bits {
-            let position = id * entry_bits + bit;
-            dictionary[3 + position / 8] |= ((((value - base) >> bit) & 1) as u8) << (position % 8);
-        }
-    }
-    if best.worthwhile(direct_cost, cost) {
-        // Discovery assigns every key in 0..K. Their union mask and packed size
-        // are known exactly, so direct dictionaries need no residual trial scan.
-        let key_bits = (usize::BITS - (unique.len() - 1).leading_zeros()) as usize;
-        best.size = direct_cost;
-        best.mask = (1u128 << key_bits) - 1;
-        best.record = dictionary.clone();
-        best.encoded.clear();
-        best.encoded.extend(ids.iter().map(|id| base ^ id));
-    }
-    // Stride and cycle keys have the same minimum metadata cost.
-    if !best.worthwhile(cost.size(0, record_bytes + 2), cost) {
-        return;
-    }
-    // Repeated runs of progressively discovered values benefit from a fractional
-    // key stride. Charge its two-byte coefficient before considering cyclic keys.
-    let mut predicted = dictionary.clone();
-    predicted[0] = DICTIONARY_STRIDE;
-    predicted.insert(3, 0);
-    predicted.insert(4, 0);
-    // Use one fitted key line, ending at the last occurrence of the highest
-    // discovery key. A final revisit to an older key must not flatten the line.
-    let endpoint = ids.iter().enumerate().max_by_key(|(_, id)| *id).unwrap().0;
-    let stride =
-        FloatU16::from_u64_lossy((ids[endpoint] * ids.len() as u128 / endpoint as u128) as u64);
-    if stride.to_u64() != 0 {
-        predicted[3..5].copy_from_slice(&stride.to_bits().to_le_bytes());
-        let prediction = KeyPrediction::Stride(stride.to_u64());
-        best.consider(&predicted, &ids, cost, |id, row| {
-            base ^ prediction.encode(id, row, ids.len(), width)
-        });
-    }
-    // IDs start at zero; cyclic prediction therefore needs no stored origin.
-    let first_return = ids
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(row, &id)| (id == 0).then_some(row));
-    dictionary[0] = DICTIONARY_CYCLE;
-    dictionary.insert(3, 0);
-    dictionary.insert(4, 0);
-    if !best.worthwhile(cost.size(0, dictionary.len()), cost) {
-        return;
-    }
-    for period in cycle_periods(&ids) {
-        let rotated = first_return.map_or(0, |row| {
-            ((usize::from(period) - row % usize::from(period)) % usize::from(period)) as u8
-        });
-        for (choice, phase) in [0, rotated].into_iter().enumerate() {
-            if choice == 1 && phase == 0 {
-                continue;
-            }
-            dictionary[3] = period;
-            dictionary[4] = phase;
-            let previous = best.size;
-            best.consider(&dictionary, &ids, cost, |id, row| {
-                base ^ KeyPrediction::Cycle(period, phase).encode(id, row, ids.len(), width)
-            });
-            if best.size < previous {
-                return;
-            }
-        }
-    }
 }
 
 /// Fit decoded columns at rollover or after an archived edit requires rebuilding.
 /// Greedy choices charge real frame packing, the shared
 /// directory, record sizes, and two-byte allocation rounding. Ties keep raw data.
 pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
+    fit_inner(frame, trailer, layout, None, None);
+}
+pub(crate) fn fit_relative(
+    frame: &mut Frame,
+    trailer: &mut Vec<u8>,
+    layout: &[Layout],
+    origin: u64,
+) {
+    fit_inner(frame, trailer, layout, None, Some(origin));
+}
+pub(crate) fn refit(
+    frame: &mut Frame,
+    trailer: &mut Vec<u8>,
+    layout: &[Layout],
+    preserved: Metadata<'_, '_>,
+) {
+    fit_inner(frame, trailer, layout, Some(preserved), None);
+}
+fn fit_inner(
+    frame: &mut Frame,
+    trailer: &mut Vec<u8>,
+    layout: &[Layout],
+    preserved: Option<Metadata<'_, '_>>,
+    relative_origin: Option<u64>,
+) {
     if frame.length == 0 || layout.is_empty() {
         return;
     }
     let mut records = SmallVec::<[u8; 128]>::new();
     let mut sizes = SmallVec::<[u8; 16]>::new();
     let mut values = SmallVec::<[u128; 256]>::new();
+    // Fit mandatory origin fields first so ordinary candidates see exactly the
+    // established residual masks, regardless of their directory position.
+    let mut fixed = SmallVec::<[Footer; 2]>::new();
+    for &column in layout.iter().filter(|c| c.is_unsigned()) {
+        assert!(column.range().end <= frame.unit, "invalid column layout");
+        let mut footer = Footer::new();
+        if let Some(old) = preserved {
+            let (_, record) = old
+                .entries()
+                .find(|(c, _)| c.offset == column.offset)
+                .unwrap();
+            footer.extend_from_slice(record);
+        } else if column.is_tagged_origin() {
+            // Preserve decoded input before the legacy absolute predictor
+            // rewrites it. The split search must see the same raw/legacy/local
+            // alternatives as the offline probe, not detrend residuals twice.
+            let original: SmallVec<[u128; 256]> = frame
+                .iter()
+                .map(|row| read_word(&row[column.range()]))
+                .collect();
+            // Relative values are already elapsed ticks. Retain an absolute
+            // block start in their tagged word without transforming rows again.
+            let encoding = match relative_origin {
+                Some(origin) => OriginEncoding::relative(origin),
+                None => OriginEncoding::absolute(prediction::fit_unsigned(frame, column)),
+            };
+            encoding.write_footer(8, &mut footer);
+            let cost = Cost {
+                frame,
+                total_bits: frame_bits(frame),
+                original_bits: varying_bits(read_word(&frame.mask()[column.range()]), 8),
+                footer: trailer.len()
+                    + layout.len()
+                    + fixed.iter().map(|r| record_storage_bytes(r.len())).sum::<usize>(),
+                width: 8,
+            };
+            let mut candidate = Candidate {
+                record: footer.clone(),
+                encoded: SmallVec::new(),
+                mask: read_word(&frame.mask()[column.range()]),
+                size: cost.size(cost.original_bits, footer.len()),
+            };
+            let scope = if encoding.is_relative() {
+                split_dictionary::Scope::Relative(encoding.origin())
+            } else {
+                split_dictionary::Scope::Absolute(encoding.origin())
+            };
+            SplitDictionaryEncoding::fit(
+                &mut candidate,
+                &original,
+                &cost,
+                scope,
+                if encoding.is_relative() { 1 } else { encoding.stride_float().to_u64() },
+            );
+            if !candidate.encoded.is_empty() {
+                rewrite(frame, column, |_, row, _| candidate.encoded[row]);
+                footer = candidate.record;
+            }
+        } else {
+            assert!(
+                relative_origin.is_none(),
+                "relative origin requires tagged schema"
+            );
+            prediction::fit_unsigned(frame, column)
+                .write_footer(usize::from(column.width), &mut footer);
+        }
+        fixed.push(footer);
+    }
+    let mut pending: usize = fixed
+        .iter()
+        .map(|record| record_storage_bytes(record.len()))
+        .sum();
+    let fixed_count = fixed.len();
+    let mut fixed_index = 0;
     let mut end = 0;
     for &column in layout {
+        // Directory order follows the dyntuple's stored fields for every codec,
+        // including immutable origins; fitting order is independent of storage.
         assert!(
             column.range().start >= end && column.range().end <= frame.unit,
             "invalid column layout"
         );
         end = column.range().end;
+        if column.is_unsigned() {
+            let footer = &fixed[fixed_index];
+            fixed_index += 1;
+            let padded = record_storage_bytes(footer.len());
+            sizes.push((padded >> 1) as u8);
+            records.extend_from_slice(footer);
+            records.resize(records.len() + padded - footer.len(), 0);
+            pending -= padded;
+            continue;
+        }
         // Constant columns already occupy no packed row bits and need no fitting scratch.
         if read_word(&frame.mask()[column.range()]) == 0 {
             sizes.push(0);
@@ -1198,7 +400,9 @@ pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
             &values,
             column,
             frame,
-            trailer.len() + records.len() + layout.len(),
+            // Mandatory unsigned fields are fitted separately. Their directory
+            // slots must not change legacy alignment tie breaks for selectable codecs.
+            trailer.len() + records.len() + pending + layout.len() - fixed_count,
         );
         let bits = frame_bits(frame)
             - varying_bits(
@@ -1210,6 +414,7 @@ pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
             + trailer.len()
             + records.len()
             + record_storage_bytes(selected.record.len())
+            + pending
             + layout.len()
             <= u16::MAX as usize;
         if !selected.record.is_empty() && fits {
@@ -1223,7 +428,14 @@ pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
             sizes.push(0);
         }
     }
-    trailer.extend_from_slice(&records);
+    // Serialize records backward in schema order: entry zero starts at the
+    // directory boundary, so its address depends only on its own size byte.
+    let mut end = records.len();
+    for &size in sizes.iter().rev() {
+        let start = end - usize::from(size) * 2;
+        trailer.extend_from_slice(&records[start..end]);
+        end = start;
+    }
     trailer.extend_from_slice(&sizes);
 }
 
@@ -1231,5 +443,95 @@ pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
 mod tests;
 
 // Inspection is compiled out by default and never instruments the recording path.
-#[cfg(feature = "column-metrics")]
-pub mod metrics;
+
+/// Common transient inputs. Encodings own their footer bytes; the column supplies
+/// row geometry and the immutable physical first word only when needed.
+#[derive(Clone, Copy)]
+pub struct Context<'a> {
+    pub frame: &'a ArchivedFrame,
+    pub layout: Layout,
+}
+impl Context<'_> {
+    #[inline]
+    pub fn width(self) -> usize {
+        usize::from(self.layout.width)
+    }
+    #[inline]
+    pub fn rows(self) -> usize {
+        self.frame.len()
+    }
+    #[inline]
+    pub fn first(self) -> u128 {
+        read_word(&self.frame.first()[self.layout.range()])
+    }
+}
+/// A column's storage access is independent of its statically dispatched codec.
+pub struct Column<'a, E: Encoding<'a> = AnyEncoding<'a>> {
+    frame: &'a ArchivedFrame,
+    layout: Layout,
+    encoding: E,
+}
+impl<'a, E: Encoding<'a>> Column<'a, E> {
+    pub fn with_encoding(frame: &'a ArchivedFrame, layout: Layout, encoding: E) -> Self {
+        if let Some(width) = E::WIDTH {
+            assert_eq!(usize::from(layout.width), width);
+        }
+        assert!(
+            layout.range().end <= frame.unit(),
+            "column exceeds frame row"
+        );
+        Self {
+            frame,
+            layout,
+            encoding,
+        }
+    }
+    pub fn parse(frame: &'a ArchivedFrame, layout: Layout, record: &'a [u8]) -> Self {
+        Self::with_encoding(frame, layout, E::parse(record, layout, frame.len()))
+    }
+    #[inline]
+    fn context(&self) -> Context<'_> {
+        Context {
+            frame: self.frame,
+            layout: self.layout,
+        }
+    }
+    #[inline]
+    pub fn decode(&self, encoded: u128, row: usize) -> u128 {
+        self.encoding.decode(encoded, row, self.context())
+    }
+    #[inline]
+    pub fn encode(&self, value: u128, row: usize) -> Option<u128> {
+        self.encoding.encode(value, row, self.context())
+    }
+    #[inline]
+    pub(crate) fn decode_row(&self, row: &mut [u8], index: usize) {
+        let start = usize::from(self.layout.offset);
+        let width = E::WIDTH.unwrap_or(usize::from(self.layout.width));
+        let range = start..start + width;
+        let value = self.decode(read_word(&row[range.clone()]), index);
+        write_word(&mut row[range], value);
+    }
+    pub fn encoding(&self) -> &E {
+        &self.encoding
+    }
+    pub fn read(&self, index: usize) -> u128 {
+        let mut bytes = [0; 16];
+        let width = E::WIDTH.unwrap_or(usize::from(self.layout.width));
+        self.frame
+            .read_column(index, usize::from(self.layout.offset), &mut bytes[..width]);
+        self.decode(read_word(&bytes[..width]), index)
+    }
+}
+
+impl<'a> Column<'a> {
+    pub fn new(frame: &'a ArchivedFrame, layout: Layout, record: &'a [u8]) -> Self {
+        Self::parse(frame, layout, record)
+    }
+    pub fn is_dictionary(&self) -> bool {
+        matches!(
+            self.encoding,
+            AnyEncoding::Dictionary(_) | AnyEncoding::SplitDictionary(_)
+        )
+    }
+}

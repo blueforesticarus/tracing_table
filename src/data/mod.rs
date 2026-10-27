@@ -1,6 +1,8 @@
 // Storage and packing data structures used by the recording subscriber.
 pub mod blockbuffer;
 pub mod column;
+// Codec families live beside column storage, with independent shared helpers.
+pub mod encoding;
 pub mod dataframe;
 pub mod dyntuple;
 

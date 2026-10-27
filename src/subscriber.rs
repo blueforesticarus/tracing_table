@@ -27,11 +27,16 @@ use tracing_subscriber::{Layer, registry::LookupSpan};
 
 use crate::data::{
     CompressionStats,
-    blockbuffer::{BlockCache, CallsiteArchetype},
     column::Layout as ColumnLayout,
     dyntuple::{BytePacker, ValueData, ValueKind},
     stringbuffer::{Buffer, BufferCollection},
 };
+
+pub mod storage;
+// Offline tracing reports add no counters to generic storage.
+#[cfg(feature = "column-metrics")]
+pub mod metrics;
+use storage::{BlockCache, CallsiteArchetype};
 
 // Portable capture/loading is opt-in; live recording does not depend on its state.
 pub mod dump;
@@ -59,7 +64,7 @@ pub static STRING_BUFFER_TARGET_SIZE: LazyLock<AtomicUsize> = LazyLock::new(|| {
 // Preserve the existing subscriber-facing import while buffer policy lives with storage.
 pub use crate::data::stringbuffer::StringStorage;
 // Keep the public subscriber import while the block owns reference storage.
-pub use crate::data::blockbuffer::SpanFieldsRef;
+pub use crate::subscriber::storage::SpanFieldsRef;
 
 // Existing data is exposed for example-owned inspection; recording stays unchanged.
 pub struct PerCallsiteData {
@@ -600,12 +605,14 @@ impl RecordingLayer {
                         continue;
                     };
                     let candidate = (site_index, arch_index, chunk.descriptor.index);
+                    let fallback = arch.archetype.column_layout();
+                    let timestamp = arch.data.eviction_timestamps(&fallback).unwrap();
                     // The per-callsite cap chooses the oldest chunk across its archetypes.
                     if site.id == callsite
                         && size > self.callsite_memory_cap
-                        && (local.is_none() || chunk.descriptor.timestamp.start < oldest)
+                        && (local.is_none() || timestamp.start < oldest)
                     {
-                        oldest = chunk.descriptor.timestamp.start;
+                        oldest = timestamp.start;
                         local = Some(candidate);
                     }
                     // Global candidates are each archetype's oldest chunk. Buffer IDs
@@ -625,12 +632,7 @@ impl RecordingLayer {
                                 .compression_ratio(),
                         )
                     };
-                    let duration = chunk
-                        .descriptor
-                        .timestamp
-                        .end
-                        .saturating_sub(chunk.descriptor.timestamp.start)
-                        .max(1);
+                    let duration = timestamp.end.saturating_sub(timestamp.start).max(1);
                     // Prefer more stored bytes per timestamp tick, charging only this
                     // chunk's share of its buffer. Zero-duration chunks use one tick.
                     let score = (chunk.data.allocation_size() as f64
@@ -759,13 +761,14 @@ impl Archetype {
             });
             offset += kind.unit();
         }
-        PhysicalLayout::new(
-            header,
-            self.unit(),
-            !self.is_span_end && !self.is_event,
-            fields,
-            policy,
-        )
+        let mut header_columns = SmallVec::<[ColumnLayout; 2]>::new();
+        if !self.is_span_end {
+            header_columns.push(ColumnLayout::tagged_origin(0));
+        }
+        if !self.is_span_end && !self.is_event {
+            header_columns.push(ColumnLayout::new(8, 8, false));
+        }
+        PhysicalLayout::new(header, self.unit(), &header_columns, fields, policy)
     }
     /// Caller-owned layout is rebuilt at block boundaries/traversal, never stored per block.
     pub fn column_layout(&self) -> SmallVec<[ColumnLayout; 8]> {
@@ -773,6 +776,11 @@ impl Archetype {
         let fields: usize = self.field_types.iter().flatten().map(ValueKind::unit).sum();
         let mut offset = self.unit() - fields - args * self.string_storage.unit();
         let mut columns = SmallVec::new();
+        // Directory sizes count backward from its start. Keep timestamps first
+        // and span durations second so both header fields are reached directly.
+        if !self.is_span_end {
+            columns.push(ColumnLayout::tagged_origin(0));
+        }
         // Biased durations (including zero for open spans) are logical u64 fields.
         // Reuse exact origins/residuals and the normal archived-edit rebuild path.
         if !self.is_span_end && !self.is_event {
@@ -808,13 +816,13 @@ impl Archetype {
                 bytes += std::mem::size_of::<PackedTimestamp>(); //end timestamp
             }
         } else {
-            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
+            bytes += crate::subscriber::storage::ParentOffsets::ROW_BYTES;
         }
         if self.parent {
-            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
+            bytes += crate::subscriber::storage::ParentOffsets::ROW_BYTES;
         }
         if self.follows_from {
-            bytes += crate::data::blockbuffer::ParentOffsets::ROW_BYTES;
+            bytes += crate::subscriber::storage::ParentOffsets::ROW_BYTES;
         }
         for field in self.field_types.iter() {
             if let Some(k) = field {
@@ -1106,7 +1114,6 @@ impl RecordingLayer {
             archetype: arch.id,
         };
         arch.data.update_mask_after_append();
-        arch.data.update_ts_range(time.value as usize, None);
         drop(guard);
         if allocated {
             self.drop_old_chunks(callsite);
@@ -1176,7 +1183,7 @@ impl RecordingLayer {
                 arch.data.encode_parent(
                     id.index,
                     CallsiteArchetype::new(id.callsite, id.archetype),
-                    crate::data::blockbuffer::ParentOffsets::ROW_BYTES,
+                    crate::subscriber::storage::ParentOffsets::ROW_BYTES,
                 )
             });
             let mut logical = SmallVec::<[u8; 256]>::from_elem(0, arch.archetype.unit());
@@ -1201,7 +1208,6 @@ impl RecordingLayer {
             };
             arch.data.allocate(time.value).0.copy_from_slice(&physical);
             arch.data.update_mask_after_append();
-            arch.data.update_ts_range(time.value as usize, None);
             // allocate() can roll over the active block, so capture its ordinal afterward.
             Some(SpanFieldsRef {
                 archetype: arch.id,
@@ -1216,13 +1222,13 @@ impl RecordingLayer {
             let columns = arch.archetype.column_layout();
             let data = &mut arch.data;
             // A long-lived span may close after its start chunk has been evicted.
-            let retained = if let Some((descriptor, mut row)) =
+            let retained = if let Some((_descriptor, mut row)) =
                 data.get_mut_physical(id.index as usize, &columns)
             {
                 let start = if self.parent_timestamp_offsets {
                     resolved_start
                 } else {
-                    Some(row.decode_timestamp(descriptor))
+                    Some(row.decode_timestamp())
                 };
                 let Some(start) = start else {
                     return;
@@ -1239,7 +1245,6 @@ impl RecordingLayer {
                 if let Some(reference) = extra_fields {
                     data.add_span_fields_ref(id.index as usize, reference);
                 }
-                data.update_ts_range(time.value as usize, Some(id.index as usize));
             }
         }
         drop(callsite_guard);
@@ -1621,10 +1626,10 @@ mod test {
             });
             assert_eq!(count, 40);
             assert!(site.cache.iter().any(|a| {
-                a.data
-                    .ring
-                    .iter()
-                    .any(|b| b.data.metadata.timestamp_parent_relative)
+                a.data.ring.iter().any(|b| {
+                    b.data
+                        .timestamp_parent_relative(&a.archetype.column_layout())
+                })
             }));
         }
         // Losing ancestors is explicitly allowed; report missing time instead
@@ -1971,7 +1976,7 @@ mod test {
 
     #[test]
     fn block_timestamp_offsets_preserve_event_and_span_starts_forever() {
-        use crate::data::blockbuffer::BlockCache;
+        use crate::subscriber::storage::BlockCache;
         for metadata in timestamp_metadata() {
             let mut recorder = RecordingLayer::new();
             recorder.global_memory_cap = usize::MAX;
@@ -2007,6 +2012,7 @@ mod test {
                 }
             });
             assert_eq!(decoded, times);
+            let columns = site.cache[0].archetype.column_layout();
             let data = &mut site.cache[0].data;
             let mut raw = data.iter(&[]);
             let mut offsets = Vec::new();
@@ -2014,10 +2020,13 @@ mod test {
                 offsets.push(u64::from_ne_bytes(row[..8].try_into().unwrap()));
             }
             drop(raw);
-            assert_eq!(offsets, [0, 0, 0, 0, 0]); // Archived starts lie on their strides.
-            assert_eq!(data.ring[0].descriptor.timestamp.start, 1_000);
-            assert_eq!(data.ring[1].descriptor.timestamp.start, 1_005);
-            assert_eq!(data.active_descriptor.timestamp.start, 4_990);
+            assert_eq!(offsets, [0, 0, 0, 0, 4_990]); // Physical archives keep residuals; the active tail is absolute.
+            assert_eq!(data.ring[0].data.timestamp_start(&columns), 1_000);
+            assert_eq!(data.ring[1].data.timestamp_start(&columns), 1_005);
+            assert_eq!(
+                u64::from_ne_bytes(data.active.iter().next().unwrap()[..8].try_into().unwrap()),
+                4_990
+            );
             data.drop_chunk(1).unwrap();
             assert!(data.descriptor(1).is_none());
             drop(site);
@@ -2200,7 +2209,16 @@ mod test {
 
     #[test]
     fn chunk_eviction_respects_caps_and_buffer_ownership() {
-        use crate::data::blockbuffer::{BlockCache, DropChunkError};
+        use crate::subscriber::storage::{BlockCache, DropChunkError};
+
+        // Build real timestamp headers so eviction exercises the same footer
+        // origins as production, rather than treating zero-filled payload as time.
+        fn append(cache: &mut BlockCache, ts: usize, fill: u8) {
+            let (row, _, _) = cache.allocate_timestamp(ts as u64);
+            row.fill(fill);
+            row[..8].copy_from_slice(&(ts as u64).to_ne_bytes());
+            cache.update_mask_after_append();
+        }
 
         // Exercise rejection paths alongside the eviction coverage below.
         let mut cache = BlockCache::new(8, 2, 2);
@@ -2238,15 +2256,16 @@ mod test {
                     // The older archetype shares one buffer across two longer chunks.
                     for chunk in 0..if i == 0 { 2 } else { 1 } {
                         let start = 1 + i * 2000 + chunk * 100;
-                        arch.data.push(&vec![0; unit], start);
+                        append(&mut arch.data, start, 0);
+                        append(&mut arch.data, start + if i == 0 { 100 } else { 1 }, 255);
                         arch.data
-                            .push(&vec![255; unit], start + if i == 0 { 100 } else { 1 });
-                        arch.data.cycle_if_needed();
+                            .cycle_if_needed_with_columns(&arch.archetype.column_layout());
                     }
                     arch.strings.rotate(false);
                     arch.data.active_metadata.string_buffer = arch.strings.active_index();
                     arch.strings.active.add_string("protected");
-                    arch.data.push(&vec![0; unit], 4000);
+                    // Keep the newest interval short for the second archetype.
+                    append(&mut arch.data, if i == 0 { 4000 } else { 2002 }, 0);
                 }
             }
             let total: usize = shared

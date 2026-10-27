@@ -28,7 +28,6 @@ pub mod collect {
     use tracing_table::{
         data::{
             CompressionStats,
-            blockbuffer::{BlockCache, Data},
             dyntuple::ValueKind,
             stringbuffer::{Buffer, BufferCollection, CompressedBuffer},
         },
@@ -36,6 +35,7 @@ pub mod collect {
             Archetype, MESSAGE_BLOCK_MIN_ROWS, MESSAGE_BLOCK_TARGET_SIZE, PackedTimestamp,
             PerArchData, RecordingLayer, STRING_BUFFER_TARGET_SIZE, SpanFieldsRef, SpanId,
             dump::{Fixture, ReplayOptions},
+            storage::{BlockCache, Data},
         },
     };
 
@@ -245,8 +245,8 @@ pub mod collect {
             .iter()
             .map(|block| block.data.allocation_size() - block.data.frame.buffer().len())
             .sum();
-        // The payload's address measures the value header; prefix alignment gaps
-        // are charged to frame_padding alongside final allocation padding.
+        // Count fixed metadata at either end of the frame, including tracing
+        // retention starts. Only actual alignment gaps belong to frame_padding.
         let frame_headers: usize = arch
             .data
             .ring
@@ -254,6 +254,9 @@ pub mod collect {
             .map(|block| {
                 size_of::<u16>() + block.data.frame.buffer().as_ptr() as usize
                     - block.data.as_ref() as *const _ as *const u8 as usize
+                    + block
+                        .data
+                        .retention_footer_bytes(&arch.archetype.column_layout())
             })
             .sum();
         let parent_tables: usize = arch
@@ -269,7 +272,7 @@ pub mod collect {
                         &arch.archetype.column_layout(),
                     ))
                     .len()
-                    * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
+                    * tracing_table::subscriber::storage::ParentOffsets::ENTRY_BYTES
             })
             .sum();
         // Preserve the historical CSV key; its payload now includes all field codecs.
@@ -762,7 +765,10 @@ pub mod collect {
                     let mut active_indices = BTreeSet::new();
                     let mut arch_block_bytes = 0;
                     for (ordinal, block) in arch.data.ring.iter().enumerate() {
-                        if block.data.metadata.timestamp_parent_relative {
+                        if block
+                            .data
+                            .timestamp_parent_relative(&arch.archetype.column_layout())
+                        {
                             relative_blocks += 1;
                             relative_rows += block.data.frame.len();
                         }
@@ -824,12 +830,18 @@ pub mod collect {
                         }
                         // Charge directory and codec bytes to the owning physical field;
                         // shared parent tables are divided among reference fields.
-                        let footers: Vec<_> = block.data.column_metadata(columns).entries()
-                            .map(|(layout, record)| (layout.range(), 1 + record.len())).collect();
+                        let footers: Vec<_> = block
+                            .data
+                            .column_metadata(columns)
+                            .entries()
+                            .map(|(layout, record)| (layout.range(), 1 + record.len()))
+                            .collect();
                         let parent_bytes = block.data.parent_offsets(columns).len()
-                            * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES;
-                        let references = physical_parts.iter()
-                            .filter(|part| part.name.ends_with(".table_index")).count();
+                            * tracing_table::subscriber::storage::ParentOffsets::ENTRY_BYTES;
+                        let references = physical_parts
+                            .iter()
+                            .filter(|part| part.name.ends_with(".table_index"))
+                            .count();
                         let mut attributed_footer = 0.0;
                         let mut attributed_bits = 0;
                         for part in &physical_parts {
@@ -845,9 +857,11 @@ pub mod collect {
                             } else {
                                 padding as f64 / 8.0 * part_bits as f64 / bits as f64
                             };
-                            let mut footer = footers.iter()
+                            let mut footer = footers
+                                .iter()
                                 .filter(|(range, _)| part.range.contains(&range.start))
-                                .map(|(_, bytes)| *bytes as f64).sum::<f64>();
+                                .map(|(_, bytes)| *bytes as f64)
+                                .sum::<f64>();
                             if part.name.ends_with(".table_index") {
                                 footer += parent_bytes as f64 / references as f64;
                             }
@@ -868,8 +882,12 @@ pub mod collect {
                             )?;
                         }
                         assert_eq!(attributed_bits, bits);
-                        assert!((attributed_footer - (parent_bytes
-                            + block.data.column_footer_bytes(columns)) as f64).abs() < 1e-6);
+                        assert!(
+                            (attributed_footer
+                                - (parent_bytes + block.data.column_footer_bytes(columns)) as f64)
+                                .abs()
+                                < 1e-6
+                        );
                         if !ranges.is_empty() {
                             buffers.insert(block.data.metadata.string_buffer);
                             if block.data.metadata.string_buffer == arch.strings.active_index() {

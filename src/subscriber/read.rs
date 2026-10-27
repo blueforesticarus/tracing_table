@@ -3,8 +3,11 @@
 use super::{
     InputValue, PerCallsiteData, RecordingLayer, SpanFieldsRef, SpanId, SpanRegistry, StringStorage,
 };
+use crate::data::column::{AnyEncoding, Context, Encoding, Layout as ColumnLayout, OriginEncoding};
 use crate::data::{CompressionStats, blockbuffer::ArchivedFrameIter, dyntuple::ValueKind};
 use smallvec::SmallVec;
+// One transient decoder model, not expanded row timestamps or retained parent data.
+type OriginCache = Option<(u128, OriginEncoding)>;
 use streaming_iterator::StreamingIterator;
 
 /// Storage categories retain active tails instead of silently dropping partial blocks.
@@ -59,30 +62,34 @@ enum StartTime {
 
 // Copy one node under a short read guard, then release it before following
 // another parent. A caller already borrowing its own site must not relock it.
-fn resolve_start(
+fn resolve_start<const CACHE: bool>(
     registry: &SpanRegistry,
     local: Option<&PerCallsiteData>,
     mut span: SpanId,
+    origin_cache: &mut OriginCache,
 ) -> Option<u64> {
     let mut elapsed = 0u64;
-    let mut visited = SmallVec::<[SpanId; 8]>::new();
+    let mut visited = SmallVec::<[u128; 8]>::new();
     loop {
-        if visited.iter().any(|v| {
-            (v.callsite, v.archetype, v.index) == (span.callsite, span.archetype, span.index)
-        }) {
+        // SpanId is a checked, padding-free 16-byte value. Scalar markers make
+        // cycle checks cheap without hashing, allocating or retaining timestamps.
+        let identity = bytemuck::cast::<SpanId, u128>(span);
+        if visited.contains(&identity) {
             return None;
         }
-        visited.push(span);
         let node = if let Some(site) = local.filter(|site| site.id == u64::from(span.callsite)) {
-            site.start_time(span)?
+            site.start_time::<CACHE>(span, origin_cache)?
         } else {
             let shared = registry.read().get(span.callsite as usize)?.upgrade()?;
-            let node = shared.read().start_time(span)?;
+            let node = shared.read().start_time::<CACHE>(span, origin_cache)?;
             node
         };
         match node {
             StartTime::Absolute(start) => return start.checked_add(elapsed),
             StartTime::Parent(offset, parent) => {
+                // Only followed edges need a cycle marker. Absolute roots end
+                // the walk immediately and must not grow its transient scratch.
+                visited.push(identity);
                 elapsed = elapsed.checked_add(offset)?;
                 span = parent;
             }
@@ -96,7 +103,7 @@ impl RecordingLayer {
     /// The lookup index is populated only when parent_timestamp_offsets was
     /// enabled before registration; normal visit_rows works in both modes.
     pub fn span_timestamp(&self, span: SpanId) -> Option<u64> {
-        resolve_start(&self.span_registry, None, span)
+        resolve_start::<false>(&self.span_registry, None, span, &mut None)
     }
 
     /// Dense weak index only, not a cache of expanded timestamps. The storage
@@ -127,21 +134,27 @@ impl Reader<'_> {
     // active rows whose predictor has zero stride until rollover.
     fn span(
         &mut self,
-        dictionary: crate::data::blockbuffer::ParentOffsets<'_>,
+        dictionary: crate::subscriber::storage::ParentOffsets<'_>,
         row: usize,
         length: usize,
     ) -> SpanId {
         let residual = self.u64();
         let entry = dictionary.entry(self.u16());
         SpanId {
-            index: entry.decode(residual, row, length),
-            callsite: entry.identity.callsite(),
-            archetype: entry.identity.archetype(),
+            index: entry.decode_index(residual, row, length),
+            callsite: crate::subscriber::storage::CallsiteArchetype::from_bits(entry.identity)
+                .callsite(),
+            archetype: crate::subscriber::storage::CallsiteArchetype::from_bits(entry.identity)
+                .archetype(),
         }
     }
 }
 impl PerCallsiteData {
-    fn start_time(&self, span: SpanId) -> Option<StartTime> {
+    fn start_time<const CACHE: bool>(
+        &self,
+        span: SpanId,
+        origin_cache: &mut OriginCache,
+    ) -> Option<StartTime> {
         let arch = self.cache.get(span.archetype as usize)?;
         if arch.archetype.is_span_end || arch.archetype.is_event {
             return None;
@@ -154,36 +167,64 @@ impl PerCallsiteData {
                 return None;
             }
             let at = (row + 1) * data.active.unit;
-            return Some(StartTime::Absolute(
-                data.active_descriptor.decode_timestamp(u64::from_ne_bytes(
-                    data.active.buffer[at..at + 8].try_into().unwrap(),
-                )),
-            ));
+            return Some(StartTime::Absolute(u64::from_ne_bytes(
+                data.active.buffer[at..at + 8].try_into().unwrap(),
+            )));
         }
-        let block = data.ring.iter().rev().find(|b| {
-            index >= b.descriptor.index && index - b.descriptor.index < b.data.frame.len()
-        })?;
+        let (ordinal, block) = data.archived_at(index)?;
         let row = index - block.descriptor.index;
         let mut encoded = [0; 8];
         block.data.frame.read_column(row, 0, &mut encoded);
         let value = u64::from_ne_bytes(encoded);
-        if !block.data.metadata.timestamp_parent_relative {
-            return Some(StartTime::Absolute(block.data.metadata.decode_timestamp(
-                &block.descriptor,
-                value,
-                row,
-                block.data.frame.len(),
-            )));
+        // Recover the block and schema in the same reverse lookup. Absolute
+        // ancestor reads must not rescan the ring from its oldest block.
+        let fallback;
+        let columns = if let Some(projection) = data.layout_for_block(ordinal) {
+            projection.columns.as_slice()
+        } else {
+            fallback = arch.archetype.column_layout();
+            &fallback
+        };
+        if !block.data.timestamp_parent_relative(columns) {
+            // Revalidate retention under this read guard before reusing a model.
+            // Immutable footer coefficients survive payload edits and never pin a block.
+            let key = bytemuck::cast::<SpanId, u128>(SpanId {
+                index: block.descriptor.index as u64,
+                ..span
+            });
+            let encoding = if CACHE
+                && origin_cache
+                    .as_ref()
+                    .is_some_and(|(cached, _)| *cached == key)
+            {
+                origin_cache.as_ref().unwrap().1
+            } else {
+                let column = block.data.timestamp_column(columns);
+                let AnyEncoding::Origin(model) = column.encoding() else {
+                    // Split dictionaries borrow immutable footer tables. Decode
+                    // through the current guarded block instead of retaining a
+                    // pointer across archive rebuilds or eviction.
+                    return Some(StartTime::Absolute(
+                        column.decode(u128::from(value), row) as u64,
+                    ));
+                };
+                let model = *model;
+                if CACHE {
+                    *origin_cache = Some((key, model));
+                }
+                model
+            };
+            let context = Context {
+                frame: &block.data.frame,
+                layout: ColumnLayout::tagged_origin(0),
+            };
+            return Some(StartTime::Absolute(
+                encoding.decode(u128::from(value), row, context) as u64,
+            ));
         }
         if !arch.archetype.parent {
             return None;
         }
-        let fallback = arch.archetype.column_layout();
-        let ordinal = data
-            .ring
-            .iter()
-            .position(|b| b.descriptor.index == block.descriptor.index)?;
-        let columns = data.columns_for_block(data.offset + ordinal, &fallback);
         let mut bytes = [0; 10];
         block.data.frame.read_column(row, 16, &mut bytes);
         let parent = Reader(&bytes).span(
@@ -191,7 +232,8 @@ impl PerCallsiteData {
             row,
             block.data.frame.len(),
         );
-        Some(StartTime::Parent(value, parent))
+        let elapsed = block.data.timestamp_column(columns).decode(u128::from(value), row) as u64;
+        Some(StartTime::Parent(elapsed, parent))
     }
 
     /// Site-level visitors can resolve same-site parents without recursively
@@ -199,7 +241,7 @@ impl PerCallsiteData {
     /// Cross-callsite lookup uses the optional parent-offset registry.
     pub fn span_timestamp(&self, span: SpanId) -> Option<u64> {
         let registry = self.span_registry.upgrade()?;
-        resolve_start(&registry, Some(self), span)
+        resolve_start::<false>(&registry, Some(self), span, &mut None)
     }
     /// Locate deferred data using only this start block's deduplicated candidates.
     /// Missing/evicted candidates are harmless; other rows in a candidate block
@@ -280,6 +322,10 @@ impl PerCallsiteData {
     /// Visit every stored row, including active rows. Strings expand once per
     /// consecutive buffer within an archetype; no expansion survives this call.
     pub fn visit_rows(&self, mut consume: impl FnMut(DecodedRow)) {
+        // Keep only the weak lookup index alive for this traversal. Parents are
+        // still upgraded and retention-checked under fresh short read guards.
+        let registry = self.span_registry.upgrade();
+        let mut origin_cache = None;
         for arch in &self.cache {
             let a = &arch.archetype;
             let mut index = arch
@@ -295,14 +341,20 @@ impl PerCallsiteData {
                 .iter()
                 .enumerate()
                 .map(|(ordinal, b)| {
+                    let layout = arch
+                        .data
+                        .columns_for_block(arch.data.offset + ordinal, &columns);
+                    let origin = if !a.is_span_end {
+                        Some(b.data.timestamp_column(layout))
+                    } else {
+                        None
+                    };
                     (
                         b.data.frame.len(),
                         &b.descriptor,
                         &b.data.metadata,
-                        b.data.parent_offsets(
-                            arch.data
-                                .columns_for_block(arch.data.offset + ordinal, &columns),
-                        ),
+                        b.data.parent_offsets(layout),
+                        origin,
                     )
                 })
                 .chain(std::iter::once((
@@ -310,14 +362,16 @@ impl PerCallsiteData {
                     &arch.data.active_descriptor,
                     &arch.data.active_metadata,
                     arch.data.active_parent_offsets(),
+                    None,
                 )));
-            let mut rows = arch.data.iter(&columns);
+            let mut rows = arch.data.iter_encoded_origins(&columns);
             let mut strings = None;
             let mut string_id = None;
-            for (count, descriptor, metadata, parent_offsets) in frames {
+            for (count, _descriptor, metadata, parent_offsets, origin) in frames {
                 if count == 0 {
                     continue;
                 }
+                let relative = origin.as_ref().is_some_and(|c| c.encoding().is_relative());
                 let buffer_id = metadata.string_buffer;
                 if string_id != Some(buffer_id) {
                     strings = arch.strings.get(buffer_id);
@@ -344,15 +398,15 @@ impl PerCallsiteData {
                     } else {
                         // Span end edits never move the block's decoding origin.
                         let encoded_start = reader.u64();
-                        row.timestamp = if metadata.timestamp_parent_relative {
+                        // Both bases may now have a split dictionary. Resolve
+                        // the stored scalar before adding any parent start.
+                        let decoded_start = origin.as_ref().map_or(encoded_start, |column| {
+                            column.decode(encoded_start as u128, local_row) as u64
+                        });
+                        row.timestamp = if relative {
                             None
                         } else {
-                            Some(metadata.decode_timestamp(
-                                descriptor,
-                                encoded_start,
-                                local_row,
-                                count,
-                            ))
+                            Some(decoded_start)
                         };
                         let mut duration = None;
                         if a.is_event {
@@ -378,16 +432,32 @@ impl PerCallsiteData {
                             row.parent = Some(SpanId {
                                 // Prediction uses this block's zero-based row,
                                 // independent of absolute indices and eviction.
-                                index: entry.decode(residual, local_row, count),
-                                callsite: entry.identity.callsite(),
-                                archetype: entry.identity.archetype(),
+                                index: entry.decode_index(residual, local_row, count),
+                                callsite: crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                    entry.identity,
+                                )
+                                .callsite(),
+                                archetype:
+                                    crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                        entry.identity,
+                                    )
+                                    .archetype(),
                             });
                         }
-                        if metadata.timestamp_parent_relative {
+                        if relative {
                             row.timestamp = row
                                 .parent
-                                .and_then(|parent| self.span_timestamp(parent))
-                                .and_then(|start| start.checked_add(encoded_start));
+                                .and_then(|parent| {
+                                    registry.as_deref().and_then(|registry| {
+                                        resolve_start::<true>(
+                                            registry,
+                                            Some(self),
+                                            parent,
+                                            &mut origin_cache,
+                                        )
+                                    })
+                                })
+                                .and_then(|start| start.checked_add(decoded_start));
                         }
                         if let Some(duration) = duration {
                             row.end_timestamp = if duration == 0 {
@@ -497,5 +567,66 @@ impl PerCallsiteData {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod model_cache_tests {
+    use super::*;
+    use crate::subscriber::{RecordingLayer, Time};
+    use tracing_core::Callsite;
+
+    #[test]
+    fn transient_models_do_not_revive_parents_evicted_during_a_visit() {
+        let parent_meta = tracing::callsite!(name: "decoder model parent", kind: tracing_core::Kind::SPAN, fields:).metadata();
+        let child_meta = tracing::callsite!(name: "decoder model child", kind: tracing_core::Kind::EVENT, fields:).metadata();
+        let mut recorder = RecordingLayer::new();
+        recorder.parent_timestamp_offsets = true;
+        recorder.callsite_memory_cap = usize::MAX;
+        recorder.global_memory_cap = usize::MAX;
+        let time = |value| Time { value, shift: 0 };
+        let mut parents = Vec::new();
+        for row in 0..32u64 {
+            let start = 1_000_000 + row * row * 100_000;
+            let parent = recorder.record_start(parent_meta, time(start), None, false, |_| {});
+            parents.push(parent);
+            recorder.record_start(child_meta, time(start + 7), Some(parent), false, |_| {});
+        }
+        let sites = recorder.callsites.read();
+        let parent_site = sites
+            .get(&(parent_meta as *const _ as usize))
+            .unwrap()
+            .clone();
+        let child_site = sites
+            .get(&(child_meta as *const _ as usize))
+            .unwrap()
+            .clone();
+        drop(sites);
+        // Force both source blocks into archives. One parent model serves the
+        // first child, then that source allocation disappears before the next row.
+        for shared in [&parent_site, &child_site] {
+            let mut site = shared.write();
+            let arch = &mut site.cache[0];
+            let columns = arch.archetype.column_layout();
+            arch.data.cycle_with_columns(&columns);
+        }
+        {
+            let site = child_site.read();
+            assert!(
+                site.cache[0].data.ring[0]
+                    .data
+                    .timestamp_parent_relative(&site.cache[0].archetype.column_layout())
+            );
+        }
+        let mut starts = Vec::new();
+        child_site.read().visit_rows(|row| {
+            starts.push(row.timestamp);
+            if starts.len() == 1 {
+                parent_site.write().cache[0].data.drop_chunk(1).unwrap();
+            }
+        });
+        assert_eq!(starts[0], Some(1_000_007));
+        assert_eq!(starts.len(), parents.len());
+        assert!(starts[1..].iter().all(Option::is_none));
     }
 }

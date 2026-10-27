@@ -46,8 +46,7 @@ pub struct PhysicalLayout {
     header: u16,
     unit: u16,
     logical_unit: u16,
-    duration: bool,
-    sharing: bool,
+    flags: u8,
 }
 
 impl PhysicalLayout {
@@ -55,7 +54,7 @@ impl PhysicalLayout {
     pub fn new(
         header: usize,
         logical_unit: usize,
-        duration: bool,
+        header_columns: &[Layout],
         mut fields: SmallVec<[Field; 8]>,
         policy: LayoutPolicy,
     ) -> Self {
@@ -73,9 +72,25 @@ impl PhysicalLayout {
             header: header.try_into().expect("row header exceeds u16"),
             unit: header.try_into().expect("row header exceeds u16"),
             logical_unit: logical_unit.try_into().expect("logical row exceeds u16"),
-            duration,
-            sharing: policy.sharing,
+            flags: u8::from(policy.sharing) << 4,
         };
+        for column in header_columns {
+            assert!(
+                column.width == 8
+                    && column.offset % 8 == 0
+                    && column.offset < 16
+                    && !column.is_strings()
+            );
+            // The spare header code preserves tagged origins through promotion.
+            let code = if column.is_tagged_origin() {
+                2
+            } else if column.is_unsigned() {
+                3
+            } else {
+                1
+            };
+            layout.flags |= code << (column.offset / 4);
+        }
         layout.positions();
         layout
     }
@@ -95,8 +110,20 @@ impl PhysicalLayout {
     fn positions(&mut self) {
         self.unit = self.header;
         self.columns.clear();
-        if self.duration {
-            self.columns.push(Layout::new(8, 8, false));
+        // At most two native-word prefix fields fit the existing compact policy
+        // byte. Their interpretation is supplied by the caller, never tracing names.
+        // Emit them in dyntuple storage order, independent of codec policy.
+        for index in 0..2 {
+            let code = (self.flags >> (index * 2)) & 3;
+            if code != 0 {
+                let mut column = Layout::new(index * 8, 8, false);
+                column.policy = match code {
+                    2 => super::Policy::TaggedOrigin,
+                    3 => super::Policy::Unsigned,
+                    _ => super::Policy::Values,
+                };
+                self.columns.push(column);
+            }
         }
         for i in 0..self.fields.len() {
             let source = usize::from(self.fields[i].source);
@@ -150,7 +177,7 @@ impl PhysicalLayout {
     /// Equality groups only split. A new canonical column inherits the old
     /// group's prefix, including when several aliases diverge together.
     pub fn promoted(&self, row: &[u8], first: bool) -> Option<Self> {
-        let first = first && self.sharing;
+        let first = first && (self.flags & 16 != 0);
         let value = |i: usize| read_word(&row[self.fields[i].logical.range()]);
         let mut changed = false;
         for (i, f) in self.fields.iter().enumerate() {

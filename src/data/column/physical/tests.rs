@@ -1,6 +1,7 @@
 //! Promotion must preserve prefixes, archived bytes, IDs, and monotonic learning.
 use super::*;
-use crate::data::blockbuffer::BlockCache;
+use crate::data::blockbuffer::BlockStore;
+type BlockCache = BlockStore<()>;
 use crate::data::dataframe::Frame;
 use streaming_iterator::StreamingIterator;
 
@@ -19,7 +20,7 @@ fn layout(count: usize, signed: bool) -> PhysicalLayout {
             }
         })
         .collect();
-    PhysicalLayout::new(1, 1 + count * 8, false, fields, Default::default())
+    PhysicalLayout::new(1, 1 + count * 8, &[], fields, Default::default())
 }
 fn row(values: &[u64]) -> Vec<u8> {
     let mut row = vec![19];
@@ -30,11 +31,12 @@ fn row(values: &[u64]) -> Vec<u8> {
 }
 fn append(cache: &mut BlockCache, values: &[u64]) {
     let logical = row(values);
-    cache.promote(&logical, 0);
+    cache.promote(&logical, 4096, 0, 0);
     let p = cache.layouts.last().unwrap();
     let mut physical = vec![0; p.unit()];
     p.pack(&logical, &mut physical);
-    cache.push(&physical, 0);
+    cache.allocate_row().0.copy_from_slice(&physical);
+    cache.update_mask_after_append();
 }
 
 fn float_layout(count: usize, floats: bool) -> PhysicalLayout {
@@ -47,13 +49,30 @@ fn float_layout(count: usize, floats: bool) -> PhysicalLayout {
     PhysicalLayout::new(
         1,
         1 + count * 8,
-        false,
+        &[],
         fields.into_iter().collect(),
         LayoutPolicy {
             floats,
             ..Default::default()
         },
     )
+}
+
+#[test]
+fn header_directory_follows_dyntuple_order_independent_of_codec_policy() {
+    // Physical schemas must preserve stored order even when caller input is
+    // reversed or the later header field uses an immutable codec.
+    for headers in [
+        [Layout::new(8, 8, false), Layout::unsigned(0, 8)],
+        [Layout::unsigned(8, 8), Layout::new(0, 8, false)],
+        [Layout::new(8, 8, false), Layout::tagged_origin(0)],
+    ] {
+        let layout = PhysicalLayout::new(16, 16, &headers, SmallVec::new(), Default::default());
+        assert_eq!(layout.columns[0].offset, 0);
+        assert_eq!(layout.columns[1].offset, 8);
+        assert_eq!(layout.columns[0].policy, headers[1].policy);
+        assert_eq!(layout.columns[1].policy, headers[0].policy);
+    }
 }
 
 #[test]
@@ -73,7 +92,7 @@ fn float_width_promotion_preserves_aliases_prefixes_and_archived_history() {
     assert_eq!(cache.layouts[0].fields[1].source, 0);
     append(&mut cache, &expected[1]);
     assert_eq!(cache.active.unit, 9); // signed zero splits the shared column
-    cache.cycle_with_columns(&[]);
+    cache.archive_active(&[]);
     let archived = &cache.ring[0].data.frame;
     let mut before = Frame::new(archived.unit(), archived.len());
     archived.uncompact(&mut before);
@@ -91,7 +110,7 @@ fn float_width_promotion_preserves_aliases_prefixes_and_archived_history() {
     current.uncompact(&mut after);
     assert_eq!(before.buffer, after.buffer);
     assert_eq!(trailer, current.trailer());
-    cache.cycle_with_columns(&[]);
+    cache.archive_active(&[]);
     let mut rows = cache.iter(&[]);
     for values in expected {
         assert_eq!(rows.next().unwrap(), row(&values));
@@ -127,7 +146,7 @@ fn float_narrowing_is_bit_exact_for_extremes_and_can_be_disabled() {
             // Force archive codecs to see both repeated and varying float words.
             append(&mut cache, &[bits]);
             append(&mut cache, &[(-0.0f64).to_bits()]);
-            cache.cycle_with_columns(&[]);
+            cache.archive_active(&[]);
             let mut rows = cache.iter(&[]);
             assert_eq!(rows.next().unwrap(), row(&[bits]));
             assert_eq!(rows.next().unwrap(), row(&[bits]));
@@ -146,7 +165,7 @@ fn history_coalesces_first_block_and_keeps_archives_unchanged() {
     assert_eq!(cache.active.unit, 3);
     assert_eq!(cache.layouts.len(), 1);
     assert!(!cache.layouts.spilled());
-    cache.cycle_with_columns(&[]);
+    cache.archive_active(&[]);
     let snapshot = |cache: &BlockCache| {
         let archived = &cache.ring[0].data.frame;
         let mut raw = Frame::new(archived.unit(), archived.len());
@@ -163,7 +182,7 @@ fn history_coalesces_first_block_and_keeps_archives_unchanged() {
     assert_eq!(cache.layouts.len(), 2); // all changes in block 1 share one entry
     assert_eq!(cache.active.unit, 9);
     assert_eq!(snapshot(&cache), archived);
-    cache.cycle_with_columns(&[]);
+    cache.archive_active(&[]);
     append(&mut cache, &[1, 1, 1]);
     assert_eq!(cache.layouts.len(), 2); // no narrowing or re-sharing in block 2
     assert_eq!(cache.active.unit, 9);
@@ -209,7 +228,7 @@ fn signed_values_and_u64_extremes_promote_without_losing_bits() {
         }
         assert_eq!(cache.layouts.len(), 1);
         assert_eq!(cache.active.unit, 9);
-        cache.cycle_with_columns(&[]);
+        cache.archive_active(&[]);
         let mut rows = cache.iter(&[]);
         for value in values {
             assert_eq!(rows.next().unwrap(), row(&[value]));
@@ -235,7 +254,7 @@ fn signed_zigzag_covers_every_width_and_extreme_with_or_without_narrowing() {
             let mut p = PhysicalLayout::new(
                 1,
                 1 + width,
-                false,
+                &[],
                 smallvec::smallvec![Field {
                     logical,
                     stored: logical,
@@ -295,7 +314,7 @@ fn signed_zigzag_survives_sharing_active_and_archived_edits() {
         .1
         .get_mut()
         .copy_from_slice(&expected[1]);
-    cache.cycle_with_columns(&[]);
+    cache.archive_active(&[]);
     expected[0] = row(&[-2i64 as u64, -2i64 as u64]);
     cache
         .get_mut(1, &[])
@@ -328,7 +347,7 @@ fn layout_comparisons_are_bitwise_for_floats() {
     let mut logical = vec![0; next.logical_unit()];
     next.unpack(&packed, &mut logical);
     assert_eq!(logical, row(&[0, (-0.0f64).to_bits()]));
-    assert_eq!(size_of::<crate::data::blockbuffer::Data>(), 32);
+    assert_eq!(size_of::<crate::data::blockbuffer::Data>(), 16);
     // Layout overhead is shared, but must stay small for one-off callsites too.
     assert!(size_of::<PhysicalLayout>() <= 64);
     assert!(size_of::<Field>() <= 16);

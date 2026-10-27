@@ -811,72 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn full_buffers_force_chunk_rotation_and_preserve_rows() {
-        use crate::subscriber::{InputValue, LocalRecordingLayer, RecordingLayer};
-        use std::sync::Arc;
-        use tracing_subscriber::{Registry, prelude::*};
-
-        fn emit(a: &str, b: &str) {
-            tracing::info!(a, b);
-        }
-        for mode in [StringStorage::Offset, StringStorage::Index] {
-            let mut layer = RecordingLayer::new();
-            layer.string_storage = mode;
-            layer.callsite_memory_cap = usize::MAX;
-            layer.global_memory_cap = usize::MAX;
-            let recorder = Arc::new(layer);
-            let dispatch = tracing::Dispatch::new(
-                Registry::default().with(LocalRecordingLayer(recorder.clone())),
-            );
-            tracing::dispatcher::with_default(&dispatch, || emit("first a", "first b"));
-            let site = recorder.callsites.read().values().next().unwrap().clone();
-            {
-                let mut site = site.write();
-                let buffer = &mut site.cache[0].strings.active;
-                // Fill storage directly to avoid quadratic overflow dedup work in this boundary test.
-                while buffer.len() < Buffer::MAX_ENTRIES - 2 {
-                    buffer.storage.append("unused");
-                }
-            }
-            tracing::dispatcher::with_default(&dispatch, || emit("last a", "last b"));
-            assert_eq!(
-                site.read().cache[0].strings.active.len(),
-                Buffer::MAX_ENTRIES
-            );
-            tracing::dispatcher::with_default(&dispatch, || emit("rotated a", "rotated b"));
-            let site = site.read();
-            let arch = &site.cache[0];
-            assert_eq!(arch.data.ring.len(), 1);
-            assert_eq!(arch.data.ring[0].data.frame.len(), 2);
-            assert_eq!(
-                arch.data.ring[0].data.metadata.string_buffer,
-                StringBufferId::new(0)
-            );
-            assert_eq!(
-                arch.data.active_metadata.string_buffer,
-                StringBufferId::new(1)
-            );
-            assert_eq!(arch.strings.active.len(), 2);
-            let mut rows = Vec::new();
-            site.visit_rows(|row| rows.push(row.fields));
-            for (row, (a, b)) in rows.iter().zip([
-                ("first a", "first b"),
-                ("last a", "last b"),
-                ("rotated a", "rotated b"),
-            ]) {
-                assert_eq!(
-                    *row,
-                    vec![
-                        Some(InputValue::Text(a.into())),
-                        Some(InputValue::Text(b.into()))
-                    ]
-                );
-            }
-            assert_eq!(rows.len(), 3);
-        }
-    }
-
-    #[test]
     #[should_panic(expected = "string buffer is full")]
     fn string_buffers_reject_entries_beyond_u16_indexes() {
         let mut buffer = Buffer::default();
@@ -1054,5 +988,16 @@ mod tests {
             buffers.get(StringBufferId::new(3)),
             Some(Cow::Borrowed(_))
         ));
+    }
+}
+
+#[cfg(test)]
+impl Buffer {
+    /// Boundary fixtures need distinct row slots without exercising the dedup
+    /// overflow scan quadratically. This hook is absent from recording builds.
+    pub(crate) fn fill_unused_entries(&mut self, count: usize) {
+        while self.len() < count {
+            self.storage.append("unused");
+        }
     }
 }

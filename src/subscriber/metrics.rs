@@ -1,7 +1,12 @@
 //! Opt-in, post-recording storage leaves. No counters, summaries, or instrumentation
 //! are retained by columns. Consumers choose grouping and normalization themselves.
-use super::*;
+use crate::data::column::read_word;
+use crate::data::column::*;
+use crate::data::encoding::common::{
+    CYCLE, DICTIONARY, DICTIONARY_CYCLE, DICTIONARY_STRIDE, LINEAR, OFFSET, ROW, ROW_CYCLE,
+};
 use crate::subscriber::{Archetype, RecordingLayer};
+use smallvec::SmallVec;
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -60,9 +65,12 @@ fn fields(arch: &Archetype, names: &[String]) -> Vec<Field> {
     if arch.follows_from {
         structural("follows_from", 10, 16);
     }
-    // Duration is the first selectable column, ahead of ordinary payload fields.
+    if let Some(start) = fields.iter_mut().find(|f| f.name == "start_ts") {
+        start.record = Some(0);
+    }
+    // Duration follows the ordinary timestamp column, ahead of ordinary payload fields.
     if let Some(duration) = fields.iter_mut().find(|field| field.name == "end_duration") {
-        duration.record = Some(0);
+        duration.record = Some(1);
     }
     for (index, kind) in arch.field_types.iter().enumerate() {
         let Some(kind) = kind else {
@@ -148,6 +156,10 @@ pub fn write_recording(
                     .iter()
                     .cloned()
                     .map(|mut field| {
+                        field.record = field
+                            .stored
+                            .as_ref()
+                            .and_then(|range| layout.iter().position(|c| c.range() == *range));
                         if let Some(p) = projection {
                             field.stored = p.physical_range(field.range.clone());
                             field.record = field
@@ -183,15 +195,23 @@ pub fn write_recording(
                 while let Some(row) = rows.next() {
                     for (index, field) in fields.iter().enumerate() {
                         let value = match field.name.as_str() {
-                            "start_ts" if block.data.metadata.timestamp_parent_relative => {
+                            "start_ts" if block.data.timestamp_parent_relative(layout) => {
                                 let offset = if arch.archetype.is_event { 10 } else { 16 };
                                 let bytes = &row[offset..offset + 10];
                                 let entry = parents
                                     .entry(u16::from_ne_bytes(bytes[8..].try_into().unwrap()));
                                 let parent = crate::subscriber::SpanId {
-                                    callsite: entry.identity.callsite(),
-                                    archetype: entry.identity.archetype(),
-                                    index: entry.decode(
+                                    callsite:
+                                        crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                            entry.identity,
+                                        )
+                                        .callsite(),
+                                    archetype:
+                                        crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                            entry.identity,
+                                        )
+                                        .archetype(),
+                                    index: entry.decode_index(
                                         read_word(&bytes[..8]) as u64,
                                         row_index,
                                         frame.len(),
@@ -206,12 +226,7 @@ pub fn write_recording(
                                         .unwrap_or(elapsed),
                                 )
                             }
-                            "start_ts" => u128::from(block.data.metadata.decode_timestamp(
-                                &block.descriptor,
-                                read_word(&row[field.range.clone()]) as u64,
-                                row_index,
-                                frame.len(),
-                            )),
+                            "start_ts" => read_word(&row[field.range.clone()]),
                             "parent_span_id" | "update_span_id" | "follows_from" => {
                                 let bytes = &row[field.range.clone()];
                                 let entry = parents
@@ -220,17 +235,27 @@ pub fn write_recording(
                                 let mut raw = [0; 16];
                                 raw[..8].copy_from_slice(
                                     &entry
-                                        .decode(
+                                        .decode_index(
                                             read_word(&bytes[..8]) as u64,
                                             row_index,
                                             frame.len(),
                                         )
                                         .to_ne_bytes(),
                                 );
-                                raw[8..12]
-                                    .copy_from_slice(&entry.identity.callsite().to_ne_bytes());
-                                raw[12..]
-                                    .copy_from_slice(&entry.identity.archetype().to_ne_bytes());
+                                raw[8..12].copy_from_slice(
+                                    &crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                        entry.identity,
+                                    )
+                                    .callsite()
+                                    .to_ne_bytes(),
+                                );
+                                raw[12..].copy_from_slice(
+                                    &crate::subscriber::storage::CallsiteArchetype::from_bits(
+                                        entry.identity,
+                                    )
+                                    .archetype()
+                                    .to_ne_bytes(),
+                                );
                                 read_word(&raw)
                             }
                             _ => read_word(&row[field.range.clone()]),
@@ -249,9 +274,13 @@ pub fn write_recording(
                     let encoding = if field.alias.is_some() {
                         "alias"
                     } else if field.name == "start_ts" {
-                        if block.data.metadata.timestamp_parent_relative {
+                        if SplitDictionaryEncoding::is_tagged(record) {
+                            if block.data.timestamp_parent_relative(layout) { "parent_offset+split_dictionary" } else { "split_dictionary" }
+                        } else if block.data.timestamp_parent_relative(layout) {
                             "parent_offset"
-                        } else if block.data.metadata.timestamp_stride.to_u64() == 0 {
+                        } else if record.is_empty()
+                            || u16::from_le_bytes(record[8..10].try_into().unwrap()) == 0
+                        {
                             "offset"
                         } else {
                             "offset+stride"
@@ -358,8 +387,18 @@ pub fn write_recording(
                     if field.record.is_some() {
                         emit("metadata_width", None, 0, 8, 0, 0)?;
                     }
-                    if field.name == "start_ts" {
-                        emit("float_stride", None, 0, 16, 0, 0)?;
+                    if field.name == "start_ts" && !record.is_empty() {
+                        // Origin and representation share one word; relative
+                        // rows retain that word without a prediction stride.
+                        emit("exact_offset", None, 0, 60, 0, 0)?;
+                        emit("encoding_tag", None, 0, 4, 0, 0)?;
+                        if SplitDictionaryEncoding::is_tagged(record) {
+                            // All source/key/table fields and record padding
+                            // belong to the new codec, beyond the shared origin.
+                            emit("split_dictionary_metadata", None, 0, (record.len() - 8) * 8, 0, 0)?;
+                        } else if !block.data.timestamp_parent_relative(layout) {
+                            emit("float_stride", None, 0, 16, 0, 0)?;
+                        }
                     }
                     // Identity entries are shared by reference columns. Charge
                     // them once to the first reference in row order.
@@ -374,7 +413,7 @@ pub fn write_recording(
                             emit("float_stride", Some(group), 0, 16, 0, 0)?;
                         }
                     }
-                    if let Some(&tag) = record.first() {
+                    if let Some(&tag) = record.first().filter(|_| field.name != "start_ts") {
                         let payload = record_payload_bytes(record, retained_width, frame.len());
                         emit(
                             "record_padding",
@@ -400,6 +439,9 @@ pub fn write_recording(
                                     0,
                                     0,
                                 )?;
+                            }
+                            split_dictionary::TAG => {
+                                emit("split_dictionary_metadata", None, 0, (record.len() - 1) * 8, 0, 0)?;
                             }
                             DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE => {
                                 let count = usize::from(record[1]);
@@ -441,13 +483,13 @@ pub fn write_recording(
                 // Shared row-tail padding is a separate leaf, never attributed arbitrarily to fields.
                 let row_count = frame.len() - 1;
                 let retained_stride = if cfg!(feature = "bit-compression")
-                    && super::super::dataframe::CONTINUOUS_BIT_PACKING
+                    && crate::data::dataframe::CONTINUOUS_BIT_PACKING
                 {
                     retained_row_bits
                 } else {
                     retained_row_bits.div_ceil(8) * 8
                 };
-                let raw_stride = if super::super::dataframe::CONTINUOUS_BIT_PACKING {
+                let raw_stride = if crate::data::dataframe::CONTINUOUS_BIT_PACKING {
                     raw_row_bits
                 } else {
                     raw_row_bits.div_ceil(8) * 8
@@ -495,6 +537,7 @@ fn encoding(record: &[u8]) -> &'static str {
         Some(DICTIONARY_CYCLE) => "dictionary+cycle",
         Some(DICTIONARY_STRIDE) => "dictionary+stride",
         Some(exceptions::TAG) => "offset+exceptions",
+        Some(split_dictionary::TAG) => "split_dictionary",
         _ => unreachable!("validated codec"),
     }
 }
@@ -505,6 +548,7 @@ fn encoding(record: &[u8]) -> &'static str {
 fn record_payload_bytes(record: &[u8], width: usize, rows: usize) -> usize {
     let tag = record[0] & 127;
     match tag {
+        split_dictionary::TAG => SplitDictionaryEncoding::parse(record, Layout::new(0, width, false), rows).payload_bytes(),
         DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE => {
             let header = if tag == DICTIONARY { 3 } else { 5 };
             header + (usize::from(record[1]) * usize::from(record[2])).div_ceil(8)
@@ -598,9 +642,11 @@ mod tests {
                             + frame.unit()
                             + frame.trailer().len())
                             * 8;
-                        if !arch.archetype.is_span_end {
-                            expected += 16;
-                        }
+                        // Retention age is domain metadata rather than a field codec.
+                        let retained = block
+                            .data
+                            .retention_footer_bytes(&arch.archetype.column_layout());
+                        expected -= retained * 8;
                         trailers.push(frame.trailer().to_vec());
                     }
                 }

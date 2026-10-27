@@ -163,6 +163,18 @@ impl BitCompactFrame {
             )
         }
     }
+    /// Footer edits never alter packed row bits or the DST allocation length.
+    pub fn trailer_mut(&mut self) -> &mut [u8] {
+        let start = self.row_payload_len();
+        // SAFETY: Constructors initialize the full tail; exclusive self bounds
+        // this mutable slice to the footer, disjoint from the packed payload.
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.buffer.as_mut_ptr().cast::<u8>().add(start),
+                self.buffer.len() - start,
+            )
+        }
+    }
 
     fn row_payload_len(&self) -> usize {
         self.unit() * if self.is_empty() { 1 } else { 2 }
@@ -452,7 +464,7 @@ mod tests {
                     let address = &*compact as *const BitCompactFrame;
                     let mask = compact.mask().to_vec();
                     let mut scratch = [0xCC; 2];
-                    let mut row = Row {
+                    let mut row: Row = Row {
                         init: false,
                         buffer: if buffered {
                             RowBuffer::Borrowed(&mut scratch)

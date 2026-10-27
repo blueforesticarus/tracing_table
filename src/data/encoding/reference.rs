@@ -1,82 +1,52 @@
-//! Parent identity and predictor dictionaries appended to compacted frames.
-use crate::data::column;
-use crate::data::dataframe::Frame;
-use crate::data::util::float_u16::FloatU16;
-use smallvec::SmallVec;
-
-/// Packed identity: callsite in the low 20 bits, archetype in the high 12 bits.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CallsiteArchetype(u32);
-
-impl CallsiteArchetype {
-    pub const CALLSITE_BITS: u32 = 20;
-    pub const ARCHETYPE_BITS: u32 = 12;
-    pub const MAX_CALLSITE: u32 = (1 << Self::CALLSITE_BITS) - 1;
-    pub const MAX_ARCHETYPE: u32 = (1 << Self::ARCHETYPE_BITS) - 1;
-
-    /// Reject overflow instead of silently aliasing a different parent identity.
-    pub const fn new(callsite: u32, archetype: u32) -> Self {
-        assert!(callsite <= Self::MAX_CALLSITE, "callsite exceeds 20 bits");
-        assert!(
-            archetype <= Self::MAX_ARCHETYPE,
-            "archetype exceeds 12 bits"
-        );
-        Self(callsite | (archetype << Self::CALLSITE_BITS))
-    }
-
-    pub const fn callsite(self) -> u32 {
-        self.0 & Self::MAX_CALLSITE
-    }
-
-    pub const fn archetype(self) -> u32 {
-        self.0 >> Self::CALLSITE_BITS
-    }
-
-    /// Every u32 bit pattern encodes a valid pair.
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    pub const fn to_bits(self) -> u32 {
-        self.0
-    }
-}
-
+//! Grouped integer references use opaque u32 keys and quantized predictors.
+//! The caller defines key semantics; footer entries remain exactly eight bytes.
+use super::common::{advance, fit_line, residual, restore};
+use super::{Context, Encoding, Footer};
+use crate::data::{column, util::float_u16::FloatU16};
 /// Fields are decoded from bytes, so the trailer needs no alignment padding.
 #[derive(Clone, Copy, Debug)]
-pub struct ParentOffsetEntry {
-    pub identity: CallsiteArchetype,
+pub struct ReferenceEncoding {
+    pub identity: u32,
     pub offset: FloatU16,
     /// Predicted increase from row zero to row `frame_len`, not per row.
     pub stride: FloatU16,
 }
 
-impl ParentOffsetEntry {
-    pub fn encode(self, actual: u64, row: usize, frame_len: usize) -> u64 {
-        column::residual(
+impl ReferenceEncoding {
+    #[inline]
+    pub fn encode_index(self, actual: u64, row: usize, frame_len: usize) -> u64 {
+        residual(
             u128::from(actual),
             u128::from(self.predict(row, frame_len)),
             8,
         ) as u64
     }
 
-    pub fn decode(self, encoded: u64, row: usize, frame_len: usize) -> u64 {
-        column::restore(
+    #[inline]
+    pub fn decode_index(self, encoded: u64, row: usize, frame_len: usize) -> u64 {
+        restore(
             u128::from(encoded),
             u128::from(self.predict(row, frame_len)),
             8,
         ) as u64
     }
 
+    #[inline]
     fn predict(self, row: usize, frame_len: usize) -> u64 {
         self.offset
             .to_u64()
-            .wrapping_add(column::advance(self.stride.to_u64(), row, frame_len))
+            .wrapping_add(advance(self.stride.to_u64(), row, frame_len))
     }
 
-    fn fit(mut self, first: usize, start: u64, last: usize, end: u64, length: usize) -> Self {
-        let (offset, stride) = column::fit_line(
+    pub(crate) fn fit(
+        mut self,
+        first: usize,
+        start: u64,
+        last: usize,
+        end: u64,
+        length: usize,
+    ) -> Self {
+        let (offset, stride) = fit_line(
             first,
             u128::from(start),
             last,
@@ -90,15 +60,43 @@ impl ParentOffsetEntry {
     }
 }
 
-/// Every entry is CallsiteArchetype + FloatU16 offset/stride (8 bytes),
+impl<'a> Encoding<'a> for ReferenceEncoding {
+    const WIDTH: Option<usize> = Some(8);
+    #[inline]
+    fn parse(record: &'a [u8], _layout: super::Layout, _rows: usize) -> Self {
+        assert_eq!(record.len(), 8);
+        Self {
+            identity: u32::from_le_bytes(record[..4].try_into().unwrap()),
+            offset: FloatU16::from_bits(u16::from_le_bytes(record[4..6].try_into().unwrap())),
+            stride: FloatU16::from_bits(u16::from_le_bytes(record[6..8].try_into().unwrap())),
+        }
+    }
+    fn write_footer(&self, _width: usize, output: &mut Footer) {
+        output.extend_from_slice(&self.identity.to_le_bytes());
+        output.extend_from_slice(&self.offset.to_bits().to_le_bytes());
+        output.extend_from_slice(&self.stride.to_bits().to_le_bytes());
+    }
+    #[inline]
+    fn encode(&self, value: u128, row: usize, context: Context) -> Option<u128> {
+        Some(self.encode_index(u64::try_from(value).ok()?, row, context.rows()) as u128)
+    }
+    #[inline]
+    fn decode(&self, encoded: u128, row: usize, context: Context) -> u128 {
+        self.decode_index(encoded as u64, row, context.rows()) as u128
+    }
+}
+
+use crate::data::dataframe::Frame;
+use smallvec::SmallVec;
+/// Every entry is u32 + FloatU16 offset/stride (8 bytes),
 /// including a singleton. Rows store a u16 dictionary index beside the residual.
 #[derive(Clone, Copy, Default)]
-pub struct ParentOffsets<'a> {
+pub struct ReferenceTable<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> ParentOffsets<'a> {
-    pub const ENTRY_BYTES: usize = size_of::<CallsiteArchetype>() + 2 * size_of::<FloatU16>();
+impl<'a> ReferenceTable<'a> {
+    pub const ENTRY_BYTES: usize = size_of::<u32>() + 2 * size_of::<FloatU16>();
     pub const ROW_BYTES: usize = size_of::<u64>() + size_of::<u16>();
 
     pub fn new(bytes: &'a [u8]) -> Self {
@@ -119,42 +117,35 @@ impl<'a> ParentOffsets<'a> {
         self.bytes.is_empty()
     }
 
-    pub fn entry(self, index: u16) -> ParentOffsetEntry {
+    #[inline]
+    pub fn entry(self, index: u16) -> ReferenceEncoding {
         assert!(
             usize::from(index) < self.len(),
             "parent table index out of range"
         );
         let start = usize::from(index) * Self::ENTRY_BYTES;
         let bytes = &self.bytes[start..start + Self::ENTRY_BYTES];
-        ParentOffsetEntry {
-            identity: CallsiteArchetype::from_bits(u32::from_le_bytes(
-                bytes[..4].try_into().unwrap(),
-            )),
-            // The unit-scaled predictor rounds down; row deltas preserve all
-            // low bits and also support IDs beyond the predictor's range.
-            offset: FloatU16::from_bits(u16::from_le_bytes(bytes[4..6].try_into().unwrap())),
-            stride: FloatU16::from_bits(u16::from_le_bytes(bytes[6..8].try_into().unwrap())),
-        }
+        ReferenceEncoding::parse(bytes, super::Layout::new(0, 8, false), 0)
     }
 
-    pub(super) fn find(self, identity: CallsiteArchetype) -> Option<u16> {
+    pub(crate) fn find(self, identity: u32) -> Option<u16> {
         (0..self.len() as u16).find(|&i| self.entry(i).identity == identity)
     }
 }
 
 /// Transform a completed active frame exactly once, before initial compaction.
 /// Archived edits must retain these coefficients and must NOT call this again.
-pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) {
+pub(crate) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) {
     let length = frame.length;
     assert!(length > 0 && length <= u16::MAX as usize);
     for &offset in offsets {
-        assert!(usize::from(offset) + ParentOffsets::ROW_BYTES <= frame.unit);
+        assert!(usize::from(offset) + ReferenceTable::ROW_BYTES <= frame.unit);
     }
-    let table = ParentOffsets::new(bytes);
+    let table = ReferenceTable::new(bytes);
     // Most blocks have few identities. Inline scratch keeps singleton rollover
     // at one allocation; spill storage for larger dictionaries is temporary.
     struct Endpoints {
-        original: ParentOffsetEntry,
+        original: ReferenceEncoding,
         first_row: usize,
         first_index: u64,
         last_row: usize,
@@ -184,7 +175,7 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) 
         for &offset in offsets {
             let (residual, group) = read(row, usize::from(offset));
             let e = &mut endpoints[group];
-            let actual = e.original.decode(residual, r, length);
+            let actual = e.original.decode_index(residual, r, length);
             if e.first_row == usize::MAX {
                 e.first_row = r;
                 e.first_index = actual;
@@ -198,11 +189,11 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) 
         let fitted = e
             .original
             .fit(e.first_row, e.first_index, e.last_row, e.last_index, length);
-        let begin = g * ParentOffsets::ENTRY_BYTES;
+        let begin = g * ReferenceTable::ENTRY_BYTES;
         bytes[begin + 4..begin + 6].copy_from_slice(&fitted.offset.to_bits().to_le_bytes());
         bytes[begin + 6..begin + 8].copy_from_slice(&fitted.stride.to_bits().to_le_bytes());
     }
-    let fitted = ParentOffsets::new(bytes);
+    let fitted = ReferenceTable::new(bytes);
     // Each reference column keeps its own mask even when identities are shared.
     for &offset in offsets {
         let offset = usize::from(offset);
@@ -214,8 +205,8 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) 
                 let actual =
                     endpoints[usize::from(group)]
                         .original
-                        .decode(residual as u64, r, length);
-                u128::from(fitted.entry(group).encode(actual, r, length))
+                        .decode_index(residual as u64, r, length);
+                u128::from(fitted.entry(group).encode_index(actual, r, length))
             },
         );
     }
@@ -224,46 +215,9 @@ pub(super) fn fit_strides(frame: &mut Frame, bytes: &mut [u8], offsets: &[u16]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn packed_identity_preserves_both_fields_at_their_boundaries() {
-        assert_eq!(size_of::<CallsiteArchetype>(), 4);
-        assert_eq!(size_of::<ParentOffsetEntry>(), 8);
-        assert_eq!(ParentOffsets::ENTRY_BYTES, 8);
-        // Cross-product catches a shift or mask that leaks across either field.
-        for callsite in [0, 1, CallsiteArchetype::MAX_CALLSITE] {
-            for archetype in [0, 1, CallsiteArchetype::MAX_ARCHETYPE] {
-                let identity = CallsiteArchetype::new(callsite, archetype);
-                assert_eq!(identity.callsite(), callsite);
-                assert_eq!(identity.archetype(), archetype);
-                assert_eq!(CallsiteArchetype::from_bits(identity.to_bits()), identity);
-            }
-        }
-        assert_eq!(
-            CallsiteArchetype::from_bits(u32::MAX).callsite(),
-            (1 << 20) - 1
-        );
-        assert_eq!(
-            CallsiteArchetype::from_bits(u32::MAX).archetype(),
-            (1 << 12) - 1
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "callsite exceeds 20 bits")]
-    fn packed_identity_rejects_callsite_overflow() {
-        CallsiteArchetype::new(1 << 20, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "archetype exceeds 12 bits")]
-    fn packed_identity_rejects_archetype_overflow() {
-        CallsiteArchetype::new(0, 1 << 12);
-    }
-
-    fn entry() -> ParentOffsetEntry {
-        ParentOffsetEntry {
-            identity: CallsiteArchetype::new(7, 3),
+    fn entry() -> ReferenceEncoding {
+        ReferenceEncoding {
+            identity: (7 | (3 << 20)),
             offset: FloatU16::default(),
             stride: FloatU16::default(),
         }
@@ -302,7 +256,7 @@ mod tests {
         let saturated = entry().fit(1, 0, 2, u64::MAX, length);
         assert_eq!(saturated.offset.to_u64(), 0);
         assert_eq!(saturated.stride.to_u64(), FloatU16::MAX);
-        let fractional = ParentOffsetEntry {
+        let fractional = ReferenceEncoding {
             offset: FloatU16::from_u64_lossy(3 * FloatU16::UNIT),
             stride: FloatU16::from_u64_lossy(5 * FloatU16::UNIT),
             ..entry()
@@ -311,12 +265,12 @@ mod tests {
         for predictor in [saturated, fractional, above_f64] {
             for row in [0, 1, 2, length / 2, length - 1] {
                 for actual in [0, 1, 4095, 1 << 53, (1 << 53) + 1, u64::MAX - 1, u64::MAX] {
-                    let residual = predictor.encode(actual, row, length);
-                    assert_eq!(predictor.decode(residual, row, length), actual);
+                    let residual = predictor.encode_index(actual, row, length);
+                    assert_eq!(predictor.decode_index(residual, row, length), actual);
                 }
             }
         }
-        let half = ParentOffsetEntry {
+        let half = ReferenceEncoding {
             stride: FloatU16::from_u64_lossy(FloatU16::UNIT),
             ..entry()
         };
@@ -327,20 +281,20 @@ mod tests {
     fn early_archive_uses_actual_length_and_removes_old_residual_mask_bits() {
         let original = entry();
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&original.identity.to_bits().to_le_bytes());
+        bytes.extend_from_slice(&original.identity.to_le_bytes());
         bytes.extend_from_slice(&original.offset.to_bits().to_le_bytes());
         bytes.extend_from_slice(&original.stride.to_bits().to_le_bytes());
         let mut frame = Frame::new(11, 32);
         for r in 0..4 {
             let mut row = [0; 11];
             let actual = r as u64 * FloatU16::UNIT;
-            row[1..9].copy_from_slice(&original.encode(actual, r, 4).to_ne_bytes());
+            row[1..9].copy_from_slice(&original.encode_index(actual, r, 4).to_ne_bytes());
             frame.push(&row);
         }
         assert_ne!(&frame.buffer[1..9], &[0; 8]);
         frame.lock_editable(0, 1);
         fit_strides(&mut frame, &mut bytes, &[1]);
-        let fitted = ParentOffsets::new(&bytes).entry(0);
+        let fitted = ReferenceTable::new(&bytes).entry(0);
         assert_eq!(fitted.stride.to_u64(), 4 * FloatU16::UNIT);
         assert_eq!(&frame.buffer[1..9], &[0; 8]);
         assert_eq!(frame.buffer[0], 0xff);
@@ -348,7 +302,42 @@ mod tests {
             let begin = (r + 1) * frame.unit + 1;
             let residual = u64::from_ne_bytes(frame.buffer[begin..begin + 8].try_into().unwrap());
             assert_eq!(residual, 0);
-            assert_eq!(fitted.decode(residual, r, 4), r as u64 * FloatU16::UNIT);
+            assert_eq!(
+                fitted.decode_index(residual, r, 4),
+                r as u64 * FloatU16::UNIT
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+    use crate::data::{
+        blockbuffer::ArchivedFrame,
+        column::{Column, Layout},
+    };
+    #[test]
+    fn reference_footer_and_static_column_preserve_key_and_exact_values() {
+        let encoding = ReferenceEncoding {
+            identity: u32::MAX,
+            offset: FloatU16::from_u64_lossy(1000),
+            stride: FloatU16::from_u64_lossy(12),
+        };
+        let mut footer = Footer::new();
+        encoding.write_footer(8, &mut footer);
+        assert_eq!(footer.len(), 8);
+        let encoding = ReferenceEncoding::parse(&footer, Layout::new(0, 8, false), 4);
+        assert_eq!(encoding.identity, u32::MAX);
+        let values = [0, 1001, u64::MAX, 1043];
+        let mut frame = Frame::new(8, 4);
+        for (row, value) in values.into_iter().enumerate() {
+            frame.push(&encoding.encode_index(value, row, 4).to_ne_bytes());
+        }
+        let archived = ArchivedFrame::new_from(&frame);
+        let column = Column::with_encoding(&archived, Layout::new(0, 8, false), encoding);
+        for (row, value) in values.into_iter().enumerate() {
+            assert_eq!(column.read(row), value as u128);
         }
     }
 }

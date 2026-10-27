@@ -190,17 +190,22 @@ Timestamps are stored as shifted `u64` nanoseconds since the recorder started.
 The default shift is **10**, giving **1,024 ns (1.024 µs) ticks**. Set
 `RecordingLayer::timestamp_bit_shift` before recording to choose another resolution.
 
-Active timestamp headers store unsigned offsets from the block's fixed first
-timestamp. At archival, the first and last start timestamps fit a stride over
+Active timestamp headers store absolute shifted timestamps. Archived timestamp
+footers pack a four-bit representation tag into the high nibble of a 60-bit
+origin word; absolute predictors add a two-byte stride (10 bytes total), while
+parent-relative rows use only the tagged absolute block start (8 bytes).
+Timestamps above `2^60 - 1` ticks are rejected before allocation. At archival, the first and last start timestamps fit a stride over
 the actual row count `L`: the predicted offset at row `R` is
-`round(stride * R / L)`. Collocated metadata stores the stride as `FloatU16` in
+`round(stride * R / L)`. The timestamp footer stores the stride as `FloatU16` in
 shifted ticks, keeping small values such as 50 exact even at shift 20.
 Strides above `FloatU16::MAX` (4,396,972,769,280 ticks, about 4,397 seconds at
 nanosecond resolution) are disabled with zero; those blocks retain unsigned
 offsets. Enabled blocks store exact ZigZag residuals from the decoded predictor.
 Only timestamp mask bits are recomputed. Readers use the frame's existing row
-count; archived edits retain the fitted stride, and late span closes only extend
-the timestamp range. Span ends store duration + 1, with zero reserved for an open span.
+count; archived edits and late span closes retain the origin and fitted stride.
+Eviction estimates duration from consecutive block starts within an archetype,
+using the active start after the newest archive and at least one tick when a
+following start is absent or not later. No retention end is stored. Span ends store duration + 1, with zero reserved for an open span.
 
 Event id's are assigned as per-archetype sequential counters, to maximise how many bytes can be compacted. Archetypes ids themselves are also sequential.
 
@@ -468,7 +473,7 @@ then:
 256k per callsite cap
 
 for global cap we drop the oldest block for one of the archetypes.
-the block which is selected is the one with the largest CompressedSize/TimestampRange
+the block which is selected is the one with the largest CompressedSize/(NextBlockStart - BlockStart)
 ie. larger blocks and more frequent blocks are given less retention priority.
 # Capture/replay benchmarking
 
@@ -1400,3 +1405,35 @@ Position storage is either:
 | Frame | 7.798 | 6.066 | −1.732 | −22.22% |
 | **Total** | **8.847** | **7.796** | **−1.051** | **−11.87%** |
 
+# data/subscriber boundary and Encoding trait rewrite
+I previously instructed codex to make a Column view struct for interacting with columns. Now we will have it abstract column encoding into a trait, while cleaning up the subscriber / data boundary. Goal: data/ does not know it is being used to store tracing logs, it is a generic time series in memory db. 
+
+TODO: ideally frame and blockbuffer have no knowledge of the rows metadata (timestamps spanids etc). 
+- After the refactor is this the case. 
+- Is this truely desireable?
+
+# exception and split dict for ts
+
+We already added the exception encoder for durations.
+Tests showed split dict would work well for start ts, but that was before parent encoding. We'd like to not use parent encoding since it complicates lookup.
+
+| Capture | Parent offsets | Current | Exceptions | Split dict | Choose best |
+|---|---|---:|---:|---:|---:|
+| Bevy | Off | 17.78 | 17.72 | 12.89 | **12.89** |
+| Bevy | On | 14.06 | 12.91 | 11.19 | **10.76** |
+| Actix | Off | 22.18 | 22.18 | 14.99 | **14.99** |
+| Actix | On | 14.70 | 14.05 | 12.62 | **12.23** |
+
+Added split dict encoding:
+> The production results are close to the probe estimates. With parent offsets off, span timestamps fell from 18.24 to 13.19 bits/row for Bevy and from 22.74 to 15.37 for Actix
+> The storage gains hold with parent offsets on and off. Across both captures, total retained storage falls by 3.6–19.4%, and decoded row hashes remain identical. The tradeoff is fitting time: full-capture recording takes about 2.4–3.2× as long
+
+# bitcolumn run encoding
+one of the few remaining options. Considering going columnar anyway
+
+| Capture | Additional saving | Reduction in column storage | Columns using Rice | Avg. Rice bit columns¹ |
+|---|---:|---:|---:|---:|
+| Bevy | **272.4 KiB** | **11.88%** | 11,923 / 18,781 (63.5%) | 3.68 |
+| Actix | **711.0 KiB** | **17.25%** | 10,139 / 22,862 (44.3%) | 4.96 |
+
+TODO

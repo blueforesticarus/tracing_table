@@ -9,7 +9,7 @@ use bytemuck::Pod;
 use streaming_iterator::StreamingIterator;
 
 use super::CompressionStats;
-use super::blockbuffer::ArchivedBlock;
+use super::blockbuffer::{ArchivedBlock, BlockMetadata};
 use super::util::smallbox::{Initializer, SmallBox, boxed_with};
 
 mod bitcompact;
@@ -19,18 +19,22 @@ pub use bitcompact::{BitCompactFrame, BitCompactFrameIter};
 /// rebuild to retain byte-aligned packed rows; byte-compaction builds are unchanged.
 pub const CONTINUOUS_BIT_PACKING: bool = true;
 
-pub enum AnyFrame<'a> {
+pub enum AnyFrame<'a, M: BlockMetadata = ()> {
     Frame(&'a mut Box<Frame>),
     Compact(&'a mut Box<CompactFrame>),
     BitCompact(&'a mut Box<BitCompactFrame>),
-    Archived(&'a mut SmallBox<ArchivedBlock>, &'a [super::column::Layout]),
+    Archived(
+        &'a mut SmallBox<ArchivedBlock<M>>,
+        &'a [super::column::Layout],
+        bool,
+    ),
 }
 
 /// The edit changes omitted data and requires rebuilding; the frame is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeedsRebuild;
 
-impl AnyFrame<'_> {
+impl<M: BlockMetadata> AnyFrame<'_, M> {
     /// Write a row, rebuilding and replacing its owning box only when necessary.
     pub fn write_row(&mut self, index: usize, row: &[u8]) {
         match self {
@@ -38,7 +42,7 @@ impl AnyFrame<'_> {
                 assert!(index < frame.length, "row index out of bounds");
                 let start = (index + 1) * frame.unit;
                 // Projected active writes cover the payload prefix; preserve
-                // any active-only parent timestamp column at the end.
+                // any caller-owned active-only scratch at the end.
                 assert!(row.len() <= frame.unit);
                 frame.buffer[start..start + row.len()].copy_from_slice(row);
                 frame.update_mask(index, true);
@@ -49,7 +53,7 @@ impl AnyFrame<'_> {
                 }
                 let mut unpacked = Frame::new(frame.unit(), frame.len());
                 frame.uncompact(&mut unpacked);
-                AnyFrame::Frame(&mut unpacked).write_row(index, row);
+                AnyFrame::<M>::Frame(&mut unpacked).write_row(index, row);
                 **frame = CompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
             Self::BitCompact(frame) => {
@@ -58,22 +62,27 @@ impl AnyFrame<'_> {
                 }
                 let mut unpacked = Frame::new(frame.unit(), frame.len());
                 frame.uncompact(&mut unpacked);
-                AnyFrame::Frame(&mut unpacked).write_row(index, row);
+                AnyFrame::<M>::Frame(&mut unpacked).write_row(index, row);
                 **frame = BitCompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
-            Self::Archived(block, columns) => {
+            Self::Archived(block, columns, unsigned) => {
                 // Keep edits in place when both the current codecs and mask accept
                 // them. Failed encoding or newly varying bits require a refit.
                 let mut encoded;
-                let written = if !block.column_metadata(columns).has_encodings() {
+                let written = if !block
+                    .column_metadata(columns)
+                    .has_encodings_selected(*unsigned)
+                {
                     // Preserve the no-copy close/edit path for plain structural rows.
                     block.frame.try_write_row(index, row).is_ok()
                 } else {
                     encoded = StackVec::<128, u128>::new(row);
-                    block
-                        .column_metadata(columns)
-                        .encode(&block.frame, &mut encoded, index)
-                        && block.frame.try_write_row(index, &encoded).is_ok()
+                    block.column_metadata(columns).encode_selected(
+                        &block.frame,
+                        &mut encoded,
+                        index,
+                        *unsigned,
+                    ) && block.frame.try_write_row(index, &encoded).is_ok()
                 };
                 if written {
                     return;
@@ -81,8 +90,8 @@ impl AnyFrame<'_> {
 
                 // Decode every selectable column before fitting, just as at
                 // rollover; fitting already encoded words would double-encode.
-                // Timestamp and parent predictors are outside these columns:
-                // retain their physical values, metadata and exact footer prefix.
+                // Unselected unsigned words retain their immutable predictors.
+                // Opaque caller metadata and footer prefixes move intact.
                 let mut trailer = super::column::Metadata::split(block.frame.trailer(), columns)
                     .0
                     .to_vec();
@@ -92,15 +101,31 @@ impl AnyFrame<'_> {
                 // retaining other column encodings. Rows share one packed bit
                 // stream and footer, so replacing it still needs a frame rebuild.
                 for ordinal in 0..block.frame.len() {
-                    block.read_row(ordinal, &mut logical, columns);
+                    block.read_row_selected(ordinal, &mut logical, columns, *unsigned);
                     if ordinal == index {
                         logical.copy_from_slice(row);
                     }
+                    for (layout, record) in block
+                        .column_metadata(columns)
+                        .entries()
+                        .filter(|(c, r)| *unsigned && c.is_unsigned() && !r.is_empty())
+                    {
+                        let codec = super::column::Column::new(&block.frame, layout, record);
+                        let value = codec
+                            .encode(super::column::read_word(&logical[layout.range()]), ordinal)
+                            .expect("immutable unsigned origin");
+                        super::column::write_word(&mut logical[layout.range()], value);
+                    }
                     unpacked.push(&logical);
                 }
-                super::column::fit(&mut unpacked, &mut trailer, columns);
-                // Replacing the archive retains structural predictors, deferred
-                // references and the original Data descriptor.
+                super::column::refit(
+                    &mut unpacked,
+                    &mut trailer,
+                    columns,
+                    block.column_metadata(columns),
+                );
+                // Replacing the archive retains caller metadata and the
+                // original absolute row descriptor.
                 let metadata = std::mem::take(&mut block.metadata);
                 **block = ArchivedBlock::new_with_trailer(&unpacked, metadata, &trailer);
             }
@@ -148,15 +173,15 @@ impl DerefMut for RowBuffer<'_> {
     }
 }
 
-pub struct Row<'a> {
+pub struct Row<'a, M: BlockMetadata = ()> {
     pub init: bool,
     pub buffer: RowBuffer<'a>,
     pub index: usize,
-    pub frame: AnyFrame<'a>,
+    pub frame: AnyFrame<'a, M>,
     pub projection: Option<&'a super::column::physical::PhysicalLayout>,
 }
 
-impl<'a> Row<'a> {
+impl<'a, M: BlockMetadata> Row<'a, M> {
     pub fn get_mut<'b>(&'b mut self) -> &'b mut [u8] {
         if let Some(projection) = self.projection {
             let output = self.buffer.get_or_init(projection.logical_unit());
@@ -167,8 +192,8 @@ impl<'a> Row<'a> {
                         &frame.buffer[(self.index + 1) * frame.unit
                             ..(self.index + 1) * frame.unit + projection.unit()],
                     ),
-                    AnyFrame::Archived(block, columns) => {
-                        block.read_row(self.index, &mut physical, columns)
+                    AnyFrame::Archived(block, columns, unsigned) => {
+                        block.read_row_selected(self.index, &mut physical, columns, *unsigned)
                     }
                     _ => unreachable!(),
                 }
@@ -198,10 +223,10 @@ impl<'a> Row<'a> {
                 }
                 slice
             }
-            AnyFrame::Archived(block, columns) => {
+            AnyFrame::Archived(block, columns, unsigned) => {
                 let slice = self.buffer.get_or_init(block.frame.unit());
                 if !self.init {
-                    block.read_row(self.index, slice, columns);
+                    block.read_row_selected(self.index, slice, columns, *unsigned);
                     self.init = true;
                 }
                 slice
@@ -212,31 +237,61 @@ impl<'a> Row<'a> {
 
 /// Logical archive rows reconstruct string indices while reusing aligned inline
 /// scratch. The underlying frame iterator remains available for physical inspection.
-pub struct ArchivedBlockIter<'a> {
-    block: &'a ArchivedBlock,
+pub struct ArchivedBlockIter<'a, M: BlockMetadata = (), const DECODE_ORIGINS: bool = true> {
+    block: &'a ArchivedBlock<M>,
     buffer: StackVec<128, u128>,
     yielded: usize,
     columns: smallvec::SmallVec<[super::column::Column<'a>; 8]>,
+    // Mandatory u64 origins have a direct native-width path, avoiding a codec
+    // enum match per row or an extra spill when eight ordinary columns are present.
+    unsigned:
+        smallvec::SmallVec<[super::column::Column<'a, super::column::PredictionEncoding<true>>; 1]>,
+    // Keep tagged origins statically dispatched just like full-width origins.
+    tagged: smallvec::SmallVec<[super::column::Column<'a, super::column::OriginEncoding>; 1]>,
+    // Split timestamps retain a borrowed, statically dispatched decoder too;
+    // footer tables are parsed once per traversal rather than once per row.
+    split: smallvec::SmallVec<[super::column::Column<'a, super::column::SplitDictionaryEncoding<'a>>; 1]>,
 }
 
-impl<'a> ArchivedBlockIter<'a> {
-    pub fn new(block: &'a ArchivedBlock, columns: &'a [super::column::Layout]) -> Self {
+impl<'a, M: BlockMetadata, const DECODE_ORIGINS: bool> ArchivedBlockIter<'a, M, DECODE_ORIGINS> {
+    pub fn new(block: &'a ArchivedBlock<M>, columns: &'a [super::column::Layout]) -> Self {
+        let mut unsigned = smallvec::SmallVec::new();
+        let mut tagged = smallvec::SmallVec::new();
+        let mut split = smallvec::SmallVec::new();
+        let mut columns_decoded = smallvec::SmallVec::new();
+        for (layout, record) in block
+            .column_metadata(columns)
+            .entries()
+            .filter(|(_, r)| !r.is_empty())
+        {
+            if layout.is_tagged_origin() && DECODE_ORIGINS {
+                if super::column::SplitDictionaryEncoding::is_tagged(record) {
+                    split.push(super::column::Column::parse(&block.frame, layout, record));
+                } else {
+                    tagged.push(super::column::Column::parse(&block.frame, layout, record));
+                }
+            } else if layout.is_unsigned() && DECODE_ORIGINS {
+                unsigned.push(super::column::Column::parse(&block.frame, layout, record));
+            } else if !layout.is_unsigned() {
+                columns_decoded.push(super::column::Column::new(&block.frame, layout, record));
+            }
+        }
         Self {
             block,
             buffer: StackVec::new(block.frame.first()),
             yielded: 0,
             // Decode footer tags/coefficients once per traversal, outside the row loop.
-            columns: block
-                .column_metadata(columns)
-                .entries()
-                .filter(|(_, record)| !record.is_empty())
-                .map(|(layout, record)| super::column::Column::new(&block.frame, layout, record))
-                .collect(),
+            columns: columns_decoded,
+            unsigned,
+            tagged,
+            split,
         }
     }
 }
 
-impl StreamingIterator for ArchivedBlockIter<'_> {
+impl<M: BlockMetadata, const DECODE_ORIGINS: bool> StreamingIterator
+    for ArchivedBlockIter<'_, M, DECODE_ORIGINS>
+{
     type Item = [u8];
 
     fn advance(&mut self) {
@@ -244,6 +299,17 @@ impl StreamingIterator for ArchivedBlockIter<'_> {
             self.block.frame.read_row(self.yielded, &mut self.buffer);
             for column in &self.columns {
                 column.decode_row(&mut self.buffer, self.yielded);
+            }
+            if DECODE_ORIGINS {
+                for column in &self.tagged {
+                    column.decode_row(&mut self.buffer, self.yielded);
+                }
+                for column in &self.split {
+                    column.decode_row(&mut self.buffer, self.yielded);
+                }
+                for column in &self.unsigned {
+                    column.decode_row(&mut self.buffer, self.yielded);
+                }
             }
             self.yielded += 1;
         } else {
@@ -257,7 +323,7 @@ impl StreamingIterator for ArchivedBlockIter<'_> {
 }
 
 // when the row is dropped we have to write the scratchpad back to frame storage (if it exists)
-impl<'a> Drop for Row<'a> {
+impl<'a, M: BlockMetadata> Drop for Row<'a, M> {
     fn drop(&mut self) {
         if let Some(projection) = self.projection {
             if self.init {
@@ -669,6 +735,11 @@ impl CompactFrame {
     /// Exact opaque suffix, derived from the row schema and DST allocation length.
     pub fn trailer(&self) -> &[u8] {
         &self.buffer[self.row_payload_len()..]
+    }
+    /// Borrow the initialized opaque footer; callers must retain its layout and length.
+    pub fn trailer_mut(&mut self) -> &mut [u8] {
+        let start = self.row_payload_len();
+        &mut self.buffer[start..]
     }
 
     pub fn uncompact(&self, new: &mut Frame) {
@@ -1105,7 +1176,7 @@ mod test {
                     }
                 }
                 let address = &*compact as *const CompactFrame;
-                let mut row = Row {
+                let mut row: Row = Row {
                     init: false,
                     buffer: RowBuffer::Owned(Box::default()),
                     index,
@@ -1174,9 +1245,9 @@ mod test {
                 frame.push(&[if row == index { 3 } else { 0 }, 0x40, 0x80]);
             }
             assert_eq!(&**frame.mask(), &[3, 0, 0]);
-            AnyFrame::Frame(&mut frame).write_row(index, &[1, 0x44, 0x80]);
+            AnyFrame::<()>::Frame(&mut frame).write_row(index, &[1, 0x44, 0x80]);
             assert_eq!(&**frame.mask(), &[1, 4, 0]);
-            AnyFrame::Frame(&mut frame).write_row(index, &[0, 0x40, 0x80]);
+            AnyFrame::<()>::Frame(&mut frame).write_row(index, &[0, 0x40, 0x80]);
             assert_eq!(&**frame.mask(), &[0, 0, 0]);
         }
     }
