@@ -187,7 +187,7 @@ COMPONENT_COLORS[LABELS["end_buffer"]] = OVERVIEW_COLORS[LABELS["end_buffer"]]
 # Keep the fully overhead wedge distinct from field and string hues.
 COMPONENT_COLORS[BLOCK_OVERHEAD_LABEL] = (0.55, 0.32, 0.16)
 SPAN_ONLY_COMPONENTS = {"end_timestamp", "follows_from", "spanfieldsref", "update_span"}
-METRICS = ["first_bytes", "mask_bytes", "varying_bytes", "padding_bytes", "compressed_bytes", "total_bytes"]
+METRICS = ["footer_bytes", "first_bytes", "mask_bytes", "varying_bytes", "padding_bytes", "compressed_bytes", "total_bytes"]
 LEAF_METRICS = METRICS + ["column_values"]
 INDEX_GROUPS = ("string_field_index", "format_args_index")
 
@@ -268,7 +268,7 @@ def measurement_component(row):
 
 
 def index_slice_label(group, mode):
-    """Related hues identify storage modes without confusing radial constant tints."""
+    """Related hues identify storage modes without confusing radial overhead tints."""
     base = LABELS[group]
     name = base.removesuffix(' (raw / residual)') + f' ({INDEX_MODE_LABELS.get(mode, mode)})'
     color = COMPONENT_COLORS[base]
@@ -374,8 +374,12 @@ def component_breakdown(values, owner, split_indices=False):
     metrics = {metric: dict(component_slices(values, owner, metric, split_indices)) for metric in METRICS}
     result = []
     for name, value in component_slices(values, owner, split_indices=split_indices):
+        # New evidence charges trailers to fields; omit the legacy empty entry
+        # from legends and rate exports, while retaining historical nonzero data.
+        if name == LABELS['end_buffer'] and value == 0:
+            continue
         value -= metrics["padding_bytes"][name]
-        overhead = sum(metrics[metric][name] for metric in ("first_bytes", "mask_bytes"))
+        overhead = sum(metrics[metric][name] for metric in ("first_bytes", "mask_bytes", "footer_bytes"))
         varying = metrics["varying_bytes"][name]
         compressed = metrics["compressed_bytes"][name]
         assert math.isclose(overhead + varying + compressed, value, abs_tol=1e-5)
@@ -1337,7 +1341,7 @@ def column_populations(values, owner):
 
 def key_lines(group, style, row):
     """Share exact text between measurement and drawing to prevent clipping."""
-    name, cost, constant, varying, unsplit = row
+    name, cost, overhead, varying, unsplit = row
     denominator = group['denominator'] if style == 'rows' else 1
     size = sum(item[1] for item in group[style])
     info = f'{100 * cost / size:.2f}%'
@@ -1355,23 +1359,23 @@ def key_lines(group, style, row):
         info += f' · {kib(cost)} KiB'
     lines = [name, info]
     # Solid storage (trailers, padding and compressed strings) has no meaningful
-    # constant/varying split. Empty components likewise need no breakdown line.
-    if group['key'] in ('span', 'event') and (constant or varying):
+    # overhead/varying split. Empty components likewise need no breakdown line.
+    if group['key'] in ('span', 'event') and (overhead or varying):
         # Fields/args retain per-column rates; metadata uses the pie's row
         # denominator so optional members still show their actual cost per row.
         count = columns.get(name, 0)
         field = name in field_labels()
         rate_denominator = count if field else denominator
-        constant_rate = per_row(8 * constant, rate_denominator) if rate_denominator else '—'
+        overhead_rate = per_row(8 * overhead, rate_denominator) if rate_denominator else '—'
         varying_rate = per_row(8 * varying, rate_denominator) if rate_denominator else '—'
         frequency = per_row(count, denominator) if count else '—'
         unit = 'bits/col' if field else 'bits per row'
         if name == LABELS['compressed_payload']:
             # Container metadata is overhead, rather than a field's first/mask.
             payload_rate = per_row(8 * (varying + unsplit), rate_denominator)
-            detail = f'Buffer overhead {constant_rate} · payload {payload_rate} {unit}'
+            detail = f'Buffer overhead {overhead_rate} · payload {payload_rate} {unit}'
         else:
-            detail = f'Constant (first + mask) {constant_rate} · varying {varying_rate} {unit}'
+            detail = f'Overhead {overhead_rate} · varying {varying_rate} {unit}'
         # Omit the redundant one-column-per-row frequency outside fields/args.
         if field or (count and not math.isclose(count / denominator, 1, abs_tol=1e-9)):
             detail += f' · {frequency} col/row'
@@ -1599,8 +1603,8 @@ def export_pie_rates(prefix, modes):
         writer = csv.writer(output)
         writer.writerow(['templates', 'measure', 'style', 'component', 'bits_per_row', 'percent',
                          'archived_callsite_count', 'row_denominator', 'bits_per_column',
-                         'column_value_denominator', 'constant_bits_per_row', 'varying_bits_per_row',
-                         'unsplit_bits_per_row', 'constant_bits_per_column', 'varying_bits_per_column',
+                         'column_value_denominator', 'overhead_bits_per_row', 'varying_bits_per_row',
+                         'unsplit_bits_per_row', 'overhead_bits_per_column', 'varying_bits_per_column',
                          'columns_per_row'])
         for mode, groups in modes.items():
             for group in groups:
@@ -1609,17 +1613,17 @@ def export_pie_rates(prefix, modes):
                         continue
                     denominator = group['denominator'] if style == 'rows' else 1
                     size = sum(row[1] for row in group[style])
-                    for name, cost, constant, varying, unsplit in group[style]:
+                    for name, cost, overhead, varying, unsplit in group[style]:
                         columns = (group.get('columns') or {}).get(style, {}).get(name, 0)
                         writer.writerow([mode, group['key'], style, name, 8 * cost / denominator,
                                          100 * cost / size, group['callsite_count'] or '',
                                          group['denominator'] if style == 'rows' else '',
                                          8 * cost / columns if columns else '', columns or '',
-                                         8 * constant / denominator, 8 * varying / denominator,
+                                         8 * overhead / denominator, 8 * varying / denominator,
                                          8 * unsplit / denominator,
-                                         8 * constant / columns if columns else '',
+                                         8 * overhead / columns if columns else '',
                                          8 * varying / columns if columns else '',
-                                         columns / denominator if columns and (constant or varying) else ''])
+                                         columns / denominator if columns and (overhead or varying) else ''])
 
 
 def read_csv(path):

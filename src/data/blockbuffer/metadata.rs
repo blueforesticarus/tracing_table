@@ -8,7 +8,9 @@ impl ArchivedBlock {
         Self::new_with_trailer(frame, metadata, &[])
     }
 
-    /// Row rebuilds retain the exact trailer and count; do not re-encode residuals.
+    /// Pack an already encoded frame with its caller-supplied trailer. Rollover
+    /// and edit rebuilds run column fitting before this allocation; structural
+    /// timestamp/parent residuals must not be encoded again here.
     pub fn new_with_trailer(
         frame: &Frame,
         metadata: CollocatedMetadata,

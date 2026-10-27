@@ -3,6 +3,8 @@
 use smallvec::SmallVec;
 
 use super::{blockbuffer::ArchivedFrame, dataframe::Frame, util::float_u16::FloatU16};
+pub mod exceptions;
+pub use exceptions::ExceptionEncoding;
 pub mod physical;
 
 /// Tuning bounds fitting work and dictionary metadata; neither is a wire capacity.
@@ -11,7 +13,24 @@ pub const MAX_CYCLE: u8 = 255;
 // Tuning: favor predictable fitting work and simpler encodings over tiny savings.
 pub const MAX_CYCLE_CANDIDATES: usize = 4;
 pub const MIN_ENCODING_SAVINGS: usize = 8;
+/// Directory bytes count two-byte units; zero still means no encoding.
+pub const MAX_RECORD_BYTES: usize = u8::MAX as usize * 2;
 const CYCLE_ANCHORS: usize = 8;
+
+fn record_storage_bytes(bytes: usize) -> usize {
+    bytes.div_ceil(2) * 2
+}
+
+/// Standalone fitting records may be unpadded; archived records have at most
+/// one trailing zero byte. Never interpret that byte as codec data.
+fn check_record_size(record: &[u8], payload: usize) {
+    assert!(
+        record.len() == payload
+            || (record.len() == record_storage_bytes(payload)
+                && record[payload..].iter().all(|&byte| byte == 0)),
+        "column encoding size/padding mismatch"
+    );
+}
 
 /// Tuning: minimize actual packed timestamp mask cost with a bounded search.
 /// Disable both search flags to restore the original endpoint-only fit.
@@ -448,13 +467,14 @@ impl Prediction {
                 "invalid column cycle"
             );
         }
-        assert_eq!(bytes.len(), end, "column prediction size mismatch");
+        check_record_size(bytes, end);
         prediction
     }
 }
 
 /// The directory is schema-sized. Prefix sums locate records, so the combined
-/// metadata region has no 255-byte limit; individual records have that bound.
+/// metadata region has no per-record limit. Each directory byte counts two-byte
+/// units, allowing up to 510 bytes per record including even-length padding.
 #[derive(Clone, Copy)]
 pub struct Metadata<'a, 's> {
     records: &'a [u8],
@@ -469,7 +489,7 @@ impl<'a, 's> Metadata<'a, 's> {
             .checked_sub(layout.len())
             .expect("column directory exceeds footer");
         let widths = &trailer[directory..];
-        let size: usize = widths.iter().map(|&n| usize::from(n)).sum();
+        let size: usize = widths.iter().map(|&n| usize::from(n) << 1).sum();
         let start = directory
             .checked_sub(size)
             .expect("column metadata exceeds footer");
@@ -496,31 +516,13 @@ impl<'a, 's> Metadata<'a, 's> {
             .zip(self.widths.iter().copied())
             .map(move |(layout, width)| {
                 let start = position;
-                position += usize::from(width);
+                position += usize::from(width) << 1;
                 (layout, &self.records[start..position])
             })
     }
     pub fn is_encoded(self, offset: usize) -> bool {
         self.entries()
             .any(|(layout, record)| usize::from(layout.offset) == offset && !record.is_empty())
-    }
-    /// Exceptional edits drop only dictionaries. Other fitted coefficients and
-    /// the parent prefix remain byte-for-byte unchanged, without refitting.
-    pub(crate) fn without_dictionaries(self, prefix: &[u8]) -> SmallVec<[u8; 128]> {
-        let mut trailer = SmallVec::from_slice(prefix);
-        let mut widths = SmallVec::<[u8; 16]>::new();
-        for (_, record) in self.entries() {
-            let keep = !matches!(
-                record.first(),
-                Some(&DICTIONARY) | Some(&DICTIONARY_CYCLE) | Some(&DICTIONARY_STRIDE)
-            );
-            widths.push(if keep { record.len() as u8 } else { 0 });
-            if keep {
-                trailer.extend_from_slice(record);
-            }
-        }
-        trailer.extend_from_slice(&widths);
-        trailer
     }
     pub fn decode(self, frame: &ArchivedFrame, row: &mut [u8], index: usize) {
         for (layout, record) in self.entries().filter(|(_, record)| !record.is_empty()) {
@@ -551,6 +553,7 @@ pub struct Column<'a> {
 enum Codec<'a> {
     Raw,
     Predicted(Prediction),
+    Exceptions(ExceptionEncoding<'a>),
     Dictionary {
         entries: &'a [u8],
         count: usize,
@@ -598,6 +601,11 @@ impl<'a> Column<'a> {
         );
         let codec = match record.first().copied() {
             None => Codec::Raw,
+            Some(exceptions::TAG) => Codec::Exceptions(ExceptionEncoding::new(
+                record,
+                usize::from(layout.width),
+                frame.len(),
+            )),
             Some(DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE) => {
                 let count = usize::from(record[1]);
                 let bits = usize::from(record[2]);
@@ -616,13 +624,10 @@ impl<'a> Column<'a> {
                 } else {
                     (KeyPrediction::Raw, 3)
                 };
-                assert_eq!(
-                    record.len(),
-                    header + (count * bits).div_ceil(8),
-                    "dictionary size mismatch"
-                );
+                let end = header + (count * bits).div_ceil(8);
+                check_record_size(record, end);
                 Codec::Dictionary {
-                    entries: &record[header..],
+                    entries: &record[header..end],
                     count,
                     bits,
                     prediction,
@@ -655,6 +660,9 @@ impl<'a> Column<'a> {
         let width = usize::from(self.layout.width);
         match self.codec {
             Codec::Raw => encoded,
+            Codec::Exceptions(encoding) => {
+                encoding.decode(encoded, index, exceptions::ZERO_SPECIAL)
+            }
             Codec::Predicted(prediction) => {
                 restore(encoded, prediction.at(index, self.frame.len()), width)
             }
@@ -676,6 +684,10 @@ impl<'a> Column<'a> {
         let width = usize::from(self.layout.width);
         Some(match self.codec {
             Codec::Raw => value,
+            Codec::Exceptions(encoding) => {
+                let first = read_word(&self.frame.first()[self.layout.range()]);
+                return encoding.encode(value, index, first, exceptions::ZERO_SPECIAL);
+            }
             Codec::Predicted(prediction) => {
                 residual(value, prediction.at(index, self.frame.len()), width)
             }
@@ -756,8 +768,8 @@ impl Cost<'_> {
     fn size(&self, bits: usize, metadata: usize) -> usize {
         (payload_size(self.frame, self.total_bits - self.original_bits + bits)
             + self.footer
-            + metadata)
-            .div_ceil(2)
+            + record_storage_bytes(metadata))
+        .div_ceil(2)
             * 2
     }
 }
@@ -796,7 +808,7 @@ impl Candidate {
         let column_bytes = 2 * cost.width
             + ((cost.frame.length - 1) * varying_bits(self.mask, cost.width)).div_ceil(8)
             + 1
-            + self.record.len();
+            + record_storage_bytes(self.record.len());
         // Compare actual frame allocations to retain packing/alignment effects;
         // only the relative savings threshold is column-local.
         size.saturating_add(MIN_ENCODING_SAVINGS.max(column_bytes / 64)) <= self.size
@@ -811,7 +823,7 @@ impl Candidate {
         cost: &Cost<'_>,
         encode: impl Fn(u128, usize) -> u128,
     ) {
-        if record.len() > u8::MAX as usize || !self.worthwhile(cost.size(0, record.len()), cost) {
+        if record.len() > MAX_RECORD_BYTES || !self.worthwhile(cost.size(0, record.len()), cost) {
             return;
         }
         let first = encode(values[0], 0);
@@ -974,6 +986,11 @@ fn select(values: &[u128], layout: Layout, frame: &Frame, footer_bytes: usize) -
     // A compact arithmetic cycle is simpler than an identity dictionary.
     select_cycles(&mut best, values, layout, &cost);
     select_dictionary(&mut best, values, &cost);
+    if !layout.strings {
+        // Zero policy is supplied in code, never in a column descriptor/record.
+        // Keeping zero special also preserves duration open sentinels exactly.
+        ExceptionEncoding::fit(&mut best, values, &cost, exceptions::ZERO_SPECIAL);
+    }
     best
 }
 
@@ -1075,7 +1092,7 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
     {
         return;
     }
-    if record_bytes > u8::MAX as usize {
+    if record_bytes > MAX_RECORD_BYTES {
         return;
     }
     let base = *unique.iter().min().unwrap();
@@ -1153,7 +1170,8 @@ fn select_dictionary(best: &mut Candidate, values: &[u128], cost: &Cost<'_>) {
     }
 }
 
-/// Fit once at rollover. Greedy choices charge real frame packing, the shared
+/// Fit decoded columns at rollover or after an archived edit requires rebuilding.
+/// Greedy choices charge real frame packing, the shared
 /// directory, record sizes, and two-byte allocation rounding. Ties keep raw data.
 pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
     if frame.length == 0 || layout.is_empty() {
@@ -1191,13 +1209,16 @@ pub(crate) fn fit(frame: &mut Frame, trailer: &mut Vec<u8>, layout: &[Layout]) {
         let fits = payload_size(frame, bits)
             + trailer.len()
             + records.len()
-            + selected.record.len()
+            + record_storage_bytes(selected.record.len())
             + layout.len()
             <= u16::MAX as usize;
         if !selected.record.is_empty() && fits {
             rewrite(frame, column, |_, row, _| selected.encoded[row]);
-            sizes.push(selected.record.len() as u8);
+            let padded = record_storage_bytes(selected.record.len());
+            sizes.push((padded >> 1) as u8);
+            let end = records.len() + padded;
             records.extend_from_slice(&selected.record);
+            records.resize(end, 0);
         } else {
             sizes.push(0);
         }

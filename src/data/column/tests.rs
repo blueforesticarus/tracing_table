@@ -23,7 +23,7 @@ fn check(cache: &BlockCache, layout: &[Layout], expected: &[u128]) {
         if !p.row && p.stride == 0 {
             assert_eq!(
                 record.len(),
-                1 + usize::from(spec.width),
+                record_storage_bytes(1 + usize::from(spec.width)),
                 "flat fits must not retain cycle metadata"
             );
         }
@@ -50,6 +50,18 @@ fn tag(cache: &BlockCache, layout: &[Layout]) -> u8 {
         .first()
         .copied()
         .unwrap_or(0)
+}
+
+/// A rebuild must select exactly the codecs a fresh rollover would select on
+/// the edited values, rather than retaining a stale table or raw fallback.
+fn check_refit(cache: &BlockCache, expected: &[u128], width: usize, strings: bool) {
+    let (fresh, layout) = archive(expected, width, strings);
+    let actual = &cache.ring[0].data.frame;
+    let rebuilt = &fresh.ring[0].data.frame;
+    assert_eq!(actual.trailer(), rebuilt.trailer());
+    assert_eq!(&actual.mask()[..], &rebuilt.mask()[..]);
+    assert_eq!(actual.first(), rebuilt.first());
+    check(cache, &layout, expected);
 }
 
 fn irregular(count: usize, rows: usize, base: u128, step: u128) -> Vec<u128> {
@@ -124,15 +136,16 @@ fn near_ties_keep_raw_but_larger_savings_pay_for_an_origin() {
     // cannot save enough bytes to justify adding a codec and its footer.
     // Byte compaction already stores these values in one byte, so an origin
     // cannot improve even the larger block in that build.
-    let larger = if cfg!(feature = "bit-compression") {
-        OFFSET
-    } else {
-        0
-    };
-    for (rows, expected) in [(24, 0), (256, larger)] {
+    for rows in [24, 256] {
         let values = irregular(17, rows, 120, 1);
         let (cache, layout) = archive(&values, 2, false);
-        assert_eq!(tag(&cache, &layout), expected);
+        if rows == 256 && cfg!(feature = "bit-compression") {
+            // Record padding may favor unsigned minimum/exception storage
+            // over a signed origin; both must repay the same savings guard.
+            assert!(matches!(tag(&cache, &layout), OFFSET | exceptions::TAG));
+        } else {
+            assert_eq!(tag(&cache, &layout), 0);
+        }
         check(&cache, &layout, &values);
     }
 }
@@ -158,11 +171,12 @@ fn small_column_savings_are_independent_of_unrelated_payload_and_footer() {
         }
         for footer in [1, 4097] {
             let selected = select(&values, column, &frame, footer);
-            // Byte compaction cannot remove a single varying bit, so retains raw.
+            // Byte mode can now move these values into bit-packed exception
+            // patches, even though its row payload cannot remove one bit.
             let expected = if cfg!(feature = "bit-compression") {
                 OFFSET
             } else {
-                0
+                exceptions::TAG
             };
             assert_eq!(selected.record.first().copied().unwrap_or(0), expected);
         }
@@ -225,8 +239,7 @@ fn calculated_dictionary_size_matches_physical_key_packing() {
         // including its mask, dictionary record, directory and alignment.
         let physical = compact.compression_ratio().compressed
             + compact.unit()
-            + 3
-            + (count * bits).div_ceil(8)
+            + record_storage_bytes(3 + (count * bits).div_ceil(8))
             + 1;
         assert_eq!(calculated, physical.div_ceil(2) * 2, "count {count}");
     }
@@ -256,7 +269,7 @@ fn strings_keep_row_and_rotated_cyclic_row_encodings() {
             .next()
             .unwrap();
         // Row-only metadata has no FloatU16 stride; cycles add only period/phase.
-        assert_eq!(record.len(), if expected == ROW { 3 } else { 5 });
+        assert_eq!(record.len(), if expected == ROW { 4 } else { 6 });
     }
 }
 
@@ -286,7 +299,7 @@ fn general_fields_choose_exact_offset_or_custom_float_line() {
         let p = Prediction::parse(record, width);
         if expected == LINEAR {
             assert_eq!(p.origin, values[0]);
-            assert_eq!(record.len(), 1 + width + 2);
+            assert_eq!(record.len(), record_storage_bytes(1 + width + 2));
         }
     }
 }
@@ -339,12 +352,102 @@ fn dictionaries_preserve_all_counts_and_full_width_value_bits() {
             .map(|id| [maximum, 0, maximum / 2][id as usize])
             .collect();
         let (cache, layout) = archive(&values, 16, false);
-        assert!(matches!(
-            tag(&cache, &layout),
-            DICTIONARY | DICTIONARY_CYCLE
-        ));
         check(&cache, &layout, &values);
+        // Exception tables can now beat dictionaries on this sparse pattern.
+        // Exercise dictionary fitting directly to retain 127/128-bit table
+        // packing coverage independently of the overall selector's winner.
+        let mut frame = Frame::new(16, values.len());
+        for value in &values {
+            frame.push(&value.to_ne_bytes());
+        }
+        let original = read_word(frame.mask());
+        let cost = Cost {
+            frame: &frame,
+            total_bits: frame_bits(&frame),
+            original_bits: varying_bits(original, 16),
+            footer: 1,
+            width: 16,
+        };
+        let mut selected = Candidate {
+            record: SmallVec::new(),
+            encoded: SmallVec::new(),
+            mask: original,
+            size: cost.size(cost.original_bits, 0),
+        };
+        select_dictionary(&mut selected, &values, &cost);
+        assert!(matches!(selected.record[0], DICTIONARY | DICTIONARY_CYCLE));
+        rewrite(&mut frame, Layout::new(0, 16, false), |_, row, _| {
+            selected.encoded[row]
+        });
+        let frame = ArchivedFrame::new_from(&frame);
+        let column = Column::new(&frame, Layout::new(0, 16, false), &selected.record);
+        for (row, &value) in values.iter().enumerate() {
+            assert_eq!(column.read(row), value);
+        }
     }
+}
+
+#[test]
+fn exceptions_preserve_open_rows_low_edits_and_rebuild_for_late_closes() {
+    let base = 1u128 << 40;
+    let mut state = 7u64;
+    let mut expected: Vec<_> = (0..1024)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            base + u128::from((state >> 32) % 31)
+        })
+        .collect();
+    for row in [0, 55, 203] {
+        expected[row] = base + (1 << 30) + 17;
+    }
+    expected[1] = 0; // Open duration among already closed, clustered durations.
+    let (mut cache, layout) = archive(&expected, 8, false);
+    assert_eq!(tag(&cache, &layout), exceptions::TAG);
+    check(&cache, &layout, &expected);
+    let footer = cache.ring[0].data.frame.trailer().to_vec();
+    // A low-only edit to row zero must preserve its full first-offset high bits.
+    expected[0] += 1;
+    write_word(
+        &mut cache.get_mut(1, &layout).unwrap().1.get_mut()[1..9],
+        expected[0],
+    );
+    assert_eq!(cache.ring[0].data.frame.trailer(), footer);
+    check(&cache, &layout, &expected);
+    // A late close with a previously absent high value must refit the table,
+    // retaining every other row, including the exceptional first row.
+    expected[1] = base + (1 << 35);
+    {
+        let block = &cache.ring[0].data;
+        let (column, record) = block.column_metadata(&layout).entries().next().unwrap();
+        assert!(
+            Column::new(&block.frame, column, record)
+                .encode(expected[1], 1)
+                .is_none(),
+            "record {record:?}"
+        );
+    }
+    write_word(
+        &mut cache.get_mut(2, &layout).unwrap().1.get_mut()[1..9],
+        expected[1],
+    );
+    assert_eq!(tag(&cache, &layout), exceptions::TAG);
+    check_refit(&cache, &expected, 8, false);
+}
+
+#[test]
+fn plain_archived_duration_close_refits_like_rollover() {
+    // Entirely open blocks have no column codec. The first late close changes
+    // omitted constant bits and must enter the same fitter as a table miss.
+    let mut expected = vec![0u128; 1024];
+    let (mut cache, layout) = archive(&expected, 8, false);
+    assert_eq!(tag(&cache, &layout), 0);
+    expected[73] = (1 << 40) + 17;
+    write_word(
+        &mut cache.get_mut(74, &layout).unwrap().1.get_mut()[1..9],
+        expected[73],
+    );
+    assert_ne!(tag(&cache, &layout), 0);
+    check_refit(&cache, &expected, 8, false);
 }
 
 #[test]
@@ -373,22 +476,21 @@ fn dictionary_stride_compresses_slow_runs_and_survives_archived_edits() {
     let (mut cache, layout) = archive(&values, 8, false);
     assert_eq!(tag(&cache, &layout), DICTIONARY_STRIDE);
     check(&cache, &layout, &values);
-    let footer = cache.ring[0].data.frame.trailer().to_vec();
+    // This known entry widens the predicted-key mask, so the rebuild refits
+    // discovery-order keys just as a fresh rollover of the edited rows would.
     values[100] = entries[9];
     write_word(
         &mut cache.get_mut(101, &layout).unwrap().1.get_mut()[1..9],
         values[100],
     );
-    assert_eq!(cache.ring[0].data.frame.trailer(), footer);
-    check(&cache, &layout, &values);
-    // New entries must remove this dictionary variant too, preserving all rows.
+    check_refit(&cache, &values, 8, false);
+    // New entries must refit this dictionary variant too, preserving all rows.
     values[101] = u128::from(u64::MAX);
     write_word(
         &mut cache.get_mut(102, &layout).unwrap().1.get_mut()[1..9],
         values[101],
     );
-    assert_eq!(tag(&cache, &layout), 0);
-    check(&cache, &layout, &values);
+    check_refit(&cache, &values, 8, false);
 }
 
 #[test]
@@ -458,7 +560,8 @@ fn dictionary_edits_preserve_other_predictions_and_structural_metadata() {
         expected[17],
     );
     assert_eq!(cache.ring[0].data.frame.trailer(), footer);
-    // A new value below the minimum drops dictionaries, retaining the row predictor.
+    // A new value below the minimum refits columns without changing structural
+    // timestamp/parent encodings or the unrelated column's decoded values.
     expected[4] = 7;
     write_word(
         &mut cache.get_mut(5, &columns).unwrap().1.get_mut()[18..20],
@@ -470,7 +573,7 @@ fn dictionary_edits_preserve_other_predictions_and_structural_metadata() {
         .entries()
         .map(|(_, r)| r)
         .collect();
-    assert!(records[0].is_empty());
+    assert!(matches!(records[0][0], DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE));
     assert_eq!(records[1][0], ROW);
     let mut bytes = [0; 22];
     for (row, &value) in expected.iter().enumerate() {
@@ -506,8 +609,7 @@ fn changing_dictionary_row_zero_rebuilds_without_changing_other_rows() {
         &mut cache.get_mut(1, &layout).unwrap().1.get_mut()[1..3],
         expected[0],
     );
-    assert_eq!(tag(&cache, &layout), 0);
-    check(&cache, &layout, &expected);
+    check_refit(&cache, &expected, 2, true);
 }
 
 #[test]
@@ -527,9 +629,46 @@ fn oversized_dictionary_records_fall_back_and_malformed_sizes_are_rejected() {
         .entries()
         .next()
         .unwrap();
-    assert!(record.len() <= 255);
+    assert!(record.len() <= MAX_RECORD_BYTES);
     check(&cache, &layout, &values);
     assert!(std::panic::catch_unwind(|| Metadata::split(&[255], &layout)).is_err());
+}
+
+#[test]
+fn word_sized_directory_round_trips_a_510_byte_record() {
+    // 39 entries * 104 bits = 507 table bytes, plus the three-byte dictionary
+    // header. This exactly fills size byte 255, well beyond the old limit.
+    let mut distinct = vec![0u128];
+    let mut state = 7u128;
+    for _ in 1..39 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        distinct.push((1u128 << 103) | (state & ((1u128 << 103) - 1)));
+    }
+    let values: Vec<_> = irregular(39, 1024, 0, 1)
+        .into_iter()
+        .map(|id| distinct[id as usize])
+        .collect();
+    let (cache, layout) = archive(&values, 16, false);
+    let block = &cache.ring[0].data;
+    let (_, record) = block.column_metadata(&layout).entries().next().unwrap();
+    assert_eq!(record[0], DICTIONARY);
+    assert_eq!(record.len(), 510);
+    assert_eq!(block.frame.trailer().last(), Some(&255));
+    check(&cache, &layout, &values);
+}
+
+#[test]
+fn odd_codec_records_have_one_zero_padding_byte_and_word_directory_units() {
+    let values: Vec<_> = (0..1024).map(|row| 2000 + row).collect();
+    let (cache, layout) = archive(&values, 2, true);
+    let block = &cache.ring[0].data;
+    let (_, record) = block.column_metadata(&layout).entries().next().unwrap();
+    assert_eq!(record, &[ROW, 0xd0, 7, 0]); // Three bytes of row-codec data.
+    assert_eq!(block.frame.trailer().last(), Some(&2)); // Four bytes / two.
+    check(&cache, &layout, &values);
+    assert!(std::panic::catch_unwind(|| Prediction::parse(&[ROW, 0xd0, 7, 1], 2)).is_err());
 }
 
 #[test]

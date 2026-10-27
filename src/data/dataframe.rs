@@ -62,49 +62,47 @@ impl AnyFrame<'_> {
                 **frame = BitCompactFrame::new_from_with_trailer(&unpacked, frame.trailer());
             }
             Self::Archived(block, columns) => {
-                // Public rows contain decoded field values. Preserve immutable codecs;
-                // a new dictionary value/base requires reconstruction and codec removal.
+                // Keep edits in place when both the current codecs and mask accept
+                // them. Failed encoding or newly varying bits require a refit.
                 let mut encoded;
-                let row = if !block.column_metadata(columns).has_encodings() {
-                    row // Preserve the no-copy close/edit path for plain structural rows.
+                let written = if !block.column_metadata(columns).has_encodings() {
+                    // Preserve the no-copy close/edit path for plain structural rows.
+                    block.frame.try_write_row(index, row).is_ok()
                 } else {
                     encoded = StackVec::<128, u128>::new(row);
-                    if !block
+                    block
                         .column_metadata(columns)
                         .encode(&block.frame, &mut encoded, index)
-                    {
-                        let parents = block.parent_offsets(columns).len()
-                            * super::blockbuffer::ParentOffsets::ENTRY_BYTES;
-                        let trailer = block
-                            .column_metadata(columns)
-                            .without_dictionaries(&block.frame.trailer()[..parents]);
-                        let preserved = super::column::Metadata::split(&trailer, columns).1;
-                        let mut unpacked = Frame::new(block.frame.unit(), block.frame.len());
-                        let mut logical = StackVec::<128, u128>::new(row);
-                        for ordinal in 0..block.frame.len() {
-                            block.read_row(ordinal, &mut logical, columns);
-                            if ordinal == index {
-                                logical.copy_from_slice(row);
-                            }
-                            assert!(preserved.encode(&block.frame, &mut logical, ordinal));
-                            unpacked.push(&logical);
-                        }
-                        let metadata = std::mem::take(&mut block.metadata);
-                        **block = ArchivedBlock::new_with_trailer(&unpacked, metadata, &trailer);
-                        return;
-                    }
-                    &*encoded
+                        && block.frame.try_write_row(index, &encoded).is_ok()
                 };
-                if block.frame.try_write_row(index, row).is_ok() {
+                if written {
                     return;
                 }
+
+                // Decode every selectable column before fitting, just as at
+                // rollover; fitting already encoded words would double-encode.
+                // Timestamp and parent predictors are outside these columns:
+                // retain their physical values, metadata and exact footer prefix.
+                let mut trailer = super::column::Metadata::split(block.frame.trailer(), columns)
+                    .0
+                    .to_vec();
                 let mut unpacked = Frame::new(block.frame.unit(), block.frame.len());
-                block.frame.uncompact(&mut unpacked);
-                AnyFrame::Frame(&mut unpacked).write_row(index, row);
-                // Rebuilding replaces only the archive; Data's descriptor stays put.
+                let mut logical = StackVec::<128, u128>::new(row);
+                // TODO: Decode/refit only the edited column (usually duration),
+                // retaining other column encodings. Rows share one packed bit
+                // stream and footer, so replacing it still needs a frame rebuild.
+                for ordinal in 0..block.frame.len() {
+                    block.read_row(ordinal, &mut logical, columns);
+                    if ordinal == index {
+                        logical.copy_from_slice(row);
+                    }
+                    unpacked.push(&logical);
+                }
+                super::column::fit(&mut unpacked, &mut trailer, columns);
+                // Replacing the archive retains structural predictors, deferred
+                // references and the original Data descriptor.
                 let metadata = std::mem::take(&mut block.metadata);
-                **block =
-                    ArchivedBlock::new_with_trailer(&unpacked, metadata, block.frame.trailer());
+                **block = ArchivedBlock::new_with_trailer(&unpacked, metadata, &trailer);
             }
         }
     }

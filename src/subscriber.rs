@@ -1871,7 +1871,11 @@ mod test {
                     .data
                     .column_metadata(&layout)
                     .entries()
-                    .any(|(column, record)| column.offset == 8 && record.first() == Some(&1))
+                    .any(|(column, record)| {
+                        // Signed origins and minimum-based exceptions both
+                        // remove the large common duration without losing ticks.
+                        column.offset == 8 && matches!(record.first().copied(), Some(1 | 9))
+                    })
             }));
         }
         // Exercise editing an origin-encoded duration and an archived open slot.

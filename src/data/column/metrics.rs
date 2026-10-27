@@ -375,8 +375,32 @@ pub fn write_recording(
                         }
                     }
                     if let Some(&tag) = record.first() {
+                        let payload = record_payload_bytes(record, retained_width, frame.len());
+                        emit(
+                            "record_padding",
+                            None,
+                            0,
+                            (record.len() - payload) * 8,
+                            0,
+                            0,
+                        )?;
+                        let record = &record[..payload];
                         emit("encoding_tag", None, 0, 8, 0, 0)?;
                         match tag {
+                            exceptions::TAG => {
+                                // The tag was charged above; remaining header
+                                // flags/count/width occupy exactly three bytes.
+                                emit("exception_header", None, 0, 24, 0, 0)?;
+                                emit("exact_offset", None, 0, retained_width * 8, 0, 0)?;
+                                emit(
+                                    "exception_tables",
+                                    None,
+                                    0,
+                                    (record.len() - 4 - retained_width) * 8,
+                                    0,
+                                    0,
+                                )?;
+                            }
                             DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE => {
                                 let count = usize::from(record[1]);
                                 let bits = usize::from(record[2]);
@@ -470,7 +494,47 @@ fn encoding(record: &[u8]) -> &'static str {
         Some(DICTIONARY) => "dictionary",
         Some(DICTIONARY_CYCLE) => "dictionary+cycle",
         Some(DICTIONARY_STRIDE) => "dictionary+stride",
+        Some(exceptions::TAG) => "offset+exceptions",
         _ => unreachable!("validated codec"),
+    }
+}
+
+/// Codec sections already round their bit arrays to bytes. The size directory
+/// additionally rounds the complete record to two bytes; account for that byte
+/// separately rather than charging it to a coefficient or exception table.
+fn record_payload_bytes(record: &[u8], width: usize, rows: usize) -> usize {
+    let tag = record[0] & 127;
+    match tag {
+        DICTIONARY | DICTIONARY_CYCLE | DICTIONARY_STRIDE => {
+            let header = if tag == DICTIONARY { 3 } else { 5 };
+            header + (usize::from(record[1]) * usize::from(record[2])).div_ceil(8)
+        }
+        exceptions::TAG => {
+            let split = usize::from(record[1] & 127);
+            let count = usize::from(record[2]);
+            let positions = if record[1] & 128 != 0 {
+                rows
+            } else {
+                count * (usize::BITS - (rows - 1).leading_zeros()) as usize
+            };
+            4 + width
+                + if record[3] & 128 != 0 {
+                    (width * 8 - split).div_ceil(8)
+                } else {
+                    0
+                }
+                + positions.div_ceil(8)
+                + (count * usize::from(record[3] & 127)).div_ceil(8)
+        }
+        _ => {
+            1 + width
+                + if matches!(tag, LINEAR | CYCLE) { 2 } else { 0 }
+                + if matches!(tag, CYCLE | ROW_CYCLE) {
+                    2
+                } else {
+                    0
+                }
+        }
     }
 }
 
@@ -515,6 +579,9 @@ mod tests {
                         value = row % 17,
                         copy = row % 17,
                         flag = row % 2 == 0,
+                        // Force an exception-coded physical field so its exact
+                        // four-byte header/tables participate in reconciliation.
+                        sparse = (1u64 << 40) + if row % 127 == 0 { 1 << 30 } else { row % 31 },
                         signed = if row % 2 == 0 { 1i64 } else { -1i64 }
                     );
                 }
@@ -547,6 +614,7 @@ mod tests {
         assert_eq!(snapshot(), before);
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("\"alias\""));
+        assert!(text.contains("offset+exceptions"));
         let mut retained = 0;
         let mut signed_seen = false;
         for row in text.lines().skip(1) {

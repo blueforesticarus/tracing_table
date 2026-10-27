@@ -141,16 +141,14 @@ keeps direct IDs, and a nonzero period selects ZigZag ID residuals against
 `((row + phase) % period) - phase`, whose first prediction is zero. There is no
 stored additive origin for dictionary IDs.
 
-Dictionary entries follow the parent/predictor prefix, then alignment padding,
-one backward halfword pointer per selected field, and the terminal u8 field mask.
-Pointers measure distance from that mask byte; their maximum value represents
-510 bytes. The farthest pointer locates the preceding predictor count, so both
-sections remain independently readable. The first eight string-field/template
-argument positions are eligible; wider schemas and dictionaries that exceed the
-shared 512-byte window retain their existing encoding. Zero masks cost one byte;
-generic frames with no strings or parents retain an empty footer. An edit to a
-new dictionary value or to row zero's dictionary ID rebuilds ordinary indices
-while retaining parent and offset/cycle coefficients.
+Column encoding records follow the parent/predictor prefix and precede a directory
+with one size byte per selectable column. Each byte stores the record length in
+two-byte units (`size_byte << 1`), with zero meaning no encoding. Odd-length
+records have one trailing zero padding byte, allowing up to **510 bytes per
+record**. The combined footer is not restricted to a shared 512-byte window;
+the existing overall frame-size limit still applies. An edit outside a dictionary
+or exception table rebuilds ordinary values while retaining parent and
+offset/cycle coefficients.
 [Dictionary layout, measurements and verification](doc/string_dictionary_2026-10-24.md).
 
 Bit-compacted frames store the packed-row stride as `u16`: at most **65,535
@@ -203,19 +201,6 @@ offsets. Enabled blocks store exact ZigZag residuals from the decoded predictor.
 Only timestamp mask bits are recomputed. Readers use the frame's existing row
 count; archived edits retain the fitted stride, and late span closes only extend
 the timestamp range. Span ends store duration + 1, with zero reserved for an open span.
-
-Set `RecordingLayer::parent_timestamp_offsets = true` before registration, or
-`PARENT_TIMESTAMP_OFFSETS=on`, to try parent-relative archived starts. Parented
-active rows keep an extra trailing `u64` containing the exact parent start; this
-scratch column is omitted from every archive. At rollover, complete aligned
-absolute and parent-relative block allocations are compared, including payload
-codecs and trailers. Parent offsets are selected only when strictly smaller;
-ties, unavailable parent starts and negative offsets retain the current scheme.
-Parentless rows keep the current scheme. `ReplayOptions::parent_timestamp_offsets`
-accepts `Some(true/false)` for paired replay without changing the environment.
-Readers resolve elapsed starts through retained parent rows. Eviction is unchanged:
-a missing parent makes the child's absolute timestamp (and closed end time)
-unavailable. No parent pinning or retained expanded timestamp cache is introduced.
 
 Event id's are assigned as per-archetype sequential counters, to maximise how many bytes can be compacted. Archetypes ids themselves are also sequential.
 
@@ -1384,3 +1369,34 @@ switching string buffer to per callsite not per arch could help here but the pro
 | Actix spans | 22.18 | 14.66 | **14.54** |
 | Bevy all starts | 16.96 | 14.80 | **13.81** |
 | Actix all starts | 19.51 | 17.55 | **17.53** |
+
+# exception encoding (span duration)
+span duration stored as offset = val - min + 1 with table of exceptions
+- An exceptional row occupies the same number of frame bits as any other row. Only its low portion remains in the frame; its high portion moves to the footer.
+- zero (open span) continues to be treated special
+- tries every exeception dict width, filtering plausible splits could be improved
+
+layout of footer
+| Order | Field | Size |
+|---|---|---:|
+| 1 | Codec tag (`9`) | 8 bits |
+| 2 | Position mode: `0` list, `1` bitmap | 1 bit |
+| 2 | Low-bit split width, **S** | 7 bits |
+| 3 | Exception count, **E** | 8 bits |
+| 4 | Exception-high minimum present | 1 bit |
+| 4 | Patch width, **P** | 7 bits |
+| 5 | Global minimum | **64 bits for durations** |
+| 6 | Optional exception-high minimum | **64 − S bits**, byte-rounded |
+| 7 | Exception positions | See below |
+| 8 | Exception-high offsets | **E × P bits**, byte-rounded |
+
+Position storage is either:
+- List: E sorted, zero-based row indices, each ceil(log₂ row_count) bits.
+- Bitmap: one bit per frame row.
+
+| Component | Before | After | Change | Change % |
+|---|---:|---:|---:|---:|
+| Footer | 1.049 | 1.731 | +0.682 | +65.01% |
+| Frame | 7.798 | 6.066 | −1.732 | −22.22% |
+| **Total** | **8.847** | **7.796** | **−1.051** | **−11.87%** |
+

@@ -372,6 +372,7 @@ pub mod collect {
         "component",
         "first_bytes",
         "mask_bytes",
+        "footer_bytes",
         "varying_bits",
         "padding_bytes",
         "compressed_bytes",
@@ -821,6 +822,15 @@ pub mod collect {
                         if !arch.archetype.is_event && !arch.archetype.is_span_end {
                             span_starts += rows;
                         }
+                        // Charge directory and codec bytes to the owning physical field;
+                        // shared parent tables are divided among reference fields.
+                        let footers: Vec<_> = block.data.column_metadata(columns).entries()
+                            .map(|(layout, record)| (layout.range(), 1 + record.len())).collect();
+                        let parent_bytes = block.data.parent_offsets(columns).len()
+                            * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES;
+                        let references = physical_parts.iter()
+                            .filter(|part| part.name.ends_with(".table_index")).count();
+                        let mut attributed_footer = 0.0;
                         let mut attributed_bits = 0;
                         for part in &physical_parts {
                             let part_bits: usize = frame.mask()[part.range.clone()]
@@ -835,6 +845,13 @@ pub mod collect {
                             } else {
                                 padding as f64 / 8.0 * part_bits as f64 / bits as f64
                             };
+                            let mut footer = footers.iter()
+                                .filter(|(range, _)| part.range.contains(&range.start))
+                                .map(|(_, bytes)| *bytes as f64).sum::<f64>();
+                            if part.name.ends_with(".table_index") {
+                                footer += parent_bytes as f64 / references as f64;
+                            }
+                            attributed_footer += footer;
                             attributed_bits += part_bits;
                             output.row(
                                 &block_identity,
@@ -843,6 +860,7 @@ pub mod collect {
                                     ("component", part.name.clone()),
                                     ("first_bytes", part.range.len().to_string()),
                                     ("mask_bytes", part.range.len().to_string()),
+                                    ("footer_bytes", format!("{footer:.12}")),
                                     ("varying_bits", (part_bits * (rows - 1)).to_string()),
                                     ("padding_bytes", format!("{share:.12}")),
                                     ("column_values", rows.to_string()),
@@ -850,17 +868,8 @@ pub mod collect {
                             )?;
                         }
                         assert_eq!(attributed_bits, bits);
-                        let ends = block.data.parent_offsets(columns).len()
-                            * tracing_table::data::blockbuffer::ParentOffsets::ENTRY_BYTES
-                            + block.data.column_footer_bytes(columns);
-                        output.row(
-                            &block_identity,
-                            &[
-                                ("group", "end_buffer".into()),
-                                ("component", "end_buffer".into()),
-                                ("compressed_bytes", ends.to_string()),
-                            ],
-                        )?;
+                        assert!((attributed_footer - (parent_bytes
+                            + block.data.column_footer_bytes(columns)) as f64).abs() < 1e-6);
                         if !ranges.is_empty() {
                             buffers.insert(block.data.metadata.string_buffer);
                             if block.data.metadata.string_buffer == arch.strings.active_index() {
