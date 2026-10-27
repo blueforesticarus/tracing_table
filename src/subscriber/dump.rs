@@ -2,9 +2,10 @@
 //!
 //! dump and replay for benchmark
 //!
-//! Version 3 input capture: MessagePack arrays in a checksummed LZ4 frame.
-//! Recipes and typed arguments survive alongside rendered inputs, allowing all
-//! replay modes from one capture. Older rendered-only fixtures are rejected.
+//! Version 4 input capture: MessagePack arrays in a checksummed LZ4 frame.
+//! Recipes (template source, argument names and kinds) and typed arguments
+//! survive alongside rendered inputs, allowing all replay modes from one capture.
+//! Recipes are reparsed on load. Older fixtures are rejected.
 use super::{
     FieldValues, InputValue, RecordingLayer, SpanId, Time, log_callsite_adapter,
     template::CompiledTemplate,
@@ -24,6 +25,9 @@ use tracing_core::{Callsite, Kind, callsite::Identifier};
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 mod formats;
+
+// v4 recipes are a source, argument names, and argument kinds.
+const FORMAT_VERSION: u64 = 4;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -243,7 +247,7 @@ struct CaptureState<W: Write> {
     output: Option<CountWriter<FrameEncoder<W>>>,
     sites: HashMap<usize, u64>,
     // Recipe IDs are global; lookup stays local to one callsite/field.
-    formats: HashMap<(u64, usize), Vec<(u64, Arc<super::format::Format>)>>,
+    formats: HashMap<(u64, usize), Vec<(u64, introspect_fmt::Recipe)>>,
     format_count: u64,
     records: u64,
     next_span: u64,
@@ -268,7 +272,8 @@ struct RecordingSpan {
 impl<W: Write> CaptureState<W> {
     fn formats(&mut self, site: u64, visitor: &InputVisitor) -> io::Result<Mp> {
         let mut values = Vec::new();
-        for (field, recipe, arguments) in &visitor.formats {
+        for format in &visitor.formats {
+            let (field, recipe) = (&format.field, &format.recipe);
             let existing = self.formats.get(&(site, *field)).and_then(|entries| {
                 entries
                     .iter()
@@ -284,7 +289,7 @@ impl<W: Write> CaptureState<W> {
                     id.into(),
                     site.into(),
                     (*field as u64).into(),
-                    formats::encode(recipe),
+                    formats::encode(recipe, &format.names),
                 ]))?;
                 self.formats
                     .entry((site, *field))
@@ -295,7 +300,7 @@ impl<W: Write> CaptureState<W> {
             };
             values.push(array([
                 id.into(),
-                encode_fields(&arguments.iter().cloned().map(Some).collect::<Vec<_>>()),
+                encode_fields(&format.values.iter().cloned().map(Some).collect::<Vec<_>>()),
             ]));
         }
         Ok(array(values))
@@ -377,7 +382,7 @@ impl<W: Write + Send> Capture<W> {
             .to_string();
         state.write(array([
             "tracing_table.input".into(),
-            3.into(),
+            FORMAT_VERSION.into(),
             timestamp_bit_shift.into(),
             origin.into(),
         ]))?;
@@ -703,7 +708,7 @@ pub struct Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedFormat {
     pub field: usize,
-    pub recipe: Arc<super::format::Format>,
+    pub recipe: introspect_fmt::Recipe,
     pub values: Vec<InputValue>,
 }
 
@@ -832,9 +837,12 @@ impl Fixture {
         };
         let header = next(&mut input)?;
         let h = items(&header)?;
-        if h.len() != 4 || string(&h[0])? != "tracing_table.input" || number(&h[1])? != 3 {
+        if h.len() != 4
+            || string(&h[0])? != "tracing_table.input"
+            || number(&h[1])? != FORMAT_VERSION
+        {
             return Err(invalid(
-                "expected v3 replay fixture with Format arguments; regenerate older captures",
+                "expected v4 replay fixture; regenerate older captures",
             ));
         }
         let shift = u8::try_from(number(&h[2])?).map_err(io::Error::other)?;
@@ -1125,7 +1133,7 @@ impl Fixture {
                     .iter()
                     .nth(format.field)
                     .expect("validated format field");
-                visitor.record_format(&field, format.recipe.clone(), format.values.clone());
+                visitor.record_inputs(&field, &format.recipe, &format.values);
             }
         }
     }

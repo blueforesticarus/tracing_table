@@ -33,7 +33,7 @@ capture-bevy:
 	cargo run --locked --manifest-path examples/bevy_capture/Cargo.toml
 
 # Collect both reference inputs by default; publish only a successful CSV.
-# One v3 capture supports every mode: FORMAT_ARGS=off TEMPLATES=on|off.
+# One v4 capture supports every mode: FORMAT_ARGS=off TEMPLATES=on|off.
 FORMAT_ARGS ?= on
 TEMPLATES ?= on
 MIN_BLOCK_ROWS ?= 0

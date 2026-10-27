@@ -12,6 +12,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+pub use introspect_fmt::Recipe;
 use parking_lot::{ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
 use smallvec::SmallVec;
 use tracing::{
@@ -40,7 +41,6 @@ use storage::{BlockCache, CallsiteArchetype};
 
 // Portable capture/loading is opt-in; live recording does not depend on its state.
 pub mod dump;
-pub mod format;
 pub mod read;
 mod value;
 pub use value::InputValue;
@@ -73,7 +73,7 @@ pub struct PerCallsiteData {
     /// Legacy rendered-message matcher; native inspectable formats use `formats`.
     pub template: Option<template::CompiledTemplate>,
     /// Directly captured formatting schemas, shared by every row at this callsite.
-    pub formats: Vec<Arc<format::Format>>,
+    pub formats: Vec<Recipe>,
     /// Fixed at registration so previously stored rows keep their interpretation.
     pub string_storage: StringStorage,
     // Weak entries resolve archived parent-relative starts without retaining
@@ -1266,12 +1266,12 @@ struct FieldValues {
     strings: Vec<String>,
     // Rendered captures are packed only when the selected archetype uses a template.
     template_args: Vec<String>,
-    // Deferred updates retain recipes until close; live rows share callsite Arcs.
+    // Deferred updates retain recipes until close; literal templates are static.
     formats: Vec<RecordedFormat>,
 }
 struct RecordedFormat {
     field: usize,
-    recipe: Arc<format::Format>,
+    recipe: Recipe,
     start: usize,
 }
 impl FieldValues {
@@ -1279,7 +1279,7 @@ impl FieldValues {
     fn clear_format(&mut self, field: usize) {
         if let Some(index) = self.formats.iter().position(|format| format.field == field) {
             let format = self.formats.remove(index);
-            let end = format.start + format.recipe.template.value_count();
+            let end = format.start + format.recipe.value_count();
             // Compact deferred updates instead of retaining dead argument columns
             // after every overwrite of a long-lived span field.
             self.values.drain(format.start..end);
@@ -1291,13 +1291,13 @@ impl FieldValues {
             }
         }
     }
-    fn format_schema(&self, recipes: &mut Vec<Arc<format::Format>>) -> Vec<(usize, usize, usize)> {
+    fn format_schema(&self, recipes: &mut Vec<Recipe>) -> Vec<(usize, usize, usize)> {
         self.formats
             .iter()
             .map(|format| {
                 let recipe = recipes
                     .iter()
-                    .position(|r| Arc::ptr_eq(r, &format.recipe) || **r == *format.recipe)
+                    .position(|r| *r == format.recipe)
                     .unwrap_or_else(|| {
                         recipes.push(format.recipe.clone());
                         recipes.len() - 1
@@ -1369,68 +1369,102 @@ struct ValueRecorder<'a> {
     template: Option<&'a template::CompiledTemplate>,
     // Preserve a successful zero-argument match without storing the message field index.
     template_arg_count: Option<usize>,
-    formats: Option<&'a mut Vec<Arc<format::Format>>>,
+    formats: Option<&'a mut Vec<Recipe>>,
+}
+
+// Arguments share ordinary typed columns; strings are interned only after
+// selecting the destination archetype and its current buffer.
+struct FormatArguments<'a>(&'a mut FieldValues);
+impl FormatArguments<'_> {
+    fn push(&mut self, value: ValueData) -> &mut String {
+        let data = &mut *self.0;
+        let index = data.values.len();
+        data.values.push(Some(value));
+        if index >= data.strings.len() {
+            data.strings.push(String::new());
+        }
+        let text = &mut data.strings[index];
+        text.clear();
+        text
+    }
+    fn push_text(&mut self) -> &mut String {
+        // Keep the placeholder's type identical to the eventual stored reference.
+        let value = match self.0.string_storage {
+            StringStorage::Offset => ValueData::BufferOffset(0),
+            StringStorage::Index => ValueData::BufferIndex(0),
+        };
+        self.push(value)
+    }
+    // Replayed snapshots take the same packing path as live capture.
+    fn input(&mut self, value: &InputValue) {
+        let value = match *value {
+            InputValue::I8(v) => ValueData::I8(v),
+            InputValue::I16(v) => ValueData::I16(v),
+            InputValue::I32(v) => ValueData::I32(v),
+            InputValue::Isize(v) => ValueData::Isize(v),
+            InputValue::U8(v) => ValueData::U8(v),
+            InputValue::U16(v) => ValueData::U16(v),
+            InputValue::U32(v) => ValueData::U32(v),
+            InputValue::Usize(v) => ValueData::Usize(v),
+            InputValue::F32(v) => ValueData::F32(f32::from_bits(v)),
+            InputValue::Char(v) => ValueData::Char(v),
+            InputValue::F64(v) => ValueData::F64(f64::from_bits(v)),
+            InputValue::I64(v) => ValueData::I64(v),
+            InputValue::U64(v) => ValueData::U64(v),
+            InputValue::I128(v) => ValueData::I128(v),
+            InputValue::U128(v) => ValueData::U128(v),
+            InputValue::Bool(v) => ValueData::Bool(v),
+            InputValue::Text(ref v) => return self.push_text().push_str(v),
+            InputValue::Bytes(_) => unreachable!("format arguments are primitive or textual"),
+        };
+        self.push(value);
+    }
+}
+impl introspect_fmt::CaptureSink for FormatArguments<'_> {
+    // Capture the actual primitive layout before choosing block capacity.
+    fn value(&mut self, value: &introspect_fmt::Value<'_>) {
+        use introspect_fmt::Value;
+        let value = match *value {
+            Value::I8(v) => ValueData::I8(*v),
+            Value::I16(v) => ValueData::I16(*v),
+            Value::I32(v) => ValueData::I32(*v),
+            Value::Isize(v) => ValueData::Isize(*v),
+            Value::U8(v) => ValueData::U8(*v),
+            Value::U16(v) => ValueData::U16(*v),
+            Value::U32(v) => ValueData::U32(*v),
+            Value::Usize(v) => ValueData::Usize(*v),
+            Value::F32(v) => ValueData::F32(*v),
+            Value::Char(v) => ValueData::Char(*v),
+            Value::F64(v) => ValueData::F64(*v),
+            Value::I64(v) => ValueData::I64(*v),
+            Value::U64(v) => ValueData::U64(*v),
+            Value::I128(v) => ValueData::I128(*v),
+            Value::U128(v) => ValueData::U128(*v),
+            Value::Bool(v) => ValueData::Bool(*v),
+            Value::Str(v) => return self.push_text().push_str(v),
+            Value::Opaque(_) => unreachable!("opaque arguments are captured as text"),
+        };
+        self.push(value);
+    }
+    fn text(&mut self) -> &mut String {
+        self.push_text()
+    }
 }
 
 impl ValueRecorder<'_> {
-    // The comparison capture snapshots user formatting once, then shares the
-    // owned arguments with this same packing path used by visit_format.
+    // Live capture and replayed snapshots share this packing path; `capture`
+    // appends the recipe's argument columns after the metadata fields.
+    // Callers have already registered the recipe with the callsite.
     fn record_format(
         &mut self,
         field: &tracing_core::Field,
-        recipe: Arc<format::Format>,
-        values: Vec<InputValue>,
+        recipe: Recipe,
+        capture: impl FnOnce(&Recipe, &mut FormatArguments<'_>),
     ) {
-        if let Some(recipes) = &mut self.formats {
-            if !recipes
-                .iter()
-                .any(|r| Arc::ptr_eq(r, &recipe) || **r == *recipe)
-            {
-                recipes.push(recipe.clone());
-            }
-        }
         self.data.clear_format(field.index());
         self.data.values[field.index()] = None;
         let start = self.data.values.len();
-        // Arguments share ordinary typed columns; strings are interned only after
-        // selecting the destination archetype and its current buffer.
-        for value in values {
-            let (value, text) = match value {
-                // Capture the actual primitive layout before choosing block capacity.
-                InputValue::I8(v) => (ValueData::I8(v), String::new()),
-                InputValue::I16(v) => (ValueData::I16(v), String::new()),
-                InputValue::I32(v) => (ValueData::I32(v), String::new()),
-                InputValue::Isize(v) => (ValueData::Isize(v), String::new()),
-                InputValue::U8(v) => (ValueData::U8(v), String::new()),
-                InputValue::U16(v) => (ValueData::U16(v), String::new()),
-                InputValue::U32(v) => (ValueData::U32(v), String::new()),
-                InputValue::Usize(v) => (ValueData::Usize(v), String::new()),
-                InputValue::F32(v) => (ValueData::F32(f32::from_bits(v)), String::new()),
-                InputValue::Char(v) => (ValueData::Char(v), String::new()),
-                InputValue::F64(v) => (ValueData::F64(f64::from_bits(v)), String::new()),
-                InputValue::I64(v) => (ValueData::I64(v), String::new()),
-                InputValue::U64(v) => (ValueData::U64(v), String::new()),
-                InputValue::I128(v) => (ValueData::I128(v), String::new()),
-                InputValue::U128(v) => (ValueData::U128(v), String::new()),
-                InputValue::Bool(v) => (ValueData::Bool(v), String::new()),
-                InputValue::Text(v) => (
-                    match self.data.string_storage {
-                        StringStorage::Offset => ValueData::BufferOffset(0),
-                        StringStorage::Index => ValueData::BufferIndex(0),
-                    },
-                    v,
-                ),
-                InputValue::Bytes(_) => unreachable!("format arguments are primitive or textual"),
-            };
-            let index = self.data.values.len();
-            self.data.values.push(Some(value));
-            if let Some(scratch) = self.data.strings.get_mut(index) {
-                scratch.clear();
-                scratch.push_str(&text);
-            } else {
-                self.data.strings.push(text);
-            }
-        }
+        capture(&recipe, &mut FormatArguments(self.data));
         self.data.formats.push(RecordedFormat {
             field: field.index(),
             recipe,
@@ -1440,6 +1474,25 @@ impl ValueRecorder<'_> {
         if field.name() == "message" {
             self.template_arg_count = None;
         }
+    }
+
+    // Replayed snapshots may come from another recorder, so compare by value.
+    fn record_inputs(
+        &mut self,
+        field: &tracing_core::Field,
+        recipe: &Recipe,
+        values: &[InputValue],
+    ) {
+        if let Some(recipes) = &mut self.formats {
+            if !recipes.contains(recipe) {
+                recipes.push(recipe.clone());
+            }
+        }
+        self.record_format(field, recipe.clone(), |_, arguments| {
+            for value in values {
+                arguments.input(value);
+            }
+        });
     }
 
     fn record_text(&mut self, field: &tracing_core::Field, value: impl std::fmt::Display) {
@@ -1482,21 +1535,27 @@ impl Visit for ValueRecorder<'_> {
         if self.is_log_compat && field.name() != "message" {
             return;
         }
-        let cached = self
+        // Literal templates match by static address and are never parsed;
+        // only a new recipe for this callsite is registered.
+        let known = self
             .formats
             .as_ref()
-            .and_then(|recipes| recipes.iter().find(|recipe| recipe.template.matches(value)))
+            .and_then(|recipes| recipes.iter().find(|recipe| recipe.matches(value)))
             .cloned();
-        let (recipe, values) = if let Some(recipe) = cached {
-            let values = recipe.capture(value).expect("capturing format arguments");
-            (recipe, values)
-        } else {
-            let (recipe, values) =
-                format::Format::capture_new(value).expect("compiling format arguments");
-            let recipe = Arc::new(recipe);
-            (recipe, values)
-        };
-        self.record_format(field, recipe, values);
+        let recipe = known.unwrap_or_else(|| {
+            let recipe = Recipe::new(value).expect("compiling format arguments");
+            if let Some(recipes) = &mut self.formats {
+                if !recipes.contains(&recipe) {
+                    recipes.push(recipe.clone());
+                }
+            }
+            recipe
+        });
+        self.record_format(field, recipe, |recipe, arguments| {
+            recipe
+                .capture(value, arguments)
+                .expect("capturing format arguments")
+        });
     }
 
     fn record_str(&mut self, field: &tracing_core::Field, value: &str) {

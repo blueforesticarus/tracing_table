@@ -11,8 +11,8 @@ make capture-bevy
 cargo run --locked --manifest-path examples/bevy_capture/Cargo.toml
 ```
 
-The v3 dump always preserves Format recipes and typed arguments. No environment
-flag is needed for native replay. Older v2 dumps must be recaptured. Use
+The v4 dump always preserves Format recipes and typed arguments. No environment
+flag is needed for native replay. Older (v2/v3) dumps must be recaptured. Use
 `make storage-charts` for Format replay, or set `FORMAT_ARGS=off TEMPLATES=on`
 or `FORMAT_ARGS=off TEMPLATES=off` for rendered replay. `MIN_BLOCK_ROWS` selects
 the minimum block population; the chart's second line reports both choices.

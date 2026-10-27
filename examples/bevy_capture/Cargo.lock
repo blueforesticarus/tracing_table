@@ -2849,6 +2849,7 @@ name = "introspect-fmt"
 version = "0.1.0"
 dependencies = [
  "introspect-fmt-macros",
+ "smallvec",
 ]
 
 [[package]]

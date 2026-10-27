@@ -46,10 +46,10 @@ It does not pad or duplicate records to reach the target. The decoded fixture is
 validated for size, parented events, and one completed middleware span per request. A `.capture.txt`
 sidecar records exact sizes, request/status counts, settings and callsite families.
 
-The v3 dump preserves Format recipes, typed arguments, and rendered inputs.
+The v4 dump preserves Format recipes, typed arguments, and rendered inputs.
 `make storage-charts` uses Format replay by default. Set `FORMAT_ARGS=off` and
 `TEMPLATES=on` or `TEMPLATES=off` to compare rendered replay from that same dump.
-Old v2 dumps are rejected and must be regenerated.
+Older (v2/v3) dumps are rejected and must be regenerated.
 
 Tuning variables:
 

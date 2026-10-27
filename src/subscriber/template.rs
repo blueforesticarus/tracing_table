@@ -290,13 +290,16 @@ mod tests {
             let sites = recorder.callsites.read();
             let site = sites.values().next().unwrap().read();
             let template = &site.formats[0];
-            assert_eq!(template.template.source(), "cached subscriber template");
-            (site.metadata, Arc::as_ptr(template))
+            assert_eq!(template.template().source(), "cached subscriber template");
+            (site.metadata, template.template().placeholders().as_ptr())
         };
         for _ in 0..3 {
             // Re-registration retains the directly captured callsite recipe.
             let site = recorder.register(metadata);
-            assert_eq!(template_address, Arc::as_ptr(&site.formats[0]));
+            assert_eq!(
+                template_address,
+                site.formats[0].template().placeholders().as_ptr()
+            );
         }
     }
 

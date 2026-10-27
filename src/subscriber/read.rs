@@ -531,10 +531,10 @@ impl PerCallsiteData {
                     // before hiding the appended physical argument columns.
                     for &(field, recipe, start) in &a.formats {
                         let recipe = &self.formats[recipe];
-                        let count = recipe.template.value_count();
-                        let text = recipe
-                            .render(&row.fields[start..start + count])
-                            .expect("stored format arguments");
+                        let count = recipe.value_count();
+                        let text =
+                            super::value::render_inputs(recipe, &row.fields[start..start + count])
+                                .expect("stored format arguments");
                         row.fields[field] = Some(InputValue::Text(text));
                     }
                     row.fields.truncate(self.metadata.fields().len());

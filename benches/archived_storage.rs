@@ -1013,13 +1013,11 @@ pub mod collect {
                 // Recipes are per-callsite metadata. Charge their actual retained
                 // capacities once, rather than once per row or archetype.
                 let recipes = site.formats.capacity()
-                    * size_of::<std::sync::Arc<tracing_table::subscriber::format::Format>>()
+                    * size_of::<tracing_table::subscriber::Recipe>()
                     + site
                         .formats
                         .iter()
-                        .map(|recipe| {
-                            size_of_val(&**recipe) + 2 * size_of::<usize>() + recipe.heap_bytes()
-                        })
+                        .map(|recipe| recipe.heap_bytes())
                         .sum::<usize>()
                     + site
                         .template

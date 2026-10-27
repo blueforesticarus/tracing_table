@@ -39,9 +39,9 @@ Generate it with `make capture-actix`, then run `make storage-charts` to compute
 CSV rows retain `run=bevy` or `run=actix`; chart statistics pool both populations.
 See the [storage pipeline](doc/storage_chart.md) for single-run overrides and tuning.
 
-Captures use v3 MessagePack/LZ4: format recipes are stored once and each operation
-keeps exact typed arguments alongside rendered fields. Old v2 dumps are rejected;
-regenerate them with the capture targets. Replay defaults to **Format patch**.
+Captures use v4 MessagePack/LZ4: format recipes (template source, argument names
+and kinds) are stored once and each operation keeps exact typed arguments alongside
+rendered fields. Older dumps are rejected; regenerate them with the capture targets. Replay defaults to **Format patch**.
 The same dump also supports rendered replay with template extraction on or off:
 
 ```sh
